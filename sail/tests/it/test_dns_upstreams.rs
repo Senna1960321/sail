@@ -407,6 +407,141 @@ async fn dot_answers_and_keeps_its_connection() {
     assert_eq!(counters.connections.load(Ordering::SeqCst), 1);
 }
 
+/// The server waits for a batch on ONE connection, then answers in reverse
+/// order. Opening a connection per query cannot make progress here.
+#[tokio::test(flavor = "multi_thread")]
+async fn dot_pipelines_concurrent_queries_on_one_connection() {
+    use btls::pkey::PKey;
+    use btls::ssl::{SslAcceptor, SslMethod};
+    use btls::x509::X509;
+
+    let cert = cert();
+    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    acceptor
+        .set_certificate(&X509::from_pem(cert.cert_pem.as_bytes()).unwrap())
+        .unwrap();
+    acceptor
+        .set_private_key(&PKey::private_key_from_pem(cert.key_pem.as_bytes()).unwrap())
+        .unwrap();
+    let acceptor = acceptor.build();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut tls = acceptor.accept(stream).unwrap();
+        let mut responses = Vec::new();
+        for _ in 0..16 {
+            let mut len = [0; 2];
+            tls.read_exact(&mut len).unwrap();
+            let mut query = vec![0; u16::from_be_bytes(len) as usize];
+            tls.read_exact(&mut query).unwrap();
+            responses.push(answer(&query).unwrap());
+        }
+        for response in responses.into_iter().rev() {
+            tls.write_all(&(response.len() as u16).to_be_bytes())
+                .unwrap();
+            tls.write_all(&response).unwrap();
+        }
+        tls.flush().unwrap();
+    });
+    let client = client(&[self::server("tls", port, None)], Some(&cert));
+    let hosts: Vec<_> = (0..16).map(|i| format!("pipeline-{i}.example")).collect();
+    let results = tokio::time::timeout(
+        Duration::from_secs(4),
+        futures::future::join_all(hosts.iter().map(|host| lookup(&client, host))),
+    )
+    .await
+    .expect("DoT queries must pipeline, not wait for a prior response");
+    for result in results {
+        assert_eq!(result.unwrap(), vec![IpAddr::V4(ANSWER)]);
+    }
+    server.join().unwrap();
+}
+
+/// A dropped shared connection causes one new handshake, even when all
+/// its queries fail together and retry concurrently.
+#[tokio::test(flavor = "multi_thread")]
+async fn dot_concurrent_failed_queries_share_one_replacement_connection() {
+    use btls::pkey::PKey;
+    use btls::ssl::{SslAcceptor, SslMethod};
+    use btls::x509::X509;
+
+    const BATCH: usize = 16;
+    let cert = cert();
+    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    acceptor
+        .set_certificate(&X509::from_pem(cert.cert_pem.as_bytes()).unwrap())
+        .unwrap();
+    acceptor
+        .set_private_key(&PKey::private_key_from_pem(cert.key_pem.as_bytes()).unwrap())
+        .unwrap();
+    let acceptor = acceptor.build();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = connections.clone();
+    let server = std::thread::spawn(move || {
+        let receive = |tls: &mut btls::ssl::SslStream<std::net::TcpStream>| {
+            let mut len = [0; 2];
+            tls.read_exact(&mut len).unwrap();
+            let mut query = vec![0; u16::from_be_bytes(len) as usize];
+            tls.read_exact(&mut query).unwrap();
+            query
+        };
+        let send = |tls: &mut btls::ssl::SslStream<std::net::TcpStream>, query: &[u8]| {
+            let response = answer(query).unwrap();
+            tls.write_all(&(response.len() as u16).to_be_bytes())
+                .unwrap();
+            tls.write_all(&response).unwrap();
+            tls.flush().unwrap();
+        };
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let mut tls = acceptor.accept(stream).unwrap();
+            accepted.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                // Prime the cache: only reused connections retry a failed
+                // query, matching the existing resolver policy.
+                let prime = receive(&mut tls);
+                send(&mut tls, &prime);
+                for _ in 0..BATCH {
+                    receive(&mut tls);
+                }
+                // All callers have an outstanding query when this
+                // connection closes, so they reach the retry together.
+            } else {
+                let batch: Vec<_> = (0..BATCH).map(|_| receive(&mut tls)).collect();
+                for query in batch.iter().rev() {
+                    send(&mut tls, query);
+                }
+            }
+        }
+    });
+    let client = client(&[self::server("tls", port, None)], Some(&cert));
+    assert_eq!(
+        lookup(&client, "prime-retry.example").await.unwrap(),
+        vec![IpAddr::V4(ANSWER)]
+    );
+    let hosts: Vec<_> = (0..BATCH).map(|i| format!("retry-{i}.example")).collect();
+    let answers = tokio::time::timeout(
+        Duration::from_secs(15),
+        futures::future::join_all(hosts.iter().map(|host| lookup(&client, host))),
+    )
+    .await
+    .expect("concurrent retries must share their replacement connection");
+    for answer in answers {
+        assert_eq!(answer.unwrap(), vec![IpAddr::V4(ANSWER)]);
+    }
+    server.join().unwrap();
+    assert_eq!(connections.load(Ordering::SeqCst), 2);
+}
+
 /// After `close_idle`, as on a wake from a long sleep: the next query
 /// connects again, and the answers kept are still given.
 async fn close_idle_connects_again_and_keeps_answers(
