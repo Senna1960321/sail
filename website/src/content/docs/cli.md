@@ -64,7 +64,7 @@ sail -c config.json --profile server \
 
 These settings describe the host runtime, not proxy behavior. Keep protocol, DNS and routing decisions in the configuration file.
 
-The groups are `relay` (TCP relay buffers and half-close idle timeouts), `udp`, `netstack` (the TUN stack's budget, batches and TCP windows), `inbound` (handshake timeout, multiplex accept concurrency, TCP send buffer), `quic`, `ws`, `dns` (`max_retries`, `dualstack_delay`), `stats`, `lifecycle` and `mux`. A few values that differ by profile:
+The groups are `relay` (TCP relay buffers and half-close idle timeouts), `udp`, `netstack` (the TUN stack's budget, batches and TCP windows), `inbound` (handshake timeout, multiplex accept concurrency, TCP send buffer), `memory` (the shared growth budget for transfer buffers), `quic`, `ws`, `dns` (`max_retries`, `dualstack_delay`), `stats`, `lifecycle` and `mux`. A few values that differ by profile:
 
 | Setting | `desktop` | `mobile` | `router` | `server` |
 | --- | --- | --- | --- | --- |
@@ -72,10 +72,17 @@ The groups are `relay` (TCP relay buffers and half-close idle timeouts), `udp`, 
 | `relay.buffer_max_size` (KiB) | `128` | `64` | `64` | `256` |
 | `quic.max_concurrent_streams` | `1024` | `256` | `128` | `4096` |
 | `inbound.tcp_send_buffer` (KiB, `0` = system) | `0` | `0` | `256` | `0` |
+| `inbound.tcp_send_buffer_max` (KiB, `0` = no growth) | `0` | `0` | `2048` | `0` |
 | `inbound.max_connections` (sessions at once, `0` = no limit) | `0` | `512` | `512`; on Linux below 276 MiB of memory, twice the MiB beyond 20, at least 64 | `0` |
 | `lifecycle.drain_timeout` | `0` | `0` | `0` | `30s` |
 
 `lifecycle.drain_timeout` is how long open TCP connections may finish after SIGTERM or Ctrl-C once no new ones are accepted; `0` stops at once, and a second signal always stops at once.
+
+On Linux and Android, accepted TCP connections can grow their send buffer from `inbound.tcp_send_buffer` to `inbound.tcp_send_buffer_max` while the buffer limits the transfer. The extra allowance comes from `memory.transfer_budget`, shared with Hysteria2 and TUIC windows. Sail charges twice the requested increase above the starting size to account for kernel bookkeeping. Growth is disabled when the starting size is `0`, the maximum is no larger, or the system is neither Linux nor Android.
+
+After a second without filling the buffer, or with a blocked write, Sail lowers the configured size to its starting value as writes are polled. This does not discard queued data. Allowance for excess queued memory stays reserved until a write observes it draining through `SO_MEMINFO`, or the connection closes. If that query is unavailable, the allowance stays reserved until close. An idle connection, including one whose write was canceled, has no background task to reclaim its drained allowance; it may hold the budget until another write or close.
+
+After growth, Sail reads back the configured size and refunds only unused new allowance, preserving any reservation still needed for an older queue. If readback fails, the requested growth stays charged. Closing the connection returns Sail's reservation, but TCP may retain queued memory after a graceful close; this budget is not a bound on all kernel memory.
 
 The `relay` settings, `relay.write_stall_timeout` among them, apply as well to the connections a fallback (Trojan, VLESS, AnyTLS), ShadowTLS or REALITY relays to the real site.
 

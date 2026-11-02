@@ -52,7 +52,7 @@ sail -c config.json --profile server \
 
 这些参数描述宿主资源预算，不改变代理行为。协议、DNS 和路由仍应写入配置文件。
 
-参数分组为 `relay`（TCP 转发缓冲区与半关闭后的空闲超时）、`udp`、`netstack`（TUN 协议栈的预算、批量与 TCP 窗口）、`inbound`（握手超时、多路复用接受并发、TCP 发送缓冲区）、`quic`、`ws`、`dns`（`max_retries`、`dualstack_delay`）、`stats`、`lifecycle` 和 `mux`。几个随配置档变化的值：
+参数分组为 `relay`（TCP 转发缓冲区与半关闭后的空闲超时）、`udp`、`netstack`（TUN 协议栈的预算、批量与 TCP 窗口）、`inbound`（握手超时、多路复用接受并发、TCP 发送缓冲区）、`memory`（传输缓冲区共享的增长预算）、`quic`、`ws`、`dns`（`max_retries`、`dualstack_delay`）、`stats`、`lifecycle` 和 `mux`。几个随配置档变化的值：
 
 | 参数 | `desktop` | `mobile` | `router` | `server` |
 | --- | --- | --- | --- | --- |
@@ -60,10 +60,17 @@ sail -c config.json --profile server \
 | `relay.buffer_max_size`（KiB） | `128` | `64` | `64` | `256` |
 | `quic.max_concurrent_streams` | `1024` | `256` | `128` | `4096` |
 | `inbound.tcp_send_buffer`（KiB，`0` 表示交给系统） | `0` | `0` | `256` | `0` |
+| `inbound.tcp_send_buffer_max`（KiB，`0` 表示不增长） | `0` | `0` | `2048` | `0` |
 | `inbound.max_connections`（同时存在的会话数，`0` 表示不限） | `0` | `512` | `512`；Linux 上内存不足 276 MiB 时为（MiB − 20）× 2，至少 64 | `0` |
 | `lifecycle.drain_timeout` | `0` | `0` | `0` | `30s` |
 
 `lifecycle.drain_timeout` 指收到 SIGTERM 或 Ctrl-C、停止接受新连接后，已有 TCP 连接最多还能继续多久；`0` 表示立即停止，第二次信号总是立即停止。
+
+在 Linux 和 Android 上，接受的 TCP 连接在发送缓冲区限制传输时，可从 `inbound.tcp_send_buffer` 增长到 `inbound.tcp_send_buffer_max`。额外额度取自 `memory.transfer_budget`，与 Hysteria2、TUIC 的窗口共享；Sail 按超过起始大小的申请增量的两倍计入预算，包含内核记账开销。起始大小为 `0`、上限不大于起始大小，或系统不是 Linux、Android 时，不启用增长。
+
+缓冲区持续一秒未满，或写入阻塞一秒后，Sail 在轮询写入时将设置的大小降回起始值。这不会丢弃队列中的数据。超出起始额度的排队内存仍占用预算，按写入时通过 `SO_MEMINFO` 观察到的排空量退回，连接关闭时退回其余额度；若无法查询，则保留额度至连接关闭。空闲连接（包括写入已取消的连接）没有后台任务回收已排空的额度，可能一直占用预算，直到再次写入或关闭。
+
+增长后，Sail 读回实际设置的大小，只退回本次新申请但未用到的额度，保留旧队列仍需的额度。读回失败时，申请的增长额度继续计入预算。关闭连接会退回 Sail 的预留额度，但正常关闭后 TCP 仍可能保留排队内存，因此该预算不保证限制全部内核内存。
 
 `relay` 的各项（包括 `relay.write_stall_timeout`）同样适用于回落（Trojan、VLESS、AnyTLS）、ShadowTLS 与 REALITY 转发到真实站点的连接。
 
