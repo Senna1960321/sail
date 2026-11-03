@@ -34,6 +34,7 @@ mod test_dns_upstreams;
 mod test_domain_resolver;
 mod test_embed;
 mod test_embed_rule_set;
+mod test_embed_sessions;
 mod test_examples;
 mod test_fakeip;
 mod test_fallback;

@@ -684,7 +684,13 @@ as free, was taken before it opened"); starting again chooses another.
 ## Dialling
 
 `dial_tcp` and `dial_udp` go through the outbound named, whatever the
-rules say.
+rules say, with no user, as the control plane's dials. What they return is
+the outbound's own stream or datagrams, read and written with no relay or
+copy between; each poll is made within the instance's runtime, so any
+executor of the host's may drive them. No idle or stall timeout of sail's
+applies to them, as the host reads them itself; once the instance stops,
+they fail. To send a user's traffic, with the rules, limits and records
+that come with one, submit it to `Instance::sessions` instead (Host kinds).
 
 **While the instance starts.** A host whose own service the instance
 asks during its start, a DNS server in the host's process that the
@@ -788,6 +794,22 @@ let options = Options::new()
     its `max_connections`, or a user of another instance or run.
     `Refused::Closed` means the inbound is gone or the instance is
     stopping.
+  - **Addresses.** A session has its connection's source and local
+    address, the one the client connected to, unless `NewSession::source`
+    and `local` give others: a host that carries many clients' streams on
+    one connection gives each its own. `SessionInfo::local` tells it.
+- **Sessions with no listener.** A host that takes streams off a link of
+  its own, a peer node's, submits them to `Instance::sessions(tag)`, as
+  sessions of the inbound `tag`, any of the configuration's
+  (`NotFound` for none). They are a host inbound's sessions in every way
+  above: routed by the rules for that inbound and their user, held to the
+  user's limits and rates, counted, numbered and recorded under the
+  inbound, dialled with the outbound's bind address. sail relays the
+  host's stream to the outbound's directly, one copy, in a task of the
+  instance's, whichever executor submits it. With no listener, admission
+  refuses them only under hard memory pressure (`Refused::Pressure`), as
+  it refuses every new connection then; a reload that takes the inbound
+  out, or the instance stopping, refuses them as `Closed`.
 - **Users.** `Instance::user(name)`, or `KindContext::user` while a kind
   builds, gives a user of sail's one namespace, which `user_limits`, the
   management API and the traffic counts use.

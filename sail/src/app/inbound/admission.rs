@@ -89,7 +89,7 @@ pub struct AdmissionInfo {
     pub reserve: u64,
     /// Connections in their handshake now.
     pub handshakes: usize,
-    /// Refused at accept under hard pressure.
+    /// Refused at accept, or as a host submitted them, under hard pressure.
     pub refused: u64,
     /// Refused at accept for their source's failures.
     pub refused_sources: u64,
@@ -281,6 +281,18 @@ impl Admission {
             return Err(Refusal::Source);
         }
         Ok(())
+    }
+
+    /// Whether a session a host submits with no listener is refused: under
+    /// hard pressure, as every new connection is. It authenticated, so its
+    /// source is not judged.
+    pub(crate) fn refuses_submitted(&self) -> bool {
+        if self.update() != HARD {
+            return false;
+        }
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        self.warn("hard memory pressure");
+        true
     }
 
     /// Whether a QUIC connection from `source` is refused before its

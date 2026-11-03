@@ -1,30 +1,51 @@
 //! Connections dialled through a named outbound, handed to the host: the
-//! outbound's end stays on the instance's runtime, relayed to the host's
-//! end in memory, so the host may use it from any executor, on every
-//! platform. Either end closing closes the other; the instance stopping
-//! closes both.
+//! outbound's own stream or datagrams, read and written by the host with
+//! no copy between, from any executor, on every platform: each poll is
+//! made within the instance's runtime, which drives them. Once the
+//! instance stops, they fail.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Mutex};
+use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 
 use super::{Address, Error, Instance};
+use crate::adapter::{AnyStream, OutboundDatagramRecvHalf, OutboundDatagramSendHalf};
 use crate::control::Dialed;
 use crate::session::Network;
 
-/// Datagrams waiting either way, at most; more are dropped, as UDP would.
-const DATAGRAMS: usize = 256;
 /// The largest datagram either way: any UDP payload.
 const LARGEST: usize = 65_535;
 
 /// A TCP connection through an outbound: read, write, shut down. Dropping
 /// it closes the connection.
-pub struct DialStream(tokio::io::DuplexStream);
+pub struct DialStream {
+    /// None only as it drops.
+    stream: Option<AnyStream>,
+    runtime: Handle,
+}
+
+impl DialStream {
+    /// The runtime to poll within, and the stream.
+    fn parts(&mut self) -> (&Handle, Pin<&mut AnyStream>) {
+        let stream = self.stream.as_mut().expect("a stream until it drops");
+        (&self.runtime, Pin::new(stream))
+    }
+}
+
+impl Drop for DialStream {
+    /// Within the instance's runtime, as what closes with the stream (a
+    /// multiplexed stream's close) may spawn work there.
+    fn drop(&mut self) {
+        let _runtime = self.runtime.enter();
+        self.stream.take();
+    }
+}
 
 impl AsyncRead for DialStream {
     fn poll_read(
@@ -32,7 +53,9 @@ impl AsyncRead for DialStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        let (runtime, stream) = self.parts();
+        let _runtime = runtime.enter();
+        stream.poll_read(cx, buf)
     }
 }
 
@@ -42,15 +65,43 @@ impl AsyncWrite for DialStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        let (runtime, stream) = self.parts();
+        let _runtime = runtime.enter();
+        stream.poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        let (runtime, stream) = self.parts();
+        let _runtime = runtime.enter();
+        stream.poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        let (runtime, stream) = self.parts();
+        let _runtime = runtime.enter();
+        stream.poll_shutdown(cx)
+    }
+}
+
+/// `fut`, each poll within `runtime`.
+struct Within<'a, F> {
+    runtime: &'a Handle,
+    fut: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for Within<'_, F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let _runtime = self.runtime.enter();
+        self.fut.as_mut().poll(cx)
+    }
+}
+
+fn within<F: Future>(runtime: &Handle, fut: F) -> Within<'_, F> {
+    Within {
+        runtime,
+        fut: Box::pin(fut),
     }
 }
 
@@ -58,8 +109,10 @@ impl AsyncWrite for DialStream {
 /// the outbound reaches, and from them. Dropping it closes it.
 pub struct DialDatagram {
     to: Address,
-    out: mpsc::Sender<(Vec<u8>, Address)>,
-    back: Mutex<mpsc::Receiver<(Vec<u8>, Address)>>,
+    send: Mutex<Box<dyn OutboundDatagramSendHalf>>,
+    recv: Mutex<Box<dyn OutboundDatagramRecvHalf>>,
+    runtime: Handle,
+    scope: crate::runtime::scope::TaskScope,
 }
 
 impl DialDatagram {
@@ -77,25 +130,55 @@ impl DialDatagram {
                 "larger than a datagram",
             ));
         }
-        self.out
-            .send((data.to_vec(), to.clone()))
-            .await
-            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+        within(&self.runtime, async {
+            self.send.lock().await.send_to(data, to).await.map(|_| ())
+        })
+        .await
     }
 
-    /// The next datagram, into `buf`, cut to its length: its length, and
-    /// where it came from.
+    /// The next datagram, into `buf`: its length, and where it came from.
+    /// A `buf` of 65,535 bytes takes any; a datagram longer than a shorter
+    /// one is cut, or fails, as the outbound reads it.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, Address)> {
-        let (data, from) = self
-            .back
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        Ok((n, from))
+        within(&self.runtime, async {
+            self.recv.lock().await.recv_from(buf).await
+        })
+        .await
+    }
+}
+
+impl Drop for DialDatagram {
+    /// Closes the outbound's datagrams as its relay would have, on the
+    /// instance's runtime.
+    fn drop(&mut self) {
+        let mut send = std::mem::replace(self.send.get_mut(), Box::new(Closed));
+        let recv = std::mem::replace(self.recv.get_mut(), Box::new(Closed));
+        self.scope
+            .spawn_on(&self.runtime, "dial datagrams close", async move {
+                let _ = send.close().await;
+                drop(recv);
+            });
+    }
+}
+
+/// What a dropped `DialDatagram` keeps in place of what it closes.
+struct Closed;
+
+#[async_trait::async_trait]
+impl OutboundDatagramRecvHalf for Closed {
+    async fn recv_from(&mut self, _: &mut [u8]) -> io::Result<(usize, crate::session::SocksAddr)> {
+        Err(io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+#[async_trait::async_trait]
+impl OutboundDatagramSendHalf for Closed {
+    async fn send_to(&mut self, _: &[u8], _: &crate::session::SocksAddr) -> io::Result<usize> {
+        Err(io::ErrorKind::BrokenPipe.into())
+    }
+
+    async fn close(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -118,13 +201,10 @@ impl Instance {
                 else {
                     unreachable!("a TCP dial gives a stream");
                 };
-                let relay = dialer.env().options.relay.clone();
-                let (host, ours) = tokio::io::duplex(relay.buffer_size.max(1) * 1024);
-                dialer.env().scope.spawn(
-                    "dial relay",
-                    crate::control::relay_stream(ours, stream, relay),
-                );
-                Ok(DialStream(host))
+                Ok(DialStream {
+                    stream: Some(stream),
+                    runtime: dialer.handle().clone(),
+                })
             })
         })
         .await?
@@ -169,44 +249,13 @@ impl Instance {
                 else {
                     unreachable!("a UDP dial gives datagrams");
                 };
-                let (mut recv, send) = datagram.split();
-                let (out_tx, mut out_rx) = mpsc::channel::<(Vec<u8>, Address)>(DATAGRAMS);
-                let (back_tx, back_rx) = mpsc::channel(DATAGRAMS);
-                let send = Arc::new(Mutex::new(send));
-                dialer.env().scope.spawn("dial datagrams out", {
-                    let send = send.clone();
-                    async move {
-                        while let Some((data, to)) = out_rx.recv().await {
-                            if send.lock().await.send_to(&data, &to).await.is_err() {
-                                break;
-                            }
-                        }
-                        let _ = send.lock().await.close().await;
-                    }
-                });
-                dialer.env().scope.spawn("dial datagrams back", async move {
-                    let mut buf = vec![0u8; LARGEST];
-                    loop {
-                        tokio::select! {
-                            got = recv.recv_from(&mut buf) => match got {
-                                Ok((n, from)) => {
-                                    // Full: dropped, as the network would.
-                                    if let Err(mpsc::error::TrySendError::Closed(_)) =
-                                        back_tx.try_send((buf[..n].to_vec(), from))
-                                    {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            },
-                            _ = back_tx.closed() => break,
-                        }
-                    }
-                });
+                let (recv, send) = datagram.split();
                 Ok::<_, Error>(DialDatagram {
                     to,
-                    out: out_tx,
-                    back: Mutex::new(back_rx),
+                    send: Mutex::new(send),
+                    recv: Mutex::new(recv),
+                    runtime: dialer.handle().clone(),
+                    scope: dialer.env().scope.clone(),
                 })
             })
         })

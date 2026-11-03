@@ -761,6 +761,20 @@ impl Instance {
         Ok(User::of(&self.manager()?.env.users, name))
     }
 
+    /// Where a host submits the sessions it takes off a link of its own, a
+    /// peer node's, with no listener, as sessions of the inbound
+    /// `inbound_tag`: each routed by the rules as that inbound's and its
+    /// user's, dialled with the outbound's bind address, held to the user's
+    /// limits and rates and recorded, as a session of a host inbound is
+    /// (`Sessions::tcp`, `Sessions::udp`), and the host's stream relayed
+    /// to the outbound's with no copy between. The inbound is any the
+    /// configuration has, of whatever kind; `NotFound` for none. A reload
+    /// that takes it out refuses its sessions from then on (`Closed`), as
+    /// does the instance stopping.
+    pub fn sessions(&self, inbound_tag: &str) -> Result<Sessions, Error> {
+        Sessions::of_instance(self.manager()?.dialer(), inbound_tag)
+    }
+
     /// Tells it the system woke, as libbox's `Wake`. A sleep of 2 minutes
     /// or more since `sleep` (by the wall clock) closes the carriers left
     /// idle, pooled connections with nothing open, and the groups test

@@ -38,6 +38,7 @@ pub enum Dialed {
 #[derive(Clone)]
 pub struct Dialer {
     dispatcher: std::sync::Weak<crate::app::dispatcher::Dispatcher>,
+    nat_manager: std::sync::Weak<crate::app::nat_manager::NatManager>,
     env: Arc<crate::runtime::RuntimeEnv>,
     handle: tokio::runtime::Handle,
 }
@@ -47,6 +48,7 @@ impl RuntimeManager {
     pub fn dialer(&self) -> Dialer {
         Dialer {
             dispatcher: self.dispatcher.clone(),
+            nat_manager: self.nat_manager.clone(),
             env: self.env.clone(),
             handle: self.handle().clone(),
         }
@@ -87,11 +89,13 @@ impl RuntimeManager {
 impl Dialer {
     pub(crate) fn new(
         dispatcher: &Arc<crate::app::dispatcher::Dispatcher>,
+        nat_manager: &Arc<crate::app::nat_manager::NatManager>,
         env: Arc<crate::runtime::RuntimeEnv>,
         handle: tokio::runtime::Handle,
     ) -> Self {
         Dialer {
             dispatcher: Arc::downgrade(dispatcher),
+            nat_manager: Arc::downgrade(nat_manager),
             env,
             handle,
         }
@@ -105,6 +109,17 @@ impl Dialer {
     /// What the instance runs with.
     pub fn env(&self) -> &Arc<crate::runtime::RuntimeEnv> {
         &self.env
+    }
+
+    /// What routes sessions, and what their UDP goes through, while the
+    /// instance runs.
+    pub(crate) fn routing(
+        &self,
+    ) -> Option<(
+        Arc<crate::app::dispatcher::Dispatcher>,
+        Arc<crate::app::nat_manager::NatManager>,
+    )> {
+        Some((self.dispatcher.upgrade()?, self.nat_manager.upgrade()?))
     }
 
     /// Connects to `destination` through the outbound `outbound` alone,
@@ -188,7 +203,8 @@ impl Dialer {
 }
 
 /// The host's stream and the outbound's, relayed as a routed connection's.
-pub(crate) async fn relay_stream<H>(
+#[cfg(unix)]
+async fn relay_stream<H>(
     mut host: H,
     mut outbound: AnyStream,
     relay: crate::runtime::options::Relay,

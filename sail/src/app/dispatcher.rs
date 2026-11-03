@@ -614,6 +614,16 @@ impl Dispatcher {
         };
     }
 
+    /// The type of the inbound `tag`, as the configuration names it; none
+    /// when the instance has no such inbound.
+    pub(crate) fn inbound_type_of(&self, tag: &str) -> Option<&'static str> {
+        self.inbound_types
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tag)
+            .copied()
+    }
+
     /// Fills in what the session's inbound tells about it.
     fn identify_inbound(&self, sess: &mut Session) {
         if sess.inbound_type.is_empty() {

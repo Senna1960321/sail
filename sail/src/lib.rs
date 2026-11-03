@@ -158,6 +158,8 @@ pub struct RuntimeManager {
     env: runtime::SyncRuntimeEnv,
     /// What rule-sets are downloaded through; the same across reloads.
     dispatcher: std::sync::Weak<app::dispatcher::Dispatcher>,
+    /// What the UDP sessions a host submits go through.
+    nat_manager: std::sync::Weak<app::nat_manager::NatManager>,
     /// Downloads the remote rule-sets again as they fall due.
     rule_set_updater: Mutex<Option<tokio::task::AbortHandle>>,
     /// Updates the outbound providers as they fall due.
@@ -245,6 +247,7 @@ impl RuntimeManager {
             stat_manager: instance.stat_manager.clone(),
             env: instance.env.clone(),
             dispatcher: Arc::downgrade(&instance.dispatcher),
+            nat_manager: Arc::downgrade(&instance.nat_manager),
             #[cfg(all(
                 feature = "inbound-tun",
                 any(target_os = "linux", target_os = "macos", target_os = "windows")
@@ -2453,6 +2456,7 @@ fn run(rt_id: RuntimeId, opts: StartOptions, start: &Arc<Starting>) -> Result<()
     if let Some(platform) = &env.host.platform {
         platform.dialable(&control::Dialer::new(
             &instance.dispatcher,
+            &instance.nat_manager,
             env.clone(),
             rt.handle().clone(),
         ));

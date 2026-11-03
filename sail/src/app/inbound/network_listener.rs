@@ -205,6 +205,33 @@ async fn handle_inbound_transport(
     }
 }
 
+/// Serves one session a host submitted with no listener of its own
+/// (`embed::Instance::sessions`), as a session of a connection that carries
+/// many is served: a stream routed and relayed, datagrams through the NAT.
+pub(crate) async fn serve_submitted(
+    transport: AnyBaseInboundTransport,
+    dispatcher: Arc<Dispatcher>,
+    nat_manager: Arc<NatManager>,
+) {
+    match transport {
+        BaseInboundTransport::Stream(stream, sess) => {
+            let span = sess.span();
+            let tag = sess.inbound_tag.clone();
+            super::magic::serve_stream(sess, stream, tag, dispatcher, nat_manager)
+                .instrument(span)
+                .await;
+        }
+        BaseInboundTransport::Datagram(socket, sess) => {
+            let tag = sess
+                .as_ref()
+                .map(|sess| sess.inbound_tag.clone())
+                .unwrap_or_default();
+            handle_inbound_datagram(tag, socket, sess, nat_manager, TaskClass::Contained).await;
+        }
+        _ => (),
+    }
+}
+
 // Handle an accepted inbound TCP stream, which holds `place` among its
 // inbound's handshakes until it is a session or is closed.
 async fn handle_inbound_tcp_stream(

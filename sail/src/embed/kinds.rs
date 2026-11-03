@@ -537,6 +537,11 @@ pub struct NewSession {
     pub user: Option<User>,
     /// What the host's outbound is to know of it.
     pub extensions: Extensions,
+    /// The client, and the address it connected to, where the host knows
+    /// them: a session of a listener's connection has the connection's,
+    /// one submitted with no listener the unspecified address and port 0.
+    pub source: Option<SocketAddr>,
+    pub local: Option<SocketAddr>,
 }
 
 impl NewSession {
@@ -545,11 +550,23 @@ impl NewSession {
             destination,
             user: None,
             extensions: Extensions::default(),
+            source: None,
+            local: None,
         }
     }
 
     pub fn user(mut self, user: User) -> Self {
         self.user = Some(user);
+        self
+    }
+
+    pub fn source(mut self, source: SocketAddr) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    pub fn local(mut self, local: SocketAddr) -> Self {
+        self.local = Some(local);
         self
     }
 
@@ -570,12 +587,16 @@ pub enum Refused {
     /// (quota, expiry), taken out of the inbound, at its
     /// `max_connections`, or a user of another instance or run.
     User { name: String, reason: String },
+    /// Submitted with no listener under hard memory pressure, as a new
+    /// connection to any inbound is refused then (`inbound.memory_reserve`).
+    Pressure,
 }
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Refused::Closed => f.write_str("the connection takes no more sessions"),
+            Refused::Pressure => f.write_str("hard memory pressure"),
             Refused::User { name, reason } => write!(f, "user [{}]: {}", name, reason),
         }
     }
@@ -583,8 +604,11 @@ impl fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// Where a connection's sessions go: to the listener that accepted it, and
-/// on to the dispatcher, each a session of its own. Cheap to clone.
+/// Where sessions go to be routed, each a session of its own: those of a
+/// connection a host inbound's listener accepted, through the listener;
+/// those a host takes off a link of its own, with no listener
+/// (`Instance::sessions`), straight to the dispatcher, the host's stream
+/// relayed to the outbound's with one copy. Cheap to clone.
 #[derive(Clone)]
 pub struct Sessions(Arc<SessionsInner>);
 
@@ -594,8 +618,18 @@ struct SessionsInner {
     kind: &'static str,
     users: UserRegistry,
     numbering: Numbering,
-    to: mpsc::Sender<AnyBaseInboundTransport>,
-    established: watch::Sender<bool>,
+    to: Handoff,
+}
+
+/// Where a `Sessions`' sessions are handed on.
+enum Handoff {
+    /// To the listener of the connection, which feeds the dispatcher.
+    Listener {
+        to: mpsc::Sender<AnyBaseInboundTransport>,
+        established: watch::Sender<bool>,
+    },
+    /// To the dispatcher of the instance, on its runtime.
+    Instance(crate::control::Dialer),
 }
 
 impl fmt::Debug for Sessions {
@@ -611,7 +645,34 @@ impl Sessions {
     /// implies it; a connection that never gets here is closed at the
     /// timeout. Twice is as once.
     pub fn established(&self) {
-        self.0.established.send_replace(true);
+        if let Handoff::Listener { established, .. } = &self.0.to {
+            established.send_replace(true);
+        }
+    }
+
+    /// `Instance::sessions`: those of the inbound `inbound_tag`, routed
+    /// with no listener.
+    pub(super) fn of_instance(
+        dialer: crate::control::Dialer,
+        inbound_tag: &str,
+    ) -> Result<Self, Error> {
+        let (dispatcher, _) = dialer.routing().ok_or_else(Error::not_running)?;
+        let kind = dispatcher.inbound_type_of(inbound_tag).ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, format!("no inbound [{}]", inbound_tag))
+        })?;
+        let env = dialer.env();
+        let base = Session {
+            inbound_tag: inbound_tag.to_string(),
+            inbound_type: kind,
+            ..Default::default()
+        };
+        Ok(Sessions(Arc::new(SessionsInner {
+            base,
+            kind,
+            users: env.users.clone(),
+            numbering: env.numbering.clone(),
+            to: Handoff::Instance(dialer),
+        })))
     }
 
     /// Submits a TCP session, whose bytes are `stream`'s: sail routes it,
@@ -664,19 +725,52 @@ impl Sessions {
         transport: AnyBaseInboundTransport,
         number: Arc<Number>,
     ) -> Result<u64, Refused> {
-        match self.0.to.send(transport).await {
-            Ok(()) => Ok(number.id()),
-            Err(_) => {
-                // Never sail's: its number was not told.
-                number.forget();
-                Err(Refused::Closed)
-            }
-        }
+        let dialer = match &self.0.to {
+            Handoff::Listener { to, .. } => match to.send(transport).await {
+                Ok(()) => return Ok(number.id()),
+                Err(_) => {
+                    // Never sail's: its number was not told.
+                    number.forget();
+                    return Err(Refused::Closed);
+                }
+            },
+            Handoff::Instance(dialer) => dialer,
+        };
+        let Some((dispatcher, nat_manager)) = dialer.routing() else {
+            number.forget();
+            return Err(Refused::Closed);
+        };
+        // The instance's task, whichever executor the host submits from.
+        dialer.env().scope.spawn_on(
+            dialer.handle(),
+            "host session",
+            crate::app::inbound::network_listener::serve_submitted(
+                transport,
+                dispatcher,
+                nat_manager,
+            ),
+        );
+        Ok(number.id())
     }
 
     fn session(&self, new: NewSession, network: Network) -> Result<Session, Refused> {
         let inner = &self.0;
         let tag = &inner.base.inbound_tag;
+        if let Handoff::Instance(dialer) = &inner.to {
+            let Some((dispatcher, _)) = dialer.routing() else {
+                return Err(Refused::Closed);
+            };
+            if dispatcher.inbound_type_of(tag).is_none() {
+                return Err(Refused::Closed);
+            }
+            // No listener took it in: what admission does at accept is
+            // done here, as far as it applies to one that authenticated.
+            if let Some(admission) = &dialer.env().admission {
+                if admission.refuses_submitted() {
+                    return Err(Refused::Pressure);
+                }
+            }
+        }
         if let Some(user) = &new.user {
             let refused = |reason: String| Refused::User {
                 name: user.name().to_string(),
@@ -693,8 +787,7 @@ impl Sessions {
             if !user.user.active() {
                 return Err(refused(user.user.status().to_string()));
             }
-            let tcp = inner.base.network == crate::session::Network::Tcp;
-            if !user.user.admits_on(tag, tcp) {
+            if !user.user.admits_on(tag, network == Network::Tcp) {
                 return Err(refused(
                     "at its max_connections or max_tcp_connections".into(),
                 ));
@@ -706,6 +799,12 @@ impl Sessions {
         sess.destination = new.destination;
         sess.user = new.user.map(|user| user.user);
         sess.extensions = new.extensions;
+        if let Some(source) = new.source {
+            sess.source = source;
+        }
+        if let Some(local) = new.local {
+            sess.local_addr = local;
+        }
         sess.inbound_type = inner.kind;
         sess.number = None;
         inner.numbering.number(&mut sess);
@@ -777,8 +876,7 @@ impl InboundStreamHandler for HostStreamHandler {
                 kind: self.kind,
                 users: self.users.clone(),
                 numbering: self.numbering.clone(),
-                to,
-                established,
+                to: Handoff::Listener { to, established },
             })),
         };
         let serving = self.host.serve(accepted);
@@ -926,6 +1024,9 @@ pub struct SessionInfo {
     pub network: Network,
     /// The client.
     pub source: SocketAddr,
+    /// The address it connected to, as `NewSession::local` is; the
+    /// unspecified address and port 0 where none is known.
+    pub local: SocketAddr,
     pub destination: Address,
     pub inbound_tag: String,
     /// The type of the inbound it came in through.
@@ -959,6 +1060,7 @@ impl SessionInfo {
             id,
             network: sess.network,
             source: sess.source,
+            local: sess.local_addr,
             destination: sess.destination.clone(),
             inbound_tag: sess.inbound_tag.clone(),
             inbound_type: sess.inbound_type,

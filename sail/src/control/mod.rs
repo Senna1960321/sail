@@ -23,7 +23,6 @@ mod providers;
 pub mod records;
 
 pub use crate::app::inbound::manager::InboundChange;
-pub(crate) use dial::relay_stream;
 pub use dial::{Dialed, Dialer, DIAL_INBOUND};
 
 /// What a reload did: each inbound the configuration has, in its order,

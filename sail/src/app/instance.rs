@@ -32,7 +32,7 @@ pub struct Instance {
     pub(crate) rule_sets: RuleSets,
     pub inbound_manager: Arc<std::sync::Mutex<InboundManager>>,
     /// Serves the UDP of the inbounds, and of the endpoints once started.
-    nat_manager: Arc<NatManager>,
+    pub(crate) nat_manager: Arc<NatManager>,
     /// What the instance dials with where the dial fields leave off, which
     /// a reload replaces.
     pub(crate) dial_defaults: SharedDialDefaults,
