@@ -153,7 +153,7 @@ sing-box 的 `ntp` 段会被读取：测得的时间用于各协议的时间校�
 | `GET /status` | 总流量、连接数和内存 |
 | `GET /events` | 以 Server-Sent Events 推送用户的变化：`shut`（超额或到期，已断开）与 `removed`（被移出入站），数据为该事件的 JSON；订阅方落后太多时收到 `lagged`，带事件类别 `kind` 和漏掉的条数 `missed`。`?kinds=connection`（或 `user,connection`；不给时只有 `user`）另推送 `connection` 事件：每个连接关闭时的记录，含自连接开始起的上下行字节、用户、入站、客户端连接的本端地址、目的地、出站和出站链、时间、结束方式和使用结果（`ok`、`dial_failed`、`blocked`、`rejected`）（见 `docs/embed.md` 的 `Kinds::CONNECTION`）；连接的关闭记录等于其用户被计的流量 |
 | `GET /connections`、`DELETE /connections`、`DELETE /connections/{id}` | 列出进行中的连接，关闭全部或其中一条 |
-| `GET /admission` | 内存紧张时的准入自实例启动以来做了什么：`{"level": "off" | "normal" | "pressure" | "hard", "free", "reserve", "handshakes", "refused", "refused_sources", "refused_quic", "evicted", "evicted_full", "pressure_ms"}`。`GET /events?kinds=admission` 在级别每次变化时另推送 `admission` 事件（`{"level", "free", "reserve", "handshakes"}`） |
+| `GET /admission` | 内存紧张时的准入自实例启动以来做了什么：`{"level": "off" | "normal" | "pressure" | "hard", "free", "reserve", "handshakes", "refused", "refused_sources", "refused_quic", "evicted", "evicted_full", "pressure_ms", "host_refused", "host_panics"}`，最后两项是嵌入方自己的检查按原因拒绝的数量，以及其中 panic 的次数。`GET /events?kinds=admission` 在级别每次变化时另推送 `admission` 事件（`{"level", "free", "reserve", "handshakes"}`） |
 | `POST /connections/report` | 立即做一轮中间记录：向 `connection` 事件的订阅方（`GET /events?kinds=connection`）推送每个进行中连接的记录，空闲的也算；返回 `{"recorded": n}`。按流量计费的主机可按自己的周期调用，也可在正常停止前调用 |
 | `POST /reload`、`POST /shutdown` | 重载配置文件，或停止。重载的响应给出每个入站的结果：`{"inbounds": [{"tag", "change"}]}`，`change` 为 `untouched`、`reloaded`（换了用户或证书）、`added`、`removed`、`replaced` 之一；只有被移除和被替换的入站的连接会断开。配置文件增加、移除或修改了 TUN 时返回 409（`needs_restart`），此时什么都没有变 |
 | `GET /inbounds` | 列出入站：tag、类型、监听地址，以及运行中能否修改用户（`reloadable`） |

@@ -24,6 +24,12 @@
 //!
 //! Sessions, the connections that authenticated, are never touched.
 //!
+//! A host that embeds sail adds checks of its own (`HostHooks`): one per
+//! accepted connection and QUIC handshake, by its addresses, and one per
+//! session, before it is routed. Each runs after sail's own, synchronously,
+//! in the task of its own connection; a refusal is counted under its
+//! reason, and a check that panics refuses.
+//!
 //! Pressure is read when a connection is accepted, at most every
 //! `READ_EVERY`, as the QUIC window budget reads it: an idle instance never
 //! wakes for it. A sing-box based server in production, whose admission
@@ -35,8 +41,9 @@
 //! 145 with eviction against 62 without.
 
 use portable_atomic::AtomicU64;
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,6 +51,58 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::control::events::{AdmissionChange, AdmissionLevel, EventHub};
+
+/// The reasons a host refuses for that are counted apart, at most (a
+/// judgment: a host's reasons are a handful; one that makes them of what
+/// it refuses is not to grow the count without bound). Those past it are
+/// counted under `other`.
+const HOST_REASONS: usize = 64;
+
+/// What a host's check says of a connection: `Err` refuses it, why.
+pub type HostVerdict = Result<(), Cow<'static, str>>;
+
+/// What checks a session, before it is routed.
+type AdmitCheck = dyn Fn(&crate::session::Session) -> HostVerdict + Send + Sync;
+
+/// What checks a connection by its source and the address it came to.
+type SourceCheck = dyn Fn(SocketAddr, SocketAddr) -> HostVerdict + Send + Sync;
+
+/// A host's own checks, run after sail's admission (embed::Options::admit,
+/// admit_source).
+#[derive(Default)]
+pub struct HostHooks {
+    /// Of each session, once its inbound authenticated it, before it is
+    /// routed.
+    pub(crate) admit: Option<Box<AdmitCheck>>,
+    /// Of each connection accepted and QUIC handshake, by its source and
+    /// the address it came to, before its handshake.
+    pub(crate) admit_source: Option<Box<SourceCheck>>,
+}
+
+impl HostHooks {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.admit.is_none() && self.admit_source.is_none()
+    }
+}
+
+/// A host's checks, shared by every run of its instance.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct HostHooksRef(pub(crate) Arc<HostHooks>);
+
+impl PartialEq for HostHooksRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HostHooksRef {}
+
+impl std::fmt::Debug for HostHooksRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostHooks")
+    }
+}
 
 /// How often the memory is read, at most (a judgment: a flood fills memory
 /// over seconds; a read is one small file, two with a cgroup).
@@ -102,6 +161,10 @@ pub struct AdmissionInfo {
     pub evicted_full: u64,
     /// How long the instance was under pressure, hard pressure included.
     pub pressure: Duration,
+    /// Refused by the host's checks, by the reason each gave.
+    pub host_refused: BTreeMap<String, u64>,
+    /// The host's checks that panicked, each refusing its connection.
+    pub host_panics: u64,
 }
 
 /// The handshakes of an instance, and how hard it holds back new ones.
@@ -137,6 +200,9 @@ pub struct Admission {
     unwarned: AtomicU64,
     warned: Mutex<Option<Instant>>,
     events: EventHub,
+    hooks: Option<Arc<HostHooks>>,
+    host_refused: Mutex<BTreeMap<String, u64>>,
+    host_panics: AtomicU64,
 }
 
 #[derive(Default)]
@@ -183,13 +249,35 @@ fn level_of(code: u8) -> AdmissionLevel {
 }
 
 impl Admission {
-    /// The admission `options` set, telling its changes to `events`; none
-    /// when neither memory nor descriptors are looked at.
+    /// The admission `options` set, telling its changes to `events`, with
+    /// the host's checks `hooks`; none when neither memory nor descriptors
+    /// are looked at and the host has no checks.
     pub(crate) fn new(
         options: &crate::runtime::options::Inbound,
         events: EventHub,
+        hooks: Option<&HostHooksRef>,
     ) -> Option<Arc<Self>> {
-        Self::of_memory(options, crate::runtime::system_memory::total(), events)
+        let hooks = hooks
+            .map(|hooks| hooks.0.clone())
+            .filter(|hooks| !hooks.is_empty());
+        let total = crate::runtime::system_memory::total();
+        let admission = match Self::of_memory(options, total, events.clone()) {
+            Some(admission) => admission,
+            // sail's own off: the host's checks alone.
+            None => {
+                hooks.as_ref()?;
+                Self::with(
+                    0,
+                    0,
+                    options.handshake_stall,
+                    false,
+                    Box::new(|| None),
+                    READ_EVERY,
+                    events,
+                )
+            }
+        };
+        Some(Arc::new(Self { hooks, ..admission }))
     }
 
     /// As `new`, the system giving `total` bytes of memory. Where that
@@ -200,7 +288,7 @@ impl Admission {
         options: &crate::runtime::options::Inbound,
         total: Option<u64>,
         events: EventHub,
-    ) -> Option<Arc<Self>> {
+    ) -> Option<Self> {
         if options.memory_reserve == 0 && options.handshake_descriptor_share == 0 {
             return None;
         }
@@ -216,7 +304,7 @@ impl Admission {
             share => file_limit() / share as usize,
         };
         let free = crate::runtime::system_memory::Free::new();
-        Some(Arc::new(Self::with(
+        Some(Self::with(
             reserve,
             descriptors,
             options.handshake_stall,
@@ -224,7 +312,7 @@ impl Admission {
             Box::new(move || free.bytes()),
             READ_EVERY,
             events,
-        )))
+        ))
     }
 
     fn with(
@@ -260,6 +348,9 @@ impl Admission {
             unwarned: AtomicU64::new(0),
             warned: Mutex::default(),
             events,
+            hooks: None,
+            host_refused: Mutex::default(),
+            host_panics: AtomicU64::new(0),
         }
     }
 
@@ -281,6 +372,65 @@ impl Admission {
             return Err(Refusal::Source);
         }
         Ok(())
+    }
+
+    /// Whether the host checks the connections by their addresses.
+    pub(crate) fn checks_sources(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|h| h.admit_source.is_some())
+    }
+
+    /// Whether the host takes in a connection from `source` to `local`, as
+    /// it is accepted, before its handshake: sail's own admission took it.
+    pub(crate) fn host_admits_source(&self, source: SocketAddr, local: SocketAddr) -> bool {
+        match self.hooks.as_ref().and_then(|h| h.admit_source.as_ref()) {
+            Some(check) => self.host_verdict(|| check(source, local)),
+            None => true,
+        }
+    }
+
+    /// Whether the host takes in the session `sess`, which its inbound
+    /// authenticated, before it is routed.
+    pub(crate) fn host_admits(&self, sess: &crate::session::Session) -> bool {
+        match self.hooks.as_ref().and_then(|h| h.admit.as_ref()) {
+            Some(check) => self.host_verdict(|| check(sess)),
+            None => true,
+        }
+    }
+
+    /// What a host's check says, counted: a panic refuses, and goes no
+    /// further than here. On a runtime of many threads it runs as blocking
+    /// work (`block_in_place`): the worker's other tasks move to another
+    /// thread meanwhile, so that a check slower than it should be holds
+    /// back its own connection alone.
+    fn host_verdict(&self, check: impl FnOnce() -> HostVerdict) -> bool {
+        let caught = || std::panic::catch_unwind(std::panic::AssertUnwindSafe(check));
+        let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        let verdict = match multi_thread {
+            true => tokio::task::block_in_place(caught),
+            false => caught(),
+        };
+        match verdict {
+            Ok(Ok(())) => true,
+            Ok(Err(reason)) => {
+                let mut refused = self.host_refused.lock().unwrap_or_else(|e| e.into_inner());
+                let counted = refused.contains_key(reason.as_ref()) || refused.len() < HOST_REASONS;
+                let reason = match counted {
+                    true => reason.into_owned(),
+                    false => "other".to_string(),
+                };
+                *refused.entry(reason).or_default() += 1;
+                false
+            }
+            Err(_) => {
+                self.host_panics.fetch_add(1, Ordering::Relaxed);
+                warn!("admission: the host's check panicked: the connection is refused");
+                false
+            }
+        }
     }
 
     /// Whether a session a host submits with no listener is refused: under
@@ -553,6 +703,12 @@ impl Admission {
             evicted: self.evicted.load(Ordering::Relaxed),
             evicted_full: self.evicted_full.load(Ordering::Relaxed),
             pressure,
+            host_refused: self
+                .host_refused
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            host_panics: self.host_panics.load(Ordering::Relaxed),
         }
     }
 }

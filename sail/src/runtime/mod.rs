@@ -79,6 +79,8 @@ pub struct Host {
     pub events: Option<crate::control::events::EventHub>,
     /// The inbound and outbound kinds the embedding host registered.
     pub kinds: crate::embed::kinds::HostKinds,
+    /// The embedding host's own admission checks, run after sail's.
+    pub admission_hooks: Option<crate::app::inbound::admission::HostHooksRef>,
 }
 
 /// The base URL of a Sub-Store backend. It may carry a secret path, so it
@@ -389,6 +391,7 @@ impl StartSettings {
                 stop_within: None,
                 events: None,
                 kinds: Default::default(),
+                admission_hooks: None,
                 run_dir: match self.run_dir {
                     None => crate::platform::sweep::RunDir::Default,
                     Some(RunDirSetting::Dir(dir)) => crate::platform::sweep::RunDir::Dir(dir),

@@ -163,11 +163,19 @@ impl InboundDatagramHandler for Server {
                 }
                 let generation = resource.load();
                 let accepted = accepted.clone();
+                // The host's check, in the connection's own task.
+                let host_check = admission.as_ref().filter(|a| a.checks_sources()).cloned();
                 crate::runtime::scope::spawn_child(
                     &mut connections,
                     "tuic connection",
                     async move {
                         let remote = incoming.remote_address();
+                        if let Some(admission) = host_check {
+                            if !admission.host_admits_source(remote, local_addr) {
+                                incoming.refuse();
+                                return;
+                            }
+                        }
                         if let Err(e) = serve(
                             generation.settings.clone(),
                             incoming,

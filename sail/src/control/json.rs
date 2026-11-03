@@ -971,6 +971,10 @@ pub struct Admission {
     pub evicted_full: u64,
     /// How long it was under pressure.
     pub pressure_ms: u64,
+    /// Refused by the embedding host's checks, by reason, and those of its
+    /// checks that panicked.
+    pub host_refused: std::collections::BTreeMap<String, u64>,
+    pub host_panics: u64,
 }
 
 impl Admission {
@@ -987,6 +991,8 @@ impl Admission {
                 evicted: 0,
                 evicted_full: 0,
                 pressure_ms: 0,
+                host_refused: Default::default(),
+                host_panics: 0,
             },
             Some(info) => Self {
                 level: admission_level(info.level).into(),
@@ -999,6 +1005,8 @@ impl Admission {
                 evicted: info.evicted,
                 evicted_full: info.evicted_full,
                 pressure_ms: info.pressure.as_millis() as u64,
+                host_refused: info.host_refused.clone(),
+                host_panics: info.host_panics,
             },
         }
     }

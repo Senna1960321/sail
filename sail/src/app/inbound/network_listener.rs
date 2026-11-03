@@ -363,6 +363,9 @@ async fn handle_tcp_listen(
             place.admitted(admission.enter(source.ip(), &tag));
         }
         let eviction = place.eviction();
+        // The host's check of it runs in its own task: a slow one holds
+        // back this connection alone.
+        let host_check = admission.filter(|a| a.checks_sources()).cloned();
         let handler_cloned = handler.clone();
         let dispatcher_cloned = dispatcher.clone();
         let nat_manager_cloned = nat_manager.clone();
@@ -370,6 +373,13 @@ async fn handle_tcp_listen(
         crate::runtime::scope::spawn("inbound tcp", async move {
             #[cfg(feature = "fault-injection")]
             fault_point!(crate::fault::Point::ContainedTask, "a connection's task");
+            if let Some(admission) = host_check {
+                let local = stream.local_addr().unwrap_or(listen_addr);
+                if !admission.host_admits_source(source, local) {
+                    debug!("connection from {} refused by the host", source);
+                    return;
+                }
+            }
             // Handle each TCP stream, for as long as its inbound is there.
             tokio::select! {
                 result = handle_inbound_tcp_stream(

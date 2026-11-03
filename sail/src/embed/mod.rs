@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+mod admit;
 mod dial;
 mod error;
 mod instance;
@@ -43,6 +44,7 @@ pub use crate::runtime::platform::{ConnectionOwner, ConnectionQuery};
 pub use crate::runtime::{Platform, TunRequest};
 pub use crate::session::{Network, SocksAddr as Address};
 pub use crate::user::Limits as UserLimits;
+pub use admit::Verdict;
 pub use dial::{DialDatagram, DialStream};
 pub use error::{Error, ErrorKind};
 pub use instance::{ids_held, Instance};
@@ -135,6 +137,7 @@ pub struct Options {
     record_interval: Option<Duration>,
     lossless_records: Option<usize>,
     kinds: kinds::HostKinds,
+    admission: crate::app::inbound::admission::HostHooks,
 }
 
 impl Options {

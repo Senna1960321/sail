@@ -148,11 +148,19 @@ impl InboundDatagramHandler for DatagramHandler {
                     local_addr,
                 };
                 let config = generation.server_config.clone();
+                // The host's check, in the connection's own task.
+                let host_check = admission.as_ref().filter(|a| a.checks_sources()).cloned();
                 crate::runtime::scope::spawn_child(
                     &mut connections,
                     "hysteria2 connection",
                     async move {
                         let remote = incoming.remote_address();
+                        if let Some(admission) = host_check {
+                            if !admission.host_admits_source(remote, local_addr) {
+                                incoming.refuse();
+                                return;
+                            }
+                        }
                         if let Err(e) = conn.serve(incoming, config).await {
                             debug!("hysteria2 connection from {}: {}", remote, e);
                         }

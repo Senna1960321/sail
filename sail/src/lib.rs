@@ -2348,7 +2348,11 @@ fn run(rt_id: RuntimeId, opts: StartOptions, start: &Arc<Starting>) -> Result<()
     let scope = runtime::scope::TaskScope::new(events.clone());
     let stop_within = host.stop_within.unwrap_or(runtime::scope::STOP_WITHIN);
     // The run's, across its reloads, which keep the runtime options.
-    let admission = app::inbound::admission::Admission::new(&opts.runtime.inbound, events.clone());
+    let admission = app::inbound::admission::Admission::new(
+        &opts.runtime.inbound,
+        events.clone(),
+        host.admission_hooks.as_ref(),
+    );
     let env = Arc::new(runtime::RuntimeEnv {
         options: opts.runtime,
         host,

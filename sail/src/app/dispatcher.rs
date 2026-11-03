@@ -715,7 +715,8 @@ impl Dispatcher {
         // of the session is made, and held until it has one among the
         // sessions, or is refused one.
         let handshake = sess.handshake.take();
-        if self.env.events.records_refuse() || !self.admitted(&mut sess) {
+        if self.env.events.records_refuse() || !self.admitted(&mut sess) || !self.host_admits(&sess)
+        {
             return None;
         }
         // Its place, held as long as it lives; without one, it is refused
@@ -1194,6 +1195,12 @@ impl Dispatcher {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "the user may not connect",
+            ));
+        }
+        if !self.host_admits(&sess) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refused by the host",
             ));
         }
 
@@ -1730,6 +1737,22 @@ impl Dispatcher {
                         number.closed(sess, Outcome::Rejected, End::Closed(ClosedBy::User));
                     }
                 }
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the host's own check takes the session in, after sail's:
+    /// one it refuses was never admitted, and has no record, its number
+    /// told to a host or not.
+    fn host_admits(&self, sess: &Session) -> bool {
+        match &self.env.admission {
+            Some(admission) if !admission.host_admits(sess) => {
+                if let Some(number) = &sess.number {
+                    number.forget();
+                }
+                debug!("session refused by the host");
                 false
             }
             _ => true,

@@ -654,6 +654,35 @@ started: its level, how many it refused and closed, and how long it was
 under pressure; none when it is off. Sessions that authenticated are
 never touched.
 
+**A host's own admission.** Two checks on `Options`, registered before
+the start and kept across its runs and reloads, refuse what the host's
+own state says to (a credential revoked that no reload has taken out
+yet, a source of its own list):
+
+- `admit_source(|source, local| ...)` sees each TCP connection an inbound
+  accepts and each QUIC handshake, before its handshake. One it rejects
+  is closed at once, a QUIC one refused.
+- `admit(|session: &SessionInfo| ...)` sees each session once its
+  inbound authenticated it, before it is routed: a TCP connection, a
+  stream of a multiplexed one, a UDP session to each destination, a
+  session a host submitted. One it rejects is closed as a session of a
+  user that may not connect is, never routed, and has no connection
+  record.
+
+Each returns `Verdict::Accept` or `Verdict::reject(reason)`. sail's own
+admission and its users' checks run first: the host sees only what sail
+would take in. The checks are synchronous and never awaited; each runs in
+the task of its own connection, as blocking work (`block_in_place`) where
+the instance has several threads, so that a slow one holds back that
+connection alone. With one thread (`Threads::One`) a slow check holds
+back the instance. They are to answer in microseconds from what the host
+holds.
+`instance.admission()` counts what they rejected by reason
+(`host_refused`, 64 reasons apart and the rest as `other`), with admission
+on whenever a check is registered. A check that panics rejects its
+connection, and is counted (`host_panics`): the panic goes no further,
+where the host is built to unwind.
+
 `Kinds::SYSTEM` gives `Event::SystemChanged { kind, resource }` when
 someone else changed what sail set up on the system for a TUN with
 auto_route: on macOS, a route into the TUN gone, or another route that

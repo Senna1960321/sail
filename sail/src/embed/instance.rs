@@ -143,6 +143,7 @@ impl Instance {
             record_interval,
             lossless_records,
             kinds,
+            admission,
         } = options;
         let profile: crate::runtime::Profile = match &settings.profile {
             Some(p) => p
@@ -155,6 +156,8 @@ impl Instance {
             .map_err(|e| Error::new(ErrorKind::Config, format!("{:#}", e)))?;
         host.stop_within = stop_within;
         host.kinds = kinds;
+        host.admission_hooks = (!admission.is_empty())
+            .then(|| crate::app::inbound::admission::HostHooksRef(Arc::new(admission)));
         // As sail-cli runs each profile.
         let threads = threads.unwrap_or(match profile.threads() {
             crate::runtime::ProfileThreads::One => Threads::One,

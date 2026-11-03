@@ -1044,14 +1044,17 @@ pub struct SessionInfo {
 
 impl SessionInfo {
     fn of(sess: &Session) -> Self {
+        if let Some(number) = &sess.number {
+            number.told(sess);
+        }
+        Self::untold(sess)
+    }
+
+    /// What a host is told of `sess`, its number not yet told: a session a
+    /// host's check refuses has no record.
+    pub(super) fn untold(sess: &Session) -> Self {
         // Every session sail dispatches is numbered before it is dialled.
-        let id = match &sess.number {
-            Some(number) => {
-                number.told(sess);
-                number.id()
-            }
-            None => 0,
-        };
+        let id = sess.number.as_ref().map_or(0, |number| number.id());
         let (domain, domain_source) = match crate::app::dispatcher::domain_of(sess) {
             Some((domain, source)) => (Some(domain), Some(source)),
             None => (None, None),

@@ -186,7 +186,8 @@ async fn a_reserve_without_a_memory_reading_still_makes_room_when_full() {
     let mut options = crate::runtime::RuntimeOptions::default().inbound;
     options.memory_reserve = 1;
     options.handshake_stall = Duration::from_millis(50);
-    let a = Admission::of_memory(&options, None, EventHub::default()).expect("admission on");
+    let a =
+        Arc::new(Admission::of_memory(&options, None, EventHub::default()).expect("admission on"));
     let stalled = a.enter(ip(1), &tag("full"));
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert!(a.check(ip(2)).is_ok());
@@ -252,11 +253,52 @@ fn the_memory_is_read_at_most_so_often() {
 #[test]
 fn off_by_default_on_a_client_and_on_on_a_server() {
     let options = crate::runtime::RuntimeOptions::default();
-    assert!(Admission::new(&options.inbound, EventHub::default()).is_none());
+    assert!(Admission::new(&options.inbound, EventHub::default(), None).is_none());
     let server = crate::runtime::RuntimeOptions::profile(crate::runtime::Profile::Server);
     assert_eq!(server.inbound.memory_reserve, 20);
     assert_eq!(server.inbound.handshake_stall, Duration::from_secs(3));
-    assert!(Admission::new(&server.inbound, EventHub::default()).is_some());
+    assert!(Admission::new(&server.inbound, EventHub::default(), None).is_some());
+    // A host's checks keep it on where sail's own is off; none, it is off.
+    let hooks = HostHooksRef(Arc::new(HostHooks {
+        admit_source: Some(Box::new(|_, _| Ok(()))),
+        ..Default::default()
+    }));
+    let a = Admission::new(&options.inbound, EventHub::default(), Some(&hooks))
+        .expect("on for the host's checks");
+    assert_eq!(a.info().reserve, 0);
+    let none = HostHooksRef(Arc::new(HostHooks::default()));
+    assert!(Admission::new(&options.inbound, EventHub::default(), Some(&none)).is_none());
+}
+
+/// A host's checks refuse by their reasons, counted apart up to
+/// `HOST_REASONS` and the rest as `other`; one that panics refuses, and
+/// the panic is counted and goes no further.
+#[test]
+fn a_hosts_checks_are_counted_by_their_reasons() {
+    let options = crate::runtime::RuntimeOptions::default();
+    let hooks = HostHooksRef(Arc::new(HostHooks {
+        admit_source: Some(Box::new(|source: SocketAddr, _| match source.port() {
+            0 => panic!("a check that panics"),
+            1 => Ok(()),
+            port => Err(format!("reason {}", port).into()),
+        })),
+        admit: Some(Box::new(|_| Err("revoked".into()))),
+    }));
+    let a = Admission::new(&options.inbound, EventHub::default(), Some(&hooks)).unwrap();
+    let at = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    assert!(a.host_admits_source(at(1), at(443)));
+    assert!(!a.host_admits_source(at(0), at(443)));
+    for port in 2..(2 + HOST_REASONS as u16 + 5) {
+        assert!(!a.host_admits_source(at(port), at(443)));
+    }
+    assert!(!a.host_admits_source(at(2), at(443)));
+    assert!(!a.host_admits(&crate::session::Session::default()));
+    let info = a.info();
+    assert_eq!(info.host_panics, 1);
+    assert_eq!(info.host_refused.len(), HOST_REASONS + 1);
+    assert_eq!(info.host_refused["reason 2"], 2);
+    assert_eq!(info.host_refused["other"], 6);
+    assert_eq!(info.host_refused.get("revoked"), None);
 }
 
 /// A QUIC connection is refused before its handshake under pressure, and
