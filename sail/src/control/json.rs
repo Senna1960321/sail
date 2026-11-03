@@ -239,9 +239,8 @@ fn unix_ms(at: std::time::SystemTime) -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// What a connection sent and received since its record before: the
-/// connection record event. The `up` and `down` of one connection's
-/// records add up to its totals.
+/// What a connection sent and received since it started: the connection
+/// record event. Its closed record's totals are what it was counted.
 #[derive(Serialize, Clone, PartialEq, Eq, Debug)]
 pub struct ConnectionRecord {
     pub id: u64,
@@ -260,11 +259,16 @@ pub struct ConnectionRecord {
     /// For `closed`: `api`, `user`, `inbound`, `rules`, `network` or
     /// `stopped`.
     pub closed_by: Option<String>,
+    /// How it was used, for a closed record: `ok`, `dial_failed`,
+    /// `blocked` or `rejected`.
+    pub outcome: Option<String>,
     /// `tcp` or `udp`.
     pub network: String,
     pub user: Option<String>,
     pub inbound: String,
     pub source: String,
+    /// The address it connected to; `0.0.0.0:0` where it is not known.
+    pub local: String,
     /// Where it went, as the rules saw it.
     pub destination: String,
     /// What the outbound was asked to reach, where it was kept.
@@ -272,24 +276,22 @@ pub struct ConnectionRecord {
     pub domain: Option<String>,
     /// `request`, `fake_ip`, `sniffed` or `reverse_mapping`.
     pub domain_source: Option<String>,
+    /// The outbound the rules sent it to.
+    pub outbound: Option<String>,
     /// The outbounds it went through, the group first.
     pub chain: Vec<String>,
-    /// Bytes since the record before: up to where it goes, down from it.
-    pub up: u64,
-    pub down: u64,
-    /// Bytes since it started.
+    /// Bytes since it started: up to where it goes, down from it.
     pub up_total: u64,
     pub down_total: u64,
-    /// Unix milliseconds: when it started, where `up` and `down` count
-    /// from, and when it was counted (for a closed record, its end).
+    /// Unix milliseconds: when it started, and when it was counted (for a
+    /// closed record, its end).
     pub start_ms: u64,
-    pub since_ms: u64,
     pub at_ms: u64,
 }
 
 impl ConnectionRecord {
     pub fn of(r: &crate::control::events::ConnectionRecord) -> Self {
-        use crate::control::events::{ClosedBy, End, RecordKind};
+        use crate::control::events::{ClosedBy, End, Outcome, RecordKind};
         let end = match r.kind {
             RecordKind::Closed(end) => Some(end),
             _ => None,
@@ -332,21 +334,29 @@ impl ConnectionRecord {
                 ),
                 _ => None,
             },
+            outcome: r.outcome.map(|outcome| {
+                match outcome {
+                    Outcome::Ok => "ok",
+                    Outcome::DialFailed => "dial_failed",
+                    Outcome::Blocked => "blocked",
+                    _ => "rejected",
+                }
+                .into()
+            }),
             network: r.network.to_string(),
             user: r.user.clone(),
             inbound: r.inbound.clone(),
             source: r.source.to_string(),
+            local: r.local.to_string(),
             destination: r.destination.to_string(),
             request_destination: r.request_destination.as_ref().map(|d| d.to_string()),
             domain: r.domain.clone(),
             domain_source: r.domain_source.map(domain_source),
+            outbound: r.outbound.clone(),
             chain: r.chain.clone(),
-            up: r.up,
-            down: r.down,
             up_total: r.up_total,
             down_total: r.down_total,
             start_ms: unix_ms(r.start),
-            since_ms: unix_ms(r.since),
             at_ms: unix_ms(r.at),
         }
     }
@@ -1359,12 +1369,15 @@ mod tests {
             "connection_record": ConnectionRecord {
                 id: 7, run_ms: 1_759_300_000_000, seq: 2, kind: "closed".into(),
                 end: Some("error".into()), error: Some("connection reset".into()), closed_by: None,
+                outcome: Some("ok".into()),
                 network: "tcp".into(), user: Some("alice".into()), inbound: "in".into(),
-                source: "172.19.0.1:50000".into(), destination: "example.com:443".into(),
+                source: "172.19.0.1:50000".into(), local: "203.0.113.1:443".into(),
+                destination: "example.com:443".into(),
                 request_destination: Some("example.com:443".into()), domain: Some("example.com".into()),
-                domain_source: Some("request".into()), chain: vec!["proxy".into(), "a".into()],
-                up: 100, down: 2000, up_total: 300, down_total: 9000,
-                start_ms: 1_759_300_000_123, since_ms: 1_759_300_060_123, at_ms: 1_759_300_075_000,
+                domain_source: Some("request".into()), outbound: Some("proxy".into()),
+                chain: vec!["proxy".into(), "a".into()],
+                up_total: 300, down_total: 9000,
+                start_ms: 1_759_300_000_123, at_ms: 1_759_300_075_000,
             },
             "dns_exchange": DnsExchange {
                 name: "example.com".into(), qtype: "A".into(), qtype_code: 1,

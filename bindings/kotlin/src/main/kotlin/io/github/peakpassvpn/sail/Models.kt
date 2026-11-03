@@ -178,9 +178,8 @@ data class Routed(
 )
 
 /**
- * What a connection sent and received since its record before, as it
- * closed or at an interim pass: the `up` and `down` of one connection's
- * records add up to its totals.
+ * What a connection sent and received since it started, as it closed or
+ * at an interim pass: its closed record's totals are what it was counted.
  */
 @Serializable
 data class ConnectionRecord(
@@ -195,21 +194,24 @@ data class ConnectionRecord(
     val error: String? = null,
     /** api, user, inbound, rules, network or stopped. */
     @SerialName("closed_by") val closedBy: String? = null,
+    /** For a closed record: ok, dial_failed, blocked or rejected. */
+    val outcome: String? = null,
     val network: String,
     val user: String? = null,
     val inbound: String,
     val source: String,
+    /** The address it connected to; 0.0.0.0:0 where it is not known. */
+    val local: String,
     val destination: String,
     @SerialName("request_destination") val requestDestination: String? = null,
     val domain: String? = null,
     @SerialName("domain_source") val domainSource: String? = null,
+    /** The outbound the rules sent it to. */
+    val outbound: String? = null,
     val chain: List<String> = emptyList(),
-    val up: Long,
-    val down: Long,
     @SerialName("up_total") val upTotal: Long,
     @SerialName("down_total") val downTotal: Long,
     @SerialName("start_ms") val startMs: Long,
-    @SerialName("since_ms") val sinceMs: Long,
     @SerialName("at_ms") val atMs: Long,
 )
 

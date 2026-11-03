@@ -1,9 +1,9 @@
 use super::*;
-use crate::control::events::{End, RecordKind};
+use crate::control::events::{End, Outcome, RecordKind};
 use crate::session::{Network, SocksAddr};
 use std::time::Duration;
 
-fn record(id: u64, user: &str, up: u64, down: u64, closed: bool) -> Arc<ConnectionRecord> {
+fn record(id: u64, up: u64, closed: bool) -> Arc<ConnectionRecord> {
     let at = std::time::UNIX_EPOCH + Duration::from_secs(1000 + id);
     Arc::new(ConnectionRecord {
         id,
@@ -13,82 +13,74 @@ fn record(id: u64, user: &str, up: u64, down: u64, closed: bool) -> Arc<Connecti
             true => RecordKind::Closed(End::Finished),
             false => RecordKind::Interim,
         },
+        outcome: closed.then_some(Outcome::Ok),
         network: Network::Tcp,
-        user: Some(user.into()),
+        user: Some("a".into()),
         inbound: "in".into(),
         source: "127.0.0.1:1".parse().unwrap(),
+        local: "127.0.0.1:2".parse().unwrap(),
         destination: SocksAddr::any(),
         request_destination: None,
         domain: None,
         domain_source: None,
+        outbound: Some("g".into()),
         chain: vec!["g".into(), "out".into()],
-        up,
-        down,
         up_total: up,
-        down_total: down,
+        down_total: up * 10,
         start: at,
-        since: at,
         at,
     })
 }
 
-/// Under the cap, records come in order; past it they fold by user,
-/// inbound and outbound, and the summaries come once the queue is empty:
-/// every byte is read once.
+fn drain(reader: &mut RecordStream) -> Vec<u64> {
+    std::iter::from_fn(|| reader.try_next())
+        .map(|r| r.id)
+        .collect()
+}
+
+/// Past the cap every closed record is still kept, in order; interim
+/// records of a timed pass are dropped and counted, and those of a pass
+/// the host asked for kept.
 #[test]
-fn past_the_cap_records_fold_and_no_byte_is_lost() {
+fn closed_records_are_kept_past_the_cap_and_only_interim_ones_dropped() {
     let sink = LosslessRecords::new(2);
     let mut reader = sink.reader().unwrap();
-    for (id, user, up) in [
-        (1, "a", 1),
-        (2, "a", 2),
-        (3, "a", 4),
-        (4, "a", 8),
-        (5, "b", 16),
-    ] {
-        sink.push(record(id, user, up, up * 10, id != 4));
-    }
-    assert_eq!((reader.queued(), reader.folded_total()), (2, 3));
-    let mut read = Vec::new();
-    while let Some(r) = reader.try_next() {
-        read.push(r);
-    }
-    assert!(matches!(&read[0], Record::Connection(r) if r.id == 1));
-    assert!(matches!(&read[1], Record::Connection(r) if r.id == 2));
-    let mut folded: Vec<_> = read[2..]
-        .iter()
-        .map(|r| match r {
-            Record::Folded(s) => s.clone(),
-            other => panic!("{:?}", other),
-        })
-        .collect();
-    folded.sort_by(|x, y| x.user.cmp(&y.user));
-    assert_eq!(folded.len(), 2);
-    let a = &folded[0];
-    assert_eq!(
-        (
-            a.user.as_deref(),
-            a.outbound.as_str(),
-            a.up,
-            a.down,
-            a.records,
-            a.closed
-        ),
-        (Some("a"), "out", 12, 120, 2, 1)
-    );
-    assert!(a.since < a.at);
-    assert_eq!((folded[1].up, folded[1].records), (16, 1));
-    let up: u64 = read
-        .iter()
-        .map(|r| match r {
-            Record::Connection(r) => r.up,
-            Record::Folded(s) => s.up,
-        })
-        .sum();
-    assert_eq!(up, 1 + 2 + 4 + 8 + 16);
-    // Drained: what comes now is queued again.
-    sink.push(record(6, "a", 32, 0, true));
-    assert!(matches!(reader.try_next(), Some(Record::Connection(r)) if r.id == 6));
+    sink.push(record(1, 1, false), true);
+    sink.push(record(2, 2, true), true);
+    // Full: a timed interim record goes, a closed one and an asked one stay.
+    sink.push(record(3, 4, false), true);
+    sink.push(record(4, 8, true), true);
+    sink.push(record(5, 16, false), false);
+    assert_eq!((reader.queued(), reader.dropped()), (4, 1));
+    assert_eq!(drain(&mut reader), [1, 2, 4, 5]);
+    // Drained: an interim record is queued again.
+    sink.push(record(6, 32, false), true);
+    assert_eq!(drain(&mut reader), [6]);
+    assert_eq!(reader.dropped(), 1);
+}
+
+/// While `cap` closed records wait, new connections are refused and
+/// counted; once the reader takes one, they are let in again. Interim
+/// records waiting do not refuse anyone.
+#[test]
+fn closed_records_at_the_cap_refuse_new_connections_until_read() {
+    let sink = LosslessRecords::new(2);
+    let mut reader = sink.reader().unwrap();
+    sink.push(record(1, 1, false), false);
+    sink.push(record(2, 1, false), false);
+    sink.push(record(3, 1, true), true);
+    assert!(!sink.refuse());
+    sink.push(record(4, 1, true), true);
+    assert!(sink.refuse());
+    assert!(sink.refuse());
+    assert_eq!(reader.refused(), 2);
+    // The interim records go first: still refused.
+    assert_eq!(reader.try_next().unwrap().id, 1);
+    assert_eq!(reader.try_next().unwrap().id, 2);
+    assert!(sink.refuse());
+    assert_eq!(reader.try_next().unwrap().id, 3);
+    assert!(!sink.refuse());
+    assert_eq!(reader.refused(), 3);
 }
 
 /// One reader at a time; another once it is dropped.
@@ -108,10 +100,10 @@ async fn a_waiting_reader_is_woken() {
     let mut reader = sink.reader().unwrap();
     let waiting = tokio::spawn(async move { reader.next().await });
     tokio::task::yield_now().await;
-    sink.push(record(1, "a", 1, 1, true));
+    sink.push(record(1, 1, true), true);
     let got = tokio::time::timeout(Duration::from_secs(5), waiting)
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(got, Record::Connection(r) if r.id == 1));
+    assert_eq!(got.id, 1);
 }

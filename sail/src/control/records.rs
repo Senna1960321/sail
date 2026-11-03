@@ -1,15 +1,16 @@
 //! Connection records that are never lost, for a host that bills by them
-//! (`embed::Options::connection_records_lossless`, sail#14's R1-e).
+//! (`embed::Options::connection_records_lossless`, sail#14 and sail#24).
 //!
 //! `Kinds::CONNECTION` is a broadcast: a subscriber that falls behind is
 //! told `lagged`, and the records it missed are gone, so that no connection
-//! waits for it. This sink keeps that rule and loses no byte instead: the
-//! records queue for one reader, up to a cap the host sets; past it, a
-//! record is not queued but folded into a summary of its user, inbound and
-//! outbound, which counts its bytes and that it was folded. Once the reader
-//! has taken every record queued, it is given the summaries. The records
-//! and the summaries it reads add up to every byte the connections were
-//! counted; only the detail of the folded records is lost.
+//! waits for it. This sink loses no connection's end instead: its records
+//! queue for one reader, and every closed record is kept, however far
+//! behind the reader is. What bounds them is admission: while `cap`
+//! closed records wait for the reader, a new connection is refused, and
+//! counted so, until it catches up. Interim records carry a connection's
+//! bytes since it started, so the next holds all one held: those of a
+//! timed pass are dropped, and counted, while `cap` records wait; those of
+//! a pass the host asks for are kept, as a barrier it asked for.
 //!
 //! Adding a record is a push under a short lock, made where records are
 //! made, as a connection closes and in interim passes: the data path never
@@ -17,52 +18,19 @@
 //! records of the connections a stop cut wait for the reader. What is not
 //! read when the process ends, a crash, is lost with it.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
-use super::events::ConnectionRecord;
-
-/// What the reader of a lossless sink is given.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Record {
-    /// A connection's record, as `Kinds::CONNECTION` tells it.
-    Connection(Arc<ConnectionRecord>),
-    /// The records folded while the queue was full, of one user, inbound
-    /// and outbound together.
-    Folded(RecordSummary),
-}
-
-/// What records folded together counted: their bytes, and how many they
-/// were, of one user, inbound and outbound.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct RecordSummary {
-    pub user: Option<String>,
-    pub inbound: String,
-    /// The outbound that carried them, the last of their chain; empty for
-    /// none.
-    pub outbound: String,
-    /// The `up` and `down` of the records folded, added up.
-    pub up: u64,
-    pub down: u64,
-    /// How many records were folded, and how many of them were closed
-    /// records: the connections that ended.
-    pub records: u64,
-    pub closed: u64,
-    /// The earliest `since` and the latest `at` of the records folded.
-    pub since: SystemTime,
-    pub at: SystemTime,
-}
-
-type Key = (Option<String>, String, String);
+use super::events::{ConnectionRecord, RecordKind};
 
 /// A lossless sink of connection records, the instance's.
 pub struct LosslessRecords {
     cap: usize,
     queue: Mutex<Queue>,
+    /// Closed records queued: read without the lock, as each new
+    /// connection asks whether it is refused.
+    closed: AtomicUsize,
     notify: tokio::sync::Notify,
     /// A reader holds it.
     taken: AtomicBool,
@@ -71,18 +39,20 @@ pub struct LosslessRecords {
 #[derive(Default)]
 struct Queue {
     records: VecDeque<Arc<ConnectionRecord>>,
-    folded: HashMap<Key, RecordSummary>,
-    /// Records folded since the sink was made.
-    folded_total: u64,
+    /// Interim records dropped since the sink was made.
+    dropped: u64,
+    /// Connections refused since the sink was made.
+    refused: u64,
 }
 
 impl LosslessRecords {
-    /// A sink that queues `cap` records at most (one at least) before it
-    /// folds them.
+    /// A sink that keeps `cap` closed records (one at least) before it
+    /// refuses new connections.
     pub fn new(cap: usize) -> Arc<Self> {
         Arc::new(LosslessRecords {
             cap: cap.max(1),
             queue: Mutex::default(),
+            closed: AtomicUsize::new(0),
             notify: tokio::sync::Notify::new(),
             taken: AtomicBool::new(false),
         })
@@ -92,54 +62,51 @@ impl LosslessRecords {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Takes `record`: queued, or folded when the queue is full. Never
-    /// waits for the reader.
-    pub(crate) fn push(&self, record: Arc<ConnectionRecord>) {
+    /// Takes `record`: queued, unless it is `droppable` and `cap` records
+    /// wait; a closed record always is. Never waits for the reader.
+    pub(crate) fn push(&self, record: Arc<ConnectionRecord>, droppable: bool) {
+        let closed = matches!(record.kind, RecordKind::Closed(_));
         {
             let mut queue = self.lock();
-            if queue.records.len() < self.cap {
-                queue.records.push_back(record);
-            } else {
-                queue.folded_total += 1;
-                let key = (
-                    record.user.clone(),
-                    record.inbound.clone(),
-                    record.chain.last().cloned().unwrap_or_default(),
-                );
-                let closed = matches!(record.kind, super::events::RecordKind::Closed(_));
-                let summary = queue
-                    .folded
-                    .entry(key)
-                    .or_insert_with_key(|key| RecordSummary {
-                        user: key.0.clone(),
-                        inbound: key.1.clone(),
-                        outbound: key.2.clone(),
-                        up: 0,
-                        down: 0,
-                        records: 0,
-                        closed: 0,
-                        since: record.since,
-                        at: record.at,
-                    });
-                summary.up += record.up;
-                summary.down += record.down;
-                summary.records += 1;
-                summary.closed += u64::from(closed);
-                summary.since = summary.since.min(record.since);
-                summary.at = summary.at.max(record.at);
+            if !closed && droppable && queue.records.len() >= self.cap {
+                queue.dropped += 1;
+                return;
+            }
+            queue.records.push_back(record);
+            if closed {
+                self.closed.fetch_add(1, Ordering::Relaxed);
             }
         }
         self.notify.notify_one();
     }
 
-    /// The next record, or summary once the queue is empty; none now.
-    fn take(&self) -> Option<Record> {
-        let mut queue = self.lock();
-        if let Some(record) = queue.records.pop_front() {
-            return Some(Record::Connection(record));
+    /// Whether a new connection is refused: `cap` closed records wait for
+    /// the reader. Counted when it is.
+    pub(crate) fn refuse(&self) -> bool {
+        if self.closed.load(Ordering::Relaxed) < self.cap {
+            return false;
         }
-        let key = queue.folded.keys().next().cloned()?;
-        queue.folded.remove(&key).map(Record::Folded)
+        let refused = {
+            let mut queue = self.lock();
+            queue.refused += 1;
+            queue.refused
+        };
+        if refused == 1 || refused.is_power_of_two() {
+            tracing::warn!(
+                "connection records: {} closed records wait for the host: new connections refused ({} so far)",
+                self.cap, refused
+            );
+        }
+        true
+    }
+
+    /// The next record; none now.
+    fn take(&self) -> Option<Arc<ConnectionRecord>> {
+        let record = self.lock().records.pop_front()?;
+        if matches!(record.kind, RecordKind::Closed(_)) {
+            self.closed.fetch_sub(1, Ordering::Relaxed);
+        }
+        Some(record)
     }
 
     /// The reader, unless one holds it already.
@@ -154,7 +121,7 @@ pub struct RecordStream(Arc<LosslessRecords>);
 
 impl RecordStream {
     /// The next record, waiting for one.
-    pub async fn next(&mut self) -> Record {
+    pub async fn next(&mut self) -> Arc<ConnectionRecord> {
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
@@ -168,7 +135,7 @@ impl RecordStream {
 
     /// The next record if there is one now: to drain what is left, as
     /// after a stop.
-    pub fn try_next(&mut self) -> Option<Record> {
+    pub fn try_next(&mut self) -> Option<Arc<ConnectionRecord>> {
         self.0.take()
     }
 
@@ -177,9 +144,16 @@ impl RecordStream {
         self.0.lock().records.len()
     }
 
-    /// Records folded since the sink was made.
-    pub fn folded_total(&self) -> u64 {
-        self.0.lock().folded_total
+    /// Interim records dropped since the sink was made, the queue full:
+    /// each connection's next record holds what they did.
+    pub fn dropped(&self) -> u64 {
+        self.0.lock().dropped
+    }
+
+    /// Connections refused since the sink was made, its closed records
+    /// at the cap.
+    pub fn refused(&self) -> u64 {
+        self.0.lock().refused
     }
 }
 

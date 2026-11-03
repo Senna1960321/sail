@@ -142,9 +142,8 @@ public struct Routed: Decodable, Equatable, Sendable {
     public let connectError: String?
 }
 
-/// What a connection sent and received since its record before, as it
-/// closed or at an interim pass: the `up` and `down` of one connection's
-/// records add up to its totals.
+/// What a connection sent and received since it started, as it closed or
+/// at an interim pass: its closed record's totals are what it was counted.
 public struct ConnectionRecord: Decodable, Equatable, Sendable {
     public let id: UInt64
     /// When the instance's run started, Unix ms: with `id`, it names the
@@ -158,21 +157,24 @@ public struct ConnectionRecord: Decodable, Equatable, Sendable {
     public let error: String?
     /// api, user, inbound, rules, network or stopped.
     public let closedBy: String?
+    /// For a closed record: ok, dial_failed, blocked or rejected.
+    public let outcome: String?
     public let network: String
     public let user: String?
     public let inbound: String
     public let source: String
+    /// The address it connected to; 0.0.0.0:0 where it is not known.
+    public let local: String
     public let destination: String
     public let requestDestination: String?
     public let domain: String?
     public let domainSource: String?
+    /// The outbound the rules sent it to.
+    public let outbound: String?
     public let chain: [String]
-    public let up: UInt64
-    public let down: UInt64
     public let upTotal: UInt64
     public let downTotal: UInt64
     public let startMs: UInt64
-    public let sinceMs: UInt64
     public let atMs: UInt64
 }
 

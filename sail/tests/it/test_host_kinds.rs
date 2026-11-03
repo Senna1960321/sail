@@ -899,11 +899,11 @@ async fn each_host_session_is_one_connection_record() {
             .unwrap_or_else(|| panic!("{}'s record in {:?}", user, records))
     };
     let alice = of("alice");
-    assert_eq!((alice.up, alice.down), (1234, 1234));
+    assert_eq!((alice.up_total, alice.down_total), (1234, 1234));
     assert_eq!(alice.inbound, "mux-in");
     assert!(alice.chain.contains(&"direct".to_string()), "{:?}", alice);
     let bob = of("bob");
-    assert_eq!((bob.up, bob.down), (777, 777));
+    assert_eq!((bob.up_total, bob.down_total), (777, 777));
     assert!(bob.chain.contains(&"hop".to_string()), "{:?}", bob);
     drop(mux);
     instance.stop().await.unwrap();

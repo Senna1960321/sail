@@ -29,7 +29,7 @@ mod rule_set;
 mod streams;
 
 pub use crate::app::inbound::AdmissionInfo;
-pub use crate::control::records::{Record, RecordStream, RecordSummary};
+pub use crate::control::records::RecordStream;
 pub use crate::control::{
     ConnectionInfo, Delay, Failure, GroupInfo, InboundInfo, Mode, OutboundInfo, ProviderInfo,
     RuleSetInfo, SourceKind, SubscriptionInfo, Traffic,
@@ -55,8 +55,8 @@ pub use logs::{LogBatch, LogFilter, LogLine};
 pub use network::{
     AdmissionChange, AdmissionLevel, ClosedBy, ConnectionRecord, DialFailure, DialStage,
     DnsExchange, DnsOutcome, DnsSource, DomainSource, End, Event, GroupSwitch, Interface, Kinds,
-    NetworkChangeKind, NetworkChangeReason, NetworkEvent, NetworkKind, NetworkState, RecordKind,
-    RouteAction, RoutedConnection, SwitchReason, TunName, UserEvent,
+    NetworkChangeKind, NetworkChangeReason, NetworkEvent, NetworkKind, NetworkState, Outcome,
+    RecordKind, RouteAction, RoutedConnection, SwitchReason, TunName, UserEvent,
 };
 #[cfg(feature = "rule-set")]
 pub use rule_set::{MatchInput, RuleSet, RuleSetFormat};
@@ -236,12 +236,15 @@ impl Options {
         self
     }
 
-    /// Keeps every connection record for one reader
+    /// Keeps connection records for one reader
     /// (`Instance::connection_records`), from the instance's first start:
-    /// a host that bills by them loses no byte. Up to `cap` records queue;
-    /// past that, a record is folded into a summary of its user, inbound and
-    /// outbound (`Record::Folded`), which counts its bytes, and the reader
-    /// is given the summaries once it has taken what was queued. No
+    /// a host that bills by them loses no connection's closed record.
+    /// Every closed record is kept; while `cap` of them wait for the
+    /// reader, new connections are refused, and counted
+    /// (`RecordStream::refused`), until it takes one. Interim records,
+    /// which carry the bytes since a connection started, are dropped, and
+    /// counted (`RecordStream::dropped`), while `cap` records wait, unless
+    /// the host asked for them (`Instance::report_connections`). No
     /// connection ever waits for the reader. A record costs about 300
     /// bytes queued: 65,536 is about 20 MB. Records not read when the
     /// process ends are lost: read them promptly, and pass at the billing
@@ -470,10 +473,11 @@ impl Instance {
     }
 
     /// The reader of the lossless connection records
-    /// (`Options::connection_records_lossless`): one at a time. Every record
-    /// since the instance first started is there, or counted in a
-    /// `Record::Folded` summary. `Unsupported` without the option,
-    /// `InvalidArgument` while another reader is held.
+    /// (`Options::connection_records_lossless`): one at a time. Every
+    /// closed record since the instance first started is there; an
+    /// interim one may have been dropped, and counted. `Unsupported`
+    /// without the option, `InvalidArgument` while another reader is
+    /// held.
     pub fn connection_records(&self) -> Result<RecordStream, Error> {
         let sink = self.inner().events().lossless_records().ok_or_else(|| {
             Error::new(
@@ -490,9 +494,10 @@ impl Instance {
     }
 
     /// An interim pass, now: a record (`Kinds::CONNECTION`) of each
-    /// connection open that sent or received since its record before, as
-    /// a host asks right before a graceful stop. How many were told; none
-    /// while no one subscribes.
+    /// connection open, idle ones too, its bytes since it started, as a
+    /// host asks for a barrier or right before a graceful stop. A lossless
+    /// sink keeps them all, queued by the time it returns. How many were
+    /// told; none while no one subscribes.
     pub async fn report_connections(&self) -> Result<usize, Error> {
         self.with_manager(move |m| Box::pin(async move { m.report_connections().await }))
             .await

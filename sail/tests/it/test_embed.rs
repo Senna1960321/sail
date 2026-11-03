@@ -1365,7 +1365,7 @@ fn a_host_runtime_without_timers_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connection_s_record_tells_its_user_bytes_and_end() {
     use futures::StreamExt;
-    use sail::embed::{ClosedBy, ConnectionRecord, End, Event, Kinds, RecordKind};
+    use sail::embed::{ClosedBy, ConnectionRecord, End, Event, Kinds, Outcome, RecordKind};
     use std::sync::Arc;
 
     let (echo, serve) = common::run_tcp_echo_server("127.0.0.1:0").await.unwrap();
@@ -1438,7 +1438,12 @@ async fn a_connection_s_record_tells_its_user_bytes_and_end() {
     assert_eq!(told.user.as_deref(), Some("alice"));
     assert_eq!(told.inbound, "socks-in");
     assert_eq!(told.chain, ["direct"]);
-    assert_eq!((told.up, told.down), (5, 5));
+    assert_eq!(told.outbound.as_deref(), Some("direct"));
+    assert_eq!(told.outcome, Some(Outcome::Ok));
+    assert_eq!(
+        told.local,
+        std::net::SocketAddr::from(([127, 0, 0, 1], socks))
+    );
     assert_eq!((told.up_total, told.down_total), (5, 5));
     assert_eq!(told.seq, 0);
     assert!(told.request_destination.is_some());
@@ -1456,7 +1461,7 @@ async fn a_connection_s_record_tells_its_user_bytes_and_end() {
         "{:?}",
         told
     );
-    assert_eq!((told.up, told.down), (3, 3));
+    assert_eq!((told.up_total, told.down_total), (3, 3));
     assert_eq!(told.id, open[0].id);
     drop(s);
 
@@ -1464,8 +1469,8 @@ async fn a_connection_s_record_tells_its_user_bytes_and_end() {
 }
 
 /// An interim pass asked for records what each open connection moved so
-/// far; a stop cuts what is left open, and its closed record tells the
-/// rest, and that the stop ended it.
+/// far, whether it moved anything new or not; a stop cuts what is left
+/// open, and its closed record tells all, and that the stop ended it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_interim_pass_before_a_stop_records_what_is_open() {
     use futures::StreamExt;
@@ -1500,12 +1505,17 @@ async fn an_interim_pass_before_a_stop_records_what_is_open() {
     assert_eq!(instance.report_connections().await.unwrap(), 1);
     let interim = record(&mut events).await;
     assert_eq!(interim.kind, RecordKind::Interim);
-    assert_eq!((interim.up, interim.down, interim.seq), (5, 5, 0));
+    assert_eq!(
+        (interim.up_total, interim.down_total, interim.seq),
+        (5, 5, 0)
+    );
     assert_eq!(
         instance.report_connections().await.unwrap(),
-        0,
-        "nothing new"
+        1,
+        "nothing new, still asked for"
     );
+    let again = record(&mut events).await;
+    assert_eq!((again.up_total, again.seq), (5, 1));
 
     round_trip(&mut s, b"ab").await;
     instance.stop().await.unwrap();
@@ -1516,7 +1526,7 @@ async fn an_interim_pass_before_a_stop_records_what_is_open() {
         "{:?}",
         closed
     );
-    assert_eq!((closed.up, closed.down, closed.seq), (2, 2, 1));
+    assert_eq!(closed.seq, 2);
     assert_eq!((closed.up_total, closed.down_total), (7, 7));
     assert_eq!(closed.id, interim.id);
     assert_eq!(closed.run, interim.run);
@@ -1762,53 +1772,205 @@ async fn a_host_limits_and_disconnects_a_user_without_a_reload() {
     instance.stop().await.unwrap();
 }
 
-/// With lossless records, every byte is in what the reader gets, though
-/// no one subscribes and it reads late: past the cap, records fold into a
-/// summary of their user, inbound and outbound.
+/// With lossless records, every closed record is kept for a late reader,
+/// though no one subscribes; while `cap` of them wait, a new connection is
+/// refused, and counted, until the reader takes one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lossless_records_lose_no_byte_to_a_late_reader() {
-    use sail::embed::Record;
+async fn lossless_records_keep_every_closed_one_and_refuse_past_the_cap() {
+    use sail::embed::{End, Outcome, RecordKind};
     let (echo, serve) = common::run_tcp_echo_server("127.0.0.1:0").await.unwrap();
     tokio::spawn(serve);
     let socks = common::free_port();
-    let instance = Instance::new(options().connection_records_lossless(1)).unwrap();
+    let instance = Instance::new(options().connection_records_lossless(3)).unwrap();
     instance
         .start(Config::Json(config(socks, 53)))
         .await
         .unwrap();
-    // Three connections, each a round trip of a different size, closed.
-    for n in 1..=3usize {
-        let mut s = socks_asked(socks, echo.port()).await;
+    async fn closed_after(socks: u16, port: u16, n: usize) {
+        let mut s = socks_asked(socks, port).await;
         assert_eq!(socks_reply(&mut s).await, 0);
-        round_trip(&mut s, &vec![b'x'; n * 100]).await;
+        round_trip(&mut s, &vec![b'x'; n]).await;
         s.shutdown().await.unwrap();
         let mut rest = Vec::new();
         s.read_to_end(&mut rest).await.unwrap();
     }
-    // A stop makes the records of what is left, and the queue outlives
-    // the run: the reader comes after it, and drains.
-    instance.stop().await.unwrap();
+    // Three connections, each a round trip of a different size, closed.
+    for n in 1..=3usize {
+        closed_after(socks, echo.port(), n * 100).await;
+    }
     let mut reader = instance.connection_records().unwrap();
     assert!(instance.connection_records().is_err(), "one reader");
-    let (mut up, mut down, mut connections, mut folded) = (0, 0, 0, 0);
-    while let Some(record) = reader.try_next() {
-        match record {
-            Record::Connection(r) => {
-                up += r.up;
-                down += r.down;
-                connections += 1;
-            }
-            Record::Folded(s) => {
-                assert_eq!(s.inbound, "socks-in");
-                assert_eq!(s.outbound, "direct");
-                up += s.up;
-                down += s.down;
-                folded += s.records;
-            }
+    // Their closed records may still be on their way.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while reader.queued() < 3 {
+        assert!(tokio::time::Instant::now() < deadline, "three records");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // At the cap: the next is refused, never answered.
+    let mut s = socks_asked(socks, echo.port()).await;
+    let mut reply = [0u8; 10];
+    let read = tokio::time::timeout(Duration::from_secs(5), s.read(&mut reply))
+        .await
+        .expect("closed in time");
+    assert!(
+        matches!(read, Ok(0) | Err(_)) || reply[1] != 0,
+        "refused: {:?}",
+        read
+    );
+    assert_eq!(reader.refused(), 1);
+    let mut up = 0;
+    while let Some(r) = reader.try_next() {
+        assert_eq!(r.kind, RecordKind::Closed(End::Finished), "{:?}", r);
+        assert_eq!(r.outcome, Some(Outcome::Ok));
+        assert_eq!(r.outbound.as_deref(), Some("direct"));
+        up += r.up_total;
+    }
+    assert_eq!(up, 600);
+    // Taken: let in again.
+    closed_after(socks, echo.port(), 1).await;
+    instance.stop().await.unwrap();
+    let last = reader.try_next().expect("its closed record");
+    assert_eq!((last.up_total, last.down_total), (1, 1));
+    assert!(reader.try_next().is_none());
+    assert_eq!((reader.refused(), reader.dropped()), (1, 0));
+}
+
+/// Each connection routed has exactly one closed record, which tells how
+/// it was used: relayed, a dial that failed, blocked by a reject rule,
+/// hijacked DNS served, its user refused. One refused has no bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_connection_has_one_closed_record_telling_its_outcome() {
+    use futures::StreamExt;
+    use sail::embed::{
+        ClosedBy, ConnectionRecord, End, Event, Kinds, Outcome, RecordKind, UserLimits,
+    };
+    use std::sync::Arc;
+
+    let (echo, serve) = common::run_tcp_echo_server("127.0.0.1:0").await.unwrap();
+    tokio::spawn(serve);
+    let [socks, rejected, hijacked, dead] = common::free_ports();
+    let config = serde_json::json!({
+        "log": { "level": "info" },
+        "dns": {
+            "servers": [{ "tag": "upstream", "type": "udp", "server": "127.0.0.1", "server_port": 53 }],
+        },
+        "inbounds": [{
+            "type": "socks", "tag": "socks-in",
+            "listen": "127.0.0.1", "listen_port": socks,
+            "users": [{ "username": "alice", "password": "secret" }],
+        }],
+        "outbounds": [{ "type": "direct", "tag": "direct" }],
+        "route": {
+            "rules": [
+                { "port": [rejected], "action": "reject" },
+                { "port": [hijacked], "action": "hijack-dns" },
+            ],
+            "final": "direct",
+        },
+    })
+    .to_string();
+    let instance = Instance::new(options()).unwrap();
+    instance.start(Config::Json(config)).await.unwrap();
+    let mut events = Box::pin(instance.events(Kinds::CONNECTION));
+    async fn record(
+        events: &mut (impl futures::Stream<Item = Event> + Unpin),
+    ) -> Arc<ConnectionRecord> {
+        match tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("a record in time")
+            .unwrap()
+        {
+            Event::ConnectionRecord(record) => record,
             other => panic!("unexpected {:?}", other),
         }
     }
-    assert_eq!((connections, folded), (1, 2));
-    assert_eq!((up, down), (600, 600));
-    assert_eq!(reader.folded_total(), 2);
+    async fn as_alice(socks: u16, port: u16) -> (tokio::net::TcpStream, u8) {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", socks))
+            .await
+            .unwrap();
+        s.write_all(&[5, 1, 2]).await.unwrap();
+        let mut chosen = [0u8; 2];
+        s.read_exact(&mut chosen).await.unwrap();
+        let mut auth = vec![1, 5];
+        auth.extend(b"alice");
+        auth.push(6);
+        auth.extend(b"secret");
+        s.write_all(&auth).await.unwrap();
+        let mut authed = [0u8; 2];
+        s.read_exact(&mut authed).await.unwrap();
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend(port.to_be_bytes());
+        s.write_all(&request).await.unwrap();
+        let mut reply = [0u8; 10];
+        let code = match tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut reply))
+            .await
+            .expect("a reply in time")
+        {
+            Ok(_) => reply[1],
+            Err(_) => 0xff,
+        };
+        (s, code)
+    }
+    let closed = |r: &ConnectionRecord| match r.kind {
+        RecordKind::Closed(end) => end,
+        _ => panic!("not closed: {:?}", r),
+    };
+
+    // Relayed, held open.
+    let (mut held, code) = as_alice(socks, echo.port()).await;
+    assert_eq!(code, 0);
+    round_trip(&mut held, b"x").await;
+
+    // A dial that fails.
+    let (_s, code) = as_alice(socks, dead).await;
+    assert_ne!(code, 0);
+    let r = record(&mut events).await;
+    assert_eq!(r.outcome, Some(Outcome::DialFailed), "{:?}", r);
+    assert_eq!(
+        closed(&r),
+        End::Error(std::io::ErrorKind::ConnectionRefused)
+    );
+    assert_eq!(r.user.as_deref(), Some("alice"));
+    assert_eq!(r.outbound.as_deref(), Some("direct"));
+    assert_eq!((r.up_total, r.down_total), (0, 0));
+
+    // A reject.
+    let (_s, code) = as_alice(socks, rejected).await;
+    assert_ne!(code, 0);
+    let r = record(&mut events).await;
+    assert_eq!(r.outcome, Some(Outcome::Blocked), "{:?}", r);
+    assert_eq!(closed(&r), End::Closed(ClosedBy::Rules));
+    assert_eq!(r.outbound, None);
+
+    // Hijacked DNS, served until the client goes.
+    let (s, _) = as_alice(socks, hijacked).await;
+    drop(s);
+    let r = record(&mut events).await;
+    assert_eq!(r.outcome, Some(Outcome::Ok), "{:?}", r);
+    assert_eq!(r.outbound, None);
+
+    // Its user at its most connections.
+    let mut one_tcp = UserLimits::default();
+    one_tcp.max_tcp_connections = Some(1);
+    instance.set_user_limits("alice", one_tcp).unwrap();
+    let (_s, code) = as_alice(socks, echo.port()).await;
+    assert_ne!(code, 0);
+    let r = record(&mut events).await;
+    assert_eq!(r.outcome, Some(Outcome::Rejected), "{:?}", r);
+    assert_eq!(closed(&r), End::Closed(ClosedBy::User));
+    assert_eq!(r.user.as_deref(), Some("alice"));
+
+    // The one held, closed: relayed. And no record twice.
+    drop(held);
+    let r = record(&mut events).await;
+    assert_eq!(r.outcome, Some(Outcome::Ok), "{:?}", r);
+    assert_eq!(r.outbound.as_deref(), Some("direct"));
+    assert_eq!((r.up_total, r.down_total), (1, 1));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), events.next())
+            .await
+            .is_err(),
+        "a connection had a second closed record"
+    );
+    instance.stop().await.unwrap();
 }

@@ -563,12 +563,14 @@ fall 1024 events behind, then gets
 `Event::ConnectionRecord`, for a host that counts traffic by connection
 (billing): one record when the connection closes, and, as interim passes
 find bytes new since its record before, one while it is open. Each
-record carries the bytes since the connection's record before (`up`,
-`down`) and since it started (`up_total`, `down_total`); the `up` and
-`down` of one connection's records add up to its totals, which are what
-its user, inbound and outbound were counted (`/stats`, quotas). Each
-byte is in exactly one record, the bytes a side wrote after the last
-read included. Its fields:
+record carries the bytes since the connection started (`up_total`,
+`down_total`), so a later record holds all an earlier one did, and a
+missed interim record loses nothing. A connection's closed record has
+what its user, inbound and outbound were counted (`/stats`, quotas), the
+bytes a side wrote after the last read included. Each connection routed
+has exactly one closed record, those that never relayed too: a dial
+that failed, one the rules blocked, one its user was refused. Its
+fields:
 
 - `id`, as `Kinds::ROUTE` and `connections()` number it, and `run`, when
   the instance's run started: numbers start again with each run, so
@@ -578,45 +580,56 @@ read included. Its fields:
   `Finished` (both ways closed; a UDP session its client ended),
   `Error(kind)`, `IdleTimeout` (a UDP session), `WriteStall` (a side took
   nothing for `relay.write_stall_timeout`), `Closed(by)` (sail closed it:
-  `Api`, `User` — removed, over quota, shut out —, `Inbound` removed,
-  `Rules` of a reload, `Network` changed, `Stopped` instance) or
-  `Aborted` (nothing told how, a handshake that failed after its first
-  bytes, say).
+  `Api`, `User` — removed, over quota, shut out, at its most
+  connections —, `Inbound` removed, `Rules` that reject or drop it or a
+  reload's, `Network` changed, `Stopped` instance) or `Aborted` (nothing
+  told how, a handshake that failed after its first bytes, say).
+- `outcome`, for a closed record: how the connection was used. `Ok`
+  (relayed through an outbound, or hijacked DNS served), `DialFailed`
+  (its outbound's dial or handshake failed, or there was no outbound:
+  its end is the error where one was told), `Blocked` (a reject or drop
+  rule, `route.block_quic`: `Closed(Rules)`) or `Rejected` (its user may
+  not connect: `Closed(User)`). None for an interim record.
 - `network`, `user`, `inbound`, `source`, `destination`,
   `request_destination`, `domain`, `domain_source` and `chain`, as
-  `Kinds::ROUTE` tells them.
-- `start`, `since` (its start, or its record before: where `up` and
-  `down` count from) and `at` (when it was counted; a closed record's
-  end).
+  `Kinds::ROUTE` tells them; `local`, the address the client connected
+  to (where the inbound accepted it, a TUN's or redirect's original
+  destination, what a host gave for a session it submitted;
+  `0.0.0.0:0` where not known); `outbound`, the tag of the outbound the
+  rules sent it to, none where they sent it to none.
+- `start`, and `at` (when it was counted; a closed record's end).
 
 Interim records come from passes over the connections open: every
 `Options::record_interval(every)` (none unless set; 1 s at least;
 `instance.set_record_interval(Some(every))` or `None` changes it while
-the instance runs), and whenever the host asks with
-`instance.report_connections()`, which returns how many it told. A
-connection with nothing new since its record before is skipped. A pass
-racing a connection's close counts no byte twice: a connection's records
-leave in order (`seq`), its closed record last. For a graceful stop, ask
-for a pass and then stop: the connections still open are cut by the stop,
-and their closed records (`Closed(Stopped)`) carry what moved after the
-pass, told before the subscription ends. A crash loses what moved since
-the last pass.
+the instance runs), skipping a connection with nothing new since its
+record before; and whenever the host asks with
+`instance.report_connections()`, which records every connection open,
+idle ones too, and returns how many it told: a barrier, every live
+connection's bytes up to now. A pass racing a connection's close counts
+no byte twice: a connection's records leave in order (`seq`), its closed
+record last. For a graceful stop, ask for a pass and then stop: the
+connections still open are cut by the stop, and their closed records
+(`Closed(Stopped)`) carry their totals, told before the subscription
+ends. A crash loses what moved since the last pass.
 
-For billing, a host that must lose no byte asks for
+For billing, a host that must lose no closed record asks for
 `Options::connection_records_lossless(cap)` and reads
-`instance.connection_records()`, a `RecordStream` of one reader at a time,
-instead of subscribing. Every record is kept for it from the instance's
-first start, whether it reads or not: up to `cap` queue; past that, a
-record is folded into a `Record::Folded` summary of its user, inbound and
-outbound (the last of its chain), which adds up its bytes and counts it,
-and the summaries are given once the queued records are read. What the
-reader gets, records and summaries, adds up to every byte the
-connections were counted; only the folded records' detail is lost. No
-connection ever waits for the reader. The queue is the instance's, so
-records of connections a stop cut wait for the reader across the stop
-(`try_next` drains them). A crash loses what was not read, and what
-moved since the last interim pass: a billing host reads promptly, and
-sets `record_interval` to its billing granularity.
+`instance.connection_records()`, a `RecordStream` of one reader at a
+time, instead of subscribing. Records are kept for it from the
+instance's first start, whether it reads or not. Every closed record is
+kept; what bounds them is admission: while `cap` closed records wait for
+the reader, each new connection is refused before it is routed, with no
+record, and counted (`RecordStream::refused`), until the reader takes
+one. Interim records of a timed pass are dropped while `cap` records
+wait, and counted (`RecordStream::dropped`): the connection's next
+record holds what they did. Those of a pass the host asked for are
+kept, queued by the time `report_connections` returns. No connection
+ever waits for the reader. The queue is the instance's, so records of
+connections a stop cut wait for the reader across the stop (`try_next`
+drains them). A crash loses what was not read, and what moved since the
+last interim pass: a billing host reads promptly, and sets
+`record_interval` to its billing granularity.
 
 A connection is a TCP connection, a UDP session or a stream of a
 multiplexed connection, as for `Kinds::ROUTE`; the sessions a host's own
@@ -626,8 +639,9 @@ one was are in the connection's next record. A subscriber may fall
 4096 records behind (`Options::connection_records(capacity)` sets
 another), then gets `Event::Lagged { kind: Kinds::CONNECTION, missed }`
 and goes on from the oldest kept: no connection waits for it. A missed
-record's bytes show in the totals of that connection's next record, and
-the user's counts hold them all.
+record's bytes show in that connection's next record, and the user's
+counts hold them all; a missed closed record is lost to the subscriber,
+as the lossless reader's never is.
 
 `Kinds::ADMISSION` gives `Event::Admission(change)` when admission under
 memory pressure (`inbound.memory_reserve`, on the server and router

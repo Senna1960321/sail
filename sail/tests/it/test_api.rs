@@ -1050,9 +1050,9 @@ fn the_api_streams_connection_records() -> anyhow::Result<()> {
             record["kind"] == "closed"
                 && record["end"] == "finished"
                 && record["inbound"] == "s"
-                && record["up"] == 5
-                && record["down"] == 5
+                && record["outcome"] == "ok"
                 && record["up_total"] == 5
+                && record["down_total"] == 5
                 && record["seq"] == 0,
             "{}",
             record

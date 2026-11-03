@@ -28,7 +28,7 @@ use futures::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, warn};
 
-use crate::control::events::{ClosedBy, ConnectionRecord, End, EventHub, RecordKind};
+use crate::control::events::{ClosedBy, ConnectionRecord, End, EventHub, Outcome, RecordKind};
 use crate::user::{UserRef, UserRegistry};
 use crate::{adapter::*, session::*};
 
@@ -300,14 +300,18 @@ pub struct Counter {
     /// What the outbound was asked to reach: kept for its records while
     /// someone listens for them.
     asked: OnceLock<SocksAddr>,
+    /// How it was used, where something told: its user refused it as it
+    /// was counted.
+    outcome: OnceLock<Outcome>,
+    /// Counted before its outbound's handshake, which has not ended well
+    /// yet: retired so, its dial failed.
+    dialing: AtomicBool,
 }
 
 /// What a connection's records told so far.
 struct Reported {
     up: u64,
     down: u64,
-    /// When the last was counted, or the connection started.
-    at: SystemTime,
     /// The next record's number.
     seq: u32,
     /// Its closed record was told: nothing more is.
@@ -334,11 +338,12 @@ impl Counter {
             reported: Mutex::new(Reported {
                 up: 0,
                 down: 0,
-                at: started,
                 seq: 0,
                 closed: false,
             }),
             asked: OnceLock::new(),
+            outcome: OnceLock::new(),
+            dialing: AtomicBool::new(false),
         }
     }
 
@@ -361,6 +366,26 @@ impl Counter {
         let _ = self.asked.set(asked.clone());
     }
 
+    /// It is counted before its outbound's handshake: until `connected`,
+    /// it is retired as a failed dial.
+    pub(crate) fn dialing(&self) {
+        self.dialing.store(true, Ordering::Relaxed);
+    }
+
+    /// Its outbound's handshake ended well.
+    pub(crate) fn connected(&self) {
+        self.dialing.store(false, Ordering::Relaxed);
+    }
+
+    /// How it was used, as it is retired.
+    fn outcome(&self) -> Outcome {
+        match self.outcome.get() {
+            Some(outcome) => *outcome,
+            None if self.dialing.load(Ordering::Relaxed) => Outcome::DialFailed,
+            None => Outcome::Ok,
+        }
+    }
+
     /// How it ended, as it is retired: why sail closed it; else what its
     /// streams, relay or NAT told; else a TCP connection finished both
     /// ways; else the instance stopping; else a UDP session the host or
@@ -380,18 +405,25 @@ impl Counter {
         }
     }
 
-    /// Tells its record: what it sent and received since the one before,
-    /// closed with `end`, or interim. Nothing when no one listens, nor an
-    /// interim one with nothing new, nor anything once its closed record
-    /// went: what is not told is in the next. Whether one was told.
-    fn report(&self, events: &EventHub, run: SystemTime, end: Option<End>) -> bool {
+    /// Tells its record: what it sent and received since it started,
+    /// closed with how it ended and was used, or interim. Nothing when no
+    /// one listens, nor anything once its closed record went, nor an
+    /// interim one with nothing new unless the host `asked` for it: what
+    /// is not told is in the next. Whether one was told.
+    fn report(
+        &self,
+        events: &EventHub,
+        run: SystemTime,
+        closed: Option<(End, Outcome)>,
+        asked: bool,
+    ) -> bool {
         if !events.records_wanted() {
             return false;
         }
         let mut reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
         let (up_total, down_total) = (self.bytes_sent(), self.bytes_recvd());
         if reported.closed
-            || end.is_none() && up_total == reported.up && down_total == reported.down
+            || closed.is_none() && !asked && up_total == reported.up && down_total == reported.down
         {
             return false;
         }
@@ -405,36 +437,35 @@ impl Counter {
             id: self.id,
             run,
             seq: reported.seq,
-            kind: match end {
-                Some(end) => RecordKind::Closed(end),
+            kind: match closed {
+                Some((end, _)) => RecordKind::Closed(end),
                 None => RecordKind::Interim,
             },
+            outcome: closed.map(|(_, outcome)| outcome),
             network: sess.network,
             user: crate::user::name(&sess.user).map(str::to_owned),
             inbound: sess.inbound_tag.clone(),
             source: sess.source,
+            local: sess.local_addr,
             destination: sess.destination.clone(),
             request_destination: self.asked.get().cloned(),
             domain,
             domain_source,
+            outbound: (!sess.outbound_tag.is_empty()).then(|| sess.outbound_tag.clone()),
             chain: crate::app::dispatcher::outbound_chain(sess, &sess.outbound_tag),
-            up: up_total.saturating_sub(reported.up),
-            down: down_total.saturating_sub(reported.down),
             up_total,
             down_total,
             start: self.started,
-            since: reported.at,
             at,
         };
         *reported = Reported {
             up: up_total,
             down: down_total,
-            at,
             seq: reported.seq.saturating_add(1),
-            closed: end.is_some(),
+            closed: closed.is_some(),
         };
         // Under the lock: the next of this connection goes after it.
-        events.recorded(|| record);
+        events.recorded(closed.is_none() && !asked, || record);
         true
     }
 
@@ -601,10 +632,12 @@ impl Numbering {
 
 /// A session's number, from before it is routed: the one it is listed by
 /// the first time it is counted. Shared by the session's copies. Once the
-/// host was told it (`Number::told`), a number never listed, the session
-/// refused or failing before it was counted, is told in a closed record of
-/// its own, with nothing sent or received, as the last copy of the session
-/// goes: each number the host knows has one closed record.
+/// host was told it (`Number::told`), or the session ended unlisted in a
+/// way its records tell (`Number::closed`: blocked, its dial failed, its
+/// user refused), a number never listed is told in a closed record of its
+/// own, with nothing sent or received, as the last copy of the session
+/// goes: each number the host knows, and each connection routed, has one
+/// closed record.
 pub struct Number {
     id: u64,
     listed: AtomicBool,
@@ -621,6 +654,7 @@ struct Unlisted {
     sess: Session,
     at: SystemTime,
     end: Option<End>,
+    outcome: Outcome,
 }
 
 impl std::fmt::Debug for Number {
@@ -653,6 +687,7 @@ impl Number {
                 sess: Self::unlisted(sess),
                 at: SystemTime::now(),
                 end: None,
+                outcome: Outcome::Ok,
             }));
         }
     }
@@ -662,14 +697,31 @@ impl Number {
         self.told.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
-    /// Its dial failed, `sess` as it was dialled, before it was counted:
-    /// what the closed record of a number the host knows tells.
+    /// Its dial failed, `sess` as it was dialled, before it was counted.
     pub fn failed(&self, sess: &Session, kind: io::ErrorKind) {
-        let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(unlisted) = told.as_mut() {
-            unlisted.sess = Self::unlisted(sess);
-            unlisted.end = Some(End::Error(kind));
+        self.closed(sess, Outcome::DialFailed, End::Error(kind));
+    }
+
+    /// It ended unlisted, `sess` as it was then, as `outcome` and `end`
+    /// tell: what its closed record tells, unless it is listed after
+    /// all. Nothing while no one listens for records.
+    pub fn closed(&self, sess: &Session, outcome: Outcome, end: End) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        if self.listed.load(Ordering::Relaxed) || !recorder.events.records_wanted() {
+            return;
         }
+        let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
+        let at = told
+            .as_ref()
+            .map_or_else(SystemTime::now, |unlisted| unlisted.at);
+        *told = Some(Box::new(Unlisted {
+            sess: Self::unlisted(sess),
+            at,
+            end: Some(end),
+            outcome,
+        }));
     }
 
     /// `sess` without what would hold its number, nor the state the copies
@@ -700,13 +752,13 @@ impl Drop for Number {
         let unlisted = *unlisted;
         let mut counter = Counter::new(self.id, unlisted.sess);
         counter.started = unlisted.at;
-        counter
-            .reported
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .at = unlisted.at;
         let end = unlisted.end.unwrap_or(End::Aborted);
-        counter.report(&recorder.events, recorder.run, Some(end));
+        counter.report(
+            &recorder.events,
+            recorder.run,
+            Some((end, unlisted.outcome)),
+            false,
+        );
     }
 }
 
@@ -763,8 +815,9 @@ impl Drop for Accounts {
         let recorder = &self.recorder;
         if recorder.events.records_wanted() {
             let end = self.counter.end(recorder.stopping.load(Ordering::Relaxed));
+            let outcome = self.counter.outcome();
             self.counter
-                .report(&recorder.events, recorder.run, Some(end));
+                .report(&recorder.events, recorder.run, Some((end, outcome)), false);
         }
         self.counter.recv_completed.store(true, Ordering::Relaxed);
         self.counter.send_completed.store(true, Ordering::Relaxed);
@@ -1111,17 +1164,19 @@ impl StatManager {
         &self.numbering
     }
 
-    /// An interim pass: a record of each connection open that sent or
-    /// received since its record before, the bytes since. How many were
-    /// told; none while no one listens.
-    pub fn report(&self) -> usize {
+    /// An interim pass: a record of each connection open, its bytes since
+    /// it started. One the host `asked` for records every connection, and
+    /// a lossless sink keeps them all; a timed pass skips those with
+    /// nothing new since their record before, and a full sink drops its
+    /// records. How many were told; none while no one listens.
+    pub fn report(&self, asked: bool) -> usize {
         let recorder = &self.recorder;
         if !recorder.events.records_wanted() {
             return 0;
         }
         self.connections()
             .iter()
-            .filter(|counter| counter.report(&recorder.events, recorder.run, None))
+            .filter(|counter| counter.report(&recorder.events, recorder.run, None, asked))
             .count()
     }
 
@@ -1139,7 +1194,7 @@ impl StatManager {
                 };
                 tokio::select! {
                     () = tokio::time::sleep(interval) => {
-                        let told = sm.report();
+                        let told = sm.report(false);
                         debug!("interim pass: {} connection records", told);
                     }
                     changed = every.changed() => {
@@ -1357,6 +1412,7 @@ impl StatManager {
                     user,
                     user.live()
                 );
+                let _ = counter.outcome.set(Outcome::Rejected);
                 counter.closer.close_by(ClosedBy::User);
             }
         }

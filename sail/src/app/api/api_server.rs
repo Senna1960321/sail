@@ -442,9 +442,8 @@ mod handlers {
         }
     }
 
-    /// An interim pass, now: a record of each connection open that sent or
-    /// received since its record before, to the subscribers of
-    /// `connection` events; how many.
+    /// An interim pass, now: a record of each connection open, idle ones
+    /// too, to the subscribers of `connection` events; how many.
     pub async fn connections_report(
         State(rm): State<Arc<RuntimeManager>>,
     ) -> Json<serde_json::Value> {

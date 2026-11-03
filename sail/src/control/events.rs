@@ -172,11 +172,12 @@ pub enum ClosedBy {
     /// The host, through the management API, the Clash API or embed.
     Api,
     /// Its user: removed, taken out of its inbound, over quota, shut out,
-    /// or at its most connections.
+    /// or at its most connections, as it connected or after.
     User,
     /// Its inbound was removed.
     Inbound,
-    /// A reload's rules no longer route it as they did.
+    /// The rules: they reject or drop it, or a reload's no longer route
+    /// it as they did.
     Rules,
     /// The network changed, and connections made on the one before do not
     /// survive it.
@@ -189,17 +190,46 @@ pub enum ClosedBy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecordKind {
-    /// It is still open: the bytes since its record before.
+    /// It is still open.
     Interim,
-    /// It closed: the bytes since its record before, its last record.
+    /// It closed: its last record.
     Closed(End),
 }
 
-/// What a connection sent and received since its record before: one when
-/// it closes, and one at each interim pass that finds bytes new since.
-/// The `up` and `down` of one connection's records add up to its totals,
-/// the bytes its user, inbound and outbound were counted (`/stats`,
-/// quotas): each byte of a connection is in exactly one of its records.
+/// How a connection was used, as its closed record tells it, alongside
+/// how it ended (`End`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Outcome {
+    /// It went where the rules sent it: relayed through an outbound, or
+    /// served here (hijacked DNS).
+    Ok,
+    /// It could not be carried: the outbound's dial or handshake failed,
+    /// or there was no outbound to take it. Its `End` is the error.
+    DialFailed,
+    /// The rules rejected or dropped it (`reject`, `route.block_quic`).
+    /// Its `End` is `Closed(Rules)`.
+    Blocked,
+    /// Its user may not connect now: shut out, over quota, not of the
+    /// inbound, or at its most connections. Its `End` is
+    /// `Closed(User)`.
+    Rejected,
+}
+
+/// What a connection sent and received, as counted when its record was
+/// made: one when it closes, its last, and one at each interim pass that
+/// finds bytes new since its record before (every one at a pass the host
+/// asks for). The bytes are since the connection started, so a later
+/// record holds everything an earlier one did: an interim record may be
+/// missed, and nothing is lost with it. The totals of its closed record
+/// are what its user, inbound and outbound were counted (`/stats`,
+/// quotas).
+///
+/// A connection that never relayed has a closed record too, with no
+/// bytes: one the rules blocked, whose dial failed, or whose user was
+/// refused (`Outcome`). One refused before it was routed, as
+/// `inbound.max_connections` or a lossless sink that is full refuses,
+/// has none.
 ///
 /// One a TCP connection, a UDP session, or a stream of a multiplexed
 /// connection, as `RoutedConnection` tells them, its addresses whole as
@@ -215,10 +245,17 @@ pub struct ConnectionRecord {
     /// Its records in order, from 0.
     pub seq: u32,
     pub kind: RecordKind,
+    /// How it was used, for a closed record; none for an interim one.
+    pub outcome: Option<Outcome>,
     pub network: Network,
     pub user: Option<String>,
     pub inbound: String,
     pub source: SocketAddr,
+    /// The address it connected to: where its inbound accepted it, the
+    /// original destination of a TUN or redirect inbound, or what the host
+    /// gave for a session it submitted; unspecified (`0.0.0.0:0`) where it
+    /// is not known.
+    pub local: SocketAddr,
     /// Where it was to go, as the rules saw it: a fake IP is its domain.
     pub destination: SocksAddr,
     /// What the outbound was asked to reach, as `RoutedConnection` tells
@@ -228,20 +265,18 @@ pub struct ConnectionRecord {
     /// The domain known for it, and where from.
     pub domain: Option<String>,
     pub domain_source: Option<DomainSource>,
+    /// The tag of the outbound the rules sent it to, a group's own; none
+    /// where they sent it to none (blocked, hijacked DNS) or it was refused
+    /// first.
+    pub outbound: Option<String>,
     /// The outbounds it went through, outermost first, as
     /// `RoutedConnection::chain`.
     pub chain: Vec<String>,
-    /// Bytes sent on to where it goes, since the record before.
-    pub up: u64,
-    /// Bytes received from where it goes, since the record before.
-    pub down: u64,
-    /// Up since it started.
+    /// Bytes sent on to where it goes, since it started.
     pub up_total: u64,
-    /// Down since it started.
+    /// Bytes received from where it goes, since it started.
     pub down_total: u64,
     pub start: SystemTime,
-    /// Where `up` and `down` count from: its start, or its record before.
-    pub since: SystemTime,
     /// When it was counted: for a closed record, when it ended.
     pub at: SystemTime,
 }
@@ -630,8 +665,9 @@ impl EventHub {
         Self::with_records(capacity, None)
     }
 
-    /// `with_record_capacity`, its records also queued to a lossless sink
-    /// of `lossless` records before they are folded, when some.
+    /// `with_record_capacity`, its records also kept by a lossless sink
+    /// that keeps `lossless` closed records before it refuses connections,
+    /// when some.
     pub fn with_records(capacity: usize, lossless: Option<usize>) -> Self {
         Self {
             group: broadcast::channel(CAPACITY).0,
@@ -733,15 +769,25 @@ impl EventHub {
     }
 
     /// Tells of a connection's record, which `build` makes only when
-    /// someone listens.
-    pub fn recorded(&self, build: impl FnOnce() -> ConnectionRecord) {
+    /// someone listens. A lossless sink keeps it, unless it is an interim
+    /// record of a timed pass and the sink is full (`droppable`).
+    pub fn recorded(&self, droppable: bool, build: impl FnOnce() -> ConnectionRecord) {
         let Some(lossless) = &self.lossless else {
             self.record.emit(|| Arc::new(build()));
             return;
         };
         let record = Arc::new(build());
         self.record.emit(|| record.clone());
-        lossless.push(record);
+        lossless.push(record, droppable);
+    }
+
+    /// Whether a new connection is to be refused, its closed record having
+    /// no room: the lossless sink holds its most closed records the host
+    /// has not taken. Counts it refused when so.
+    pub fn records_refuse(&self) -> bool {
+        self.lossless
+            .as_ref()
+            .is_some_and(|lossless| lossless.refuse())
     }
 
     /// The lossless sink of the records, when the host asked for one.

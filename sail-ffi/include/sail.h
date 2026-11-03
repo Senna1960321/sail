@@ -230,14 +230,16 @@
 /*
  What each connection sent and received, for a host that counts traffic
  by connection: one record when it closes, and one at each interim pass
- that finds bytes new since its record before: `{"id", "run_ms", "seq",
- "kind": "interim" | "closed", "end": "finished" | "error" |
+ that finds bytes new since its record before, or that the host asked
+ for, each with the bytes since the connection started: `{"id", "run_ms",
+ "seq", "kind": "interim" | "closed", "end": "finished" | "error" |
  "idle_timeout" | "write_stall" | "closed" | "aborted", "error",
  "closed_by": "api" | "user" | "inbound" | "rules" | "network" |
- "stopped", "network", "user", "inbound", "source", "destination",
- "request_destination", "domain", "domain_source", "chain", "up", "down",
- "up_total", "down_total", "start_ms", "since_ms", "at_ms"}`; a
- connection's records add up to what its user was counted. Built only
+ "stopped", "outcome": "ok" | "dial_failed" | "blocked" | "rejected",
+ "network", "user", "inbound", "source", "local", "destination",
+ "request_destination", "domain", "domain_source", "outbound", "chain",
+ "up_total", "down_total", "start_ms", "at_ms"}`; a connection's closed
+ record has what its user was counted. Built only
  while someone follows them. Through stops and starts; `{"lagged":
  missed}` as for faults. In the tunnel process only.
  */

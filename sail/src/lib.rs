@@ -627,7 +627,8 @@ impl RuntimeManager {
 
     /// The records of the connections from now on: one as each closes,
     /// and one at each interim pass that finds bytes new since its record
-    /// before (control::events' `ConnectionRecord`).
+    /// before, or that the host asked for (control::events'
+    /// `ConnectionRecord`).
     pub fn connection_records(
         &self,
     ) -> control::events::Subscription<Arc<control::events::ConnectionRecord>> {

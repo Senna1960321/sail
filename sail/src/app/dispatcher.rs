@@ -418,13 +418,21 @@ impl Dispatcher {
         listed
     }
 
-    /// Tells of a connection the rules sent to no outbound.
+    /// Tells of a connection the rules sent to no outbound, which its
+    /// closed record tells as blocked, or served here.
     fn unrouted(
         &self,
         sess: &Session,
         matched: Matched,
         action: crate::control::events::RouteAction,
     ) {
+        use crate::control::events::{ClosedBy, End, Outcome, RouteAction};
+        if let Some(number) = &sess.number {
+            match action {
+                RouteAction::HijackDns => number.closed(sess, Outcome::Ok, End::Finished),
+                _ => number.closed(sess, Outcome::Blocked, End::Closed(ClosedBy::Rules)),
+            }
+        }
         let told = Told {
             matched,
             ..Default::default()
@@ -697,7 +705,7 @@ impl Dispatcher {
         // of the session is made, and held until it has one among the
         // sessions, or is refused one.
         let handshake = sess.handshake.take();
-        if !admitted(&sess) {
+        if self.env.events.records_refuse() || !self.admitted(&mut sess) {
             return None;
         }
         // Its place, held as long as it lives; without one, it is refused
@@ -751,7 +759,11 @@ impl Dispatcher {
 
         let Some(h) = self.outbound_manager.load().handler(outbound.as_deref()) else {
             warn!("handler not found");
-            refuse(&sess, &mut lhs, &io::Error::other("no outbound")).await;
+            let e = io::Error::other("no outbound");
+            if let Some(number) = &sess.number {
+                number.failed(&sess, e.kind());
+            }
+            refuse(&sess, &mut lhs, &e).await;
             return None;
         };
         self.find_dial_domain(&mut sess).await;
@@ -765,6 +777,9 @@ impl Dispatcher {
             Ok(th) => th,
             Err(e) => {
                 debug!("get stream handler, err={}", e);
+                if let Some(number) = &sess.number {
+                    number.failed(&sess, e.kind());
+                }
                 refuse(&sess, &mut lhs, &e).await;
                 return None;
             }
@@ -831,6 +846,7 @@ impl Dispatcher {
             let stream = match stream {
                 Some(s) => {
                     let (s, counter) = self.stat_manager.stat_stream_id(s, sess.clone());
+                    counter.dialing();
                     id = Some(counter.id);
                     if self.stat_manager.recheck_due(sess.routed_by) {
                         self.recheck_late(&sess, counter.id).await;
@@ -843,6 +859,7 @@ impl Dispatcher {
                         let (counted, counter) =
                             self.stat_manager.stat_inbound_stream_id(lhs, sess.clone());
                         lhs = counted;
+                        counter.dialing();
                         id = Some(counter.id);
                         lhs_counted = true;
                         if self.stat_manager.recheck_due(sess.routed_by) {
@@ -882,8 +899,9 @@ impl Dispatcher {
                 }
                 let elapsed = tokio::time::Instant::now().duration_since(handshake_start);
 
-                if let (Some(listed), Some(asked)) = (&listed, &asked) {
-                    if self.env.events.records_wanted() {
+                if let Some(listed) = &listed {
+                    listed.connected();
+                    if let (true, Some(asked)) = (self.env.events.records_wanted(), &asked) {
                         listed.dialled(asked);
                     }
                 }
@@ -1040,11 +1058,16 @@ impl Dispatcher {
             let (stream, id) = match stream {
                 Some(s) => {
                     let (s, counter) = self.stat_manager.stat_stream_id(s, sess.clone());
-                    (Some(s), Some(counter.id))
+                    counter.dialing();
+                    (Some(s), Some(counter))
                 }
                 None => (None, None),
             };
             let rhs = h.stream()?.handle(&sess, None, stream).await?;
+            let id = id.map(|counter| {
+                counter.connected();
+                counter.id
+            });
             io::Result::Ok((rhs, id))
         };
         // A failed dial is logged, and told, as a routed connection's is.
@@ -1130,6 +1153,11 @@ impl Dispatcher {
     ) -> io::Result<DispatchedDatagram> {
         // As a stream's: held until the session has its place, or none.
         let handshake = sess.handshake.take();
+        if self.env.events.records_refuse() {
+            return Err(io::Error::other(
+                "refused: the host has not taken its connection records",
+            ));
+        }
         // Its place, held by the datagram as long as the session lives.
         let entered = self.enter().await;
         drop(handshake);
@@ -1152,7 +1180,7 @@ impl Dispatcher {
             "dispatch proto={} in={} src={} dst={}",
             &sess.network, &sess.inbound_tag, &sess.source, &sess.destination
         );
-        if !admitted(&sess) {
+        if !self.admitted(&mut sess) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "the user may not connect",
@@ -1184,6 +1212,8 @@ impl Dispatcher {
             Err(e) => {
                 if matched.rejected {
                     self.unrouted(&sess, matched, RouteAction::Reject);
+                } else if let Some(number) = &sess.number {
+                    number.failed(&sess, e.kind());
                 }
                 return Err(e);
             }
@@ -1207,7 +1237,11 @@ impl Dispatcher {
 
         let Some(h) = self.outbound_manager.load().handler(outbound.as_deref()) else {
             warn!("handler not found");
-            return Err(io::Error::other("handler not found"));
+            let e = io::Error::other("handler not found");
+            if let Some(number) = &sess.number {
+                number.failed(&sess, e.kind());
+            }
+            return Err(e);
         };
         self.find_dial_domain(&mut sess).await;
         sess.outbound_tag = h.tag().clone();
@@ -1218,7 +1252,15 @@ impl Dispatcher {
         let handshake_start = tokio::time::Instant::now();
 
         debug!("connect datagram outbound={}", h.tag());
-        let dh = h.datagram()?;
+        let dh = match h.datagram() {
+            Ok(dh) => dh,
+            Err(e) => {
+                if let Some(number) = &sess.number {
+                    number.failed(&sess, e.kind());
+                }
+                return Err(e);
+            }
+        };
         // Each address a resolve rule handed on, in turn, the first that
         // opens taken; or the destination.
         let mut handshake = Err(io::Error::other("nowhere to send"));
@@ -1362,6 +1404,8 @@ impl Dispatcher {
                 );
                 if matched.rejected {
                     self.unrouted(&sess, matched, crate::control::events::RouteAction::Reject);
+                } else if let Some(number) = &sess.number {
+                    number.failed(&sess, e.kind());
                 }
                 refuse(&sess, &mut sniffer.into_stream(), &e).await;
                 None
@@ -1659,16 +1703,27 @@ impl Dispatcher {
     }
 }
 
-/// Whether the user of `sess`, if any, may have another connection: not
-/// shut out by `user_limits`, nor at its most. Checked before routing and
-/// dialing; the statistics decide once the connection is counted.
-fn admitted(sess: &Session) -> bool {
-    match &sess.user {
-        Some(user) if !user.admits_on(&sess.inbound_tag, sess.network == Network::Tcp) => {
-            debug!("user [{}]: connection refused: {}", user, user.status());
-            false
+impl Dispatcher {
+    /// Whether the user of `sess`, if any, may have another connection:
+    /// not shut out by `user_limits`, nor at its most. Checked before
+    /// routing and dialing; the statistics decide once the connection is
+    /// counted. One refused is numbered for its closed record, while
+    /// someone listens for records.
+    fn admitted(&self, sess: &mut Session) -> bool {
+        use crate::control::events::{ClosedBy, End, Outcome};
+        match &sess.user {
+            Some(user) if !user.admits_on(&sess.inbound_tag, sess.network == Network::Tcp) => {
+                debug!("user [{}]: connection refused: {}", user, user.status());
+                if self.env.events.records_wanted() {
+                    self.stat_manager.numbering().number(sess);
+                    if let Some(number) = &sess.number {
+                        number.closed(sess, Outcome::Rejected, End::Closed(ClosedBy::User));
+                    }
+                }
+                false
+            }
+            _ => true,
         }
-        _ => true,
     }
 }
 

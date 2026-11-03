@@ -388,14 +388,15 @@ async fn a_closed_record_tells_what_its_user_was_counted() {
     drop(s);
     let record = next(&mut records);
     assert_eq!(record.kind, RecordKind::Closed(End::Finished));
-    assert_eq!((record.up, record.down), (3, 5));
+    assert_eq!(record.outcome, Some(Outcome::Ok));
     assert_eq!((record.up_total, record.down_total), (3, 5));
     assert_eq!(record.seq, 0);
     assert_eq!(record.user.as_deref(), Some("alice"));
     assert_eq!(record.inbound, "in");
+    assert_eq!(record.outbound.as_deref(), Some("out"));
     assert_eq!(record.chain, vec!["out".to_string()]);
     assert_eq!(record.network, Network::Tcp);
-    assert!(record.start <= record.since && record.since <= record.at);
+    assert!(record.start <= record.at);
 
     let dgram = sm.stat_outbound_datagram(
         Box::new(MockDatagram(11)),
@@ -408,12 +409,15 @@ async fn a_closed_record_tells_what_its_user_was_counted() {
     drop((recv, send));
     let udp = next(&mut records);
     assert_eq!(udp.kind, RecordKind::Closed(End::Finished));
-    assert_eq!((udp.up, udp.down), (4, 11));
+    assert_eq!((udp.up_total, udp.down_total), (4, 11));
 
     let counted = alice.traffic().counts();
     assert_eq!(
         (counted.up, counted.down),
-        (record.up + udp.up, record.down + udp.down)
+        (
+            record.up_total + udp.up_total,
+            record.down_total + udp.down_total
+        )
     );
     assert_ne!(record.id, udp.id);
 }
@@ -430,7 +434,7 @@ async fn a_write_after_the_last_read_is_in_the_closed_record() {
     s.write_all(b"written last").await.unwrap();
     drop(s);
     let record = next(&mut records);
-    assert_eq!((record.up, record.down), (12, 2));
+    assert_eq!((record.up_total, record.down_total), (12, 2));
 }
 
 /// Nothing is built while no one listens; bytes counted before someone
@@ -448,7 +452,7 @@ async fn records_are_built_only_while_someone_listens() {
     s.write_all(b"de").await.unwrap();
     drop(s);
     let record = next(&mut records);
-    assert_eq!((record.up, record.up_total), (5, 5));
+    assert_eq!(record.up_total, 5);
     assert_eq!(events.records_built(), 1);
 }
 
@@ -554,44 +558,88 @@ fn a_closer_tells_the_first_reason() {
     }
 }
 
-/// Interim records tell the bytes since the connection's record before,
-/// skip a connection with nothing new, and its closed record the rest:
-/// its records add up to its totals.
+/// Interim records tell the bytes since the connection started; a timed
+/// pass skips a connection with nothing new, and one the host asks for
+/// records every connection, idle ones too. Its closed record holds its
+/// totals.
 #[tokio::test]
-async fn interim_records_and_the_closed_one_add_up_to_the_totals() {
+async fn interim_records_are_cumulative_and_an_asked_pass_records_every_one() {
     let (events, users) = (EventHub::default(), UserRegistry::default());
     let sm = recording(&events, &users);
     let mut records = events.records();
     let mut s = sm.stat_stream(mock(b"12345"), session("in", "out", None, Network::Tcp));
-    let _idle = sm.stat_stream(mock(b""), session("in", "out", None, Network::Tcp));
+    let (_idle, idle) = sm.stat_stream_id(mock(b""), session("in", "out", None, Network::Tcp));
 
     s.write_all(b"abc").await.unwrap();
-    assert_eq!(sm.report(), 1, "the idle one is skipped");
+    assert_eq!(sm.report(false), 1, "the idle one is skipped");
     let first = next(&mut records);
     assert_eq!(first.kind, RecordKind::Interim);
-    assert_eq!((first.seq, first.up, first.down), (0, 3, 0));
-    assert_eq!(first.since, first.start);
-    assert_eq!(sm.report(), 0, "nothing new");
+    assert_eq!(first.outcome, None);
+    assert_eq!((first.seq, first.up_total, first.down_total), (0, 3, 0));
+    assert_eq!(sm.report(false), 0, "nothing new");
 
     s.write_all(b"de").await.unwrap();
     let mut buf = [0u8; 1];
     s.read_exact(&mut buf).await.unwrap();
-    assert_eq!(sm.report(), 1);
+    assert_eq!(sm.report(false), 1);
     let second = next(&mut records);
-    assert_eq!((second.seq, second.up, second.down), (1, 2, 1));
-    assert_eq!((second.up_total, second.down_total), (5, 1));
-    assert_eq!(second.since, first.at);
+    assert_eq!((second.seq, second.up_total, second.down_total), (1, 5, 1));
+
+    // Asked for: both, nothing new or not.
+    assert_eq!(sm.report(true), 2);
+    let mut asked = [next(&mut records), next(&mut records)];
+    asked.sort_by_key(|r| r.id);
+    assert_eq!((asked[0].seq, asked[0].up_total), (2, 5));
+    assert_eq!(
+        (asked[1].id, asked[1].seq, asked[1].up_total),
+        (idle.id, 0, 0)
+    );
 
     let mut rest = Vec::new();
     s.read_to_end(&mut rest).await.unwrap();
     drop(s);
     let closed = next(&mut records);
     assert!(matches!(closed.kind, RecordKind::Closed(_)));
-    assert_eq!((closed.seq, closed.up, closed.down), (2, 0, 4));
-    assert_eq!(closed.since, second.at);
-    let all = [&first, &second, &closed];
-    assert_eq!(all.iter().map(|r| r.up).sum::<u64>(), closed.up_total);
-    assert_eq!(all.iter().map(|r| r.down).sum::<u64>(), closed.down_total);
+    assert_eq!((closed.seq, closed.up_total, closed.down_total), (3, 5, 5));
+}
+
+/// A connection counted before its outbound's handshake that never ended
+/// well is a failed dial; one its user refuses as it is counted is
+/// rejected.
+#[tokio::test]
+async fn a_closed_record_tells_how_the_connection_was_used() {
+    let (events, users) = (EventHub::default(), UserRegistry::default());
+    let sm = recording(&events, &users);
+    let mut records = events.records();
+    let tcp = || session("in", "out", None, Network::Tcp);
+
+    let (s, counter) = sm.stat_stream_id(mock(b""), tcp());
+    counter.dialing();
+    drop(s);
+    assert_eq!(next(&mut records).outcome, Some(Outcome::DialFailed));
+
+    let (s, counter) = sm.stat_stream_id(mock(b""), tcp());
+    counter.dialing();
+    counter.connected();
+    drop(s);
+    assert_eq!(next(&mut records).outcome, Some(Outcome::Ok));
+
+    let bob = users.bind("bob");
+    users.set_limits(HashMap::from([(
+        "bob".to_string(),
+        crate::user::Limits {
+            max_tcp_connections: Some(1),
+            ..Default::default()
+        },
+    )]));
+    let _first = sm.stat_stream(mock(b""), session("in", "out", Some(&bob), Network::Tcp));
+    drop(sm.stat_stream(mock(b""), session("in", "out", Some(&bob), Network::Tcp)));
+    let refused = next(&mut records);
+    assert_eq!(refused.outcome, Some(Outcome::Rejected));
+    assert_eq!(
+        refused.kind,
+        RecordKind::Closed(End::Closed(ClosedBy::User))
+    );
 }
 
 /// Passes running while the connection relays and closes count each byte
@@ -611,7 +659,7 @@ fn passes_racing_the_close_count_no_byte_twice() {
             let (sm, done) = (sm.clone(), done.clone());
             std::thread::spawn(move || {
                 while !done.load(Ordering::Relaxed) {
-                    sm.report();
+                    sm.report(false);
                 }
             })
         })
@@ -636,7 +684,7 @@ fn passes_racing_the_close_count_no_byte_twice() {
     assert!(told[..told.len() - 1]
         .iter()
         .all(|r| r.kind == RecordKind::Interim));
-    assert_eq!(told.iter().map(|r| r.up).sum::<u64>(), 2000);
+    assert!(told.windows(2).all(|w| w[0].up_total <= w[1].up_total));
     assert_eq!(last.up_total, 2000);
 }
 
@@ -663,10 +711,10 @@ async fn interim_passes_come_as_often_as_set() {
         crate::control::events::RECORD_INTERVAL_MIN + std::time::Duration::from_millis(10),
     )
     .await;
-    assert_eq!(next(&mut records).up, 2);
+    assert_eq!(next(&mut records).up_total, 2);
     s.write_all(b"c").await.unwrap();
     tokio::time::sleep(crate::control::events::RECORD_INTERVAL_MIN).await;
-    assert_eq!(next(&mut records).up, 1);
+    assert_eq!(next(&mut records).up_total, 3);
 
     events.set_record_interval(None);
     s.write_all(b"d").await.unwrap();
@@ -726,12 +774,33 @@ async fn a_number_told_has_one_closed_record() {
         record.kind,
         RecordKind::Closed(End::Error(io::ErrorKind::ConnectionRefused))
     );
+    assert_eq!(record.outcome, Some(Outcome::DialFailed));
     assert_eq!((record.up_total, record.down_total), (0, 0));
     assert_eq!(record.network, Network::Udp);
 
-    // Not told the host: nothing, as before.
+    // Not told the host, and nothing telling how it ended: nothing.
     let mut untold = session("in", "out", None, Network::Tcp);
     sm.numbering().number(&mut untold);
     drop(untold);
+    assert!(futures::FutureExt::now_or_never(records.recv()).is_none());
+
+    // Not told the host, but blocked: its closed record, once.
+    let mut blocked = session("in", "", None, Network::Tcp);
+    sm.numbering().number(&mut blocked);
+    let id = blocked.number.as_ref().unwrap().id();
+    blocked.number.as_ref().unwrap().closed(
+        &blocked,
+        Outcome::Blocked,
+        End::Closed(ClosedBy::Rules),
+    );
+    drop(blocked);
+    let record = next(&mut records);
+    assert_eq!(record.id, id);
+    assert_eq!(record.outcome, Some(Outcome::Blocked));
+    assert_eq!(
+        record.kind,
+        RecordKind::Closed(End::Closed(ClosedBy::Rules))
+    );
+    assert_eq!(record.outbound, None);
     assert!(futures::FutureExt::now_or_never(records.recv()).is_none());
 }
