@@ -467,6 +467,21 @@ jobs:
       - name: libraries
         run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/plugin --lib
 
+      # muxcore's yamux against hashicorp/yamux, the reference
+      # (scripts/yamux-peer): ignored in a plain run, and failing here
+      # without YAMUX_PEER.
+      - name: install go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+          cache: false
+
+      - name: yamux against hashicorp/yamux
+        run: |
+          (cd scripts/yamux-peer && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/yamux-peer" .)
+          YAMUX_PEER="$RUNNER_TEMP/yamux-peer" cargo test --locked -p sail -p sail-netstack \
+            --features sail/auto-reload,sail/plugin --lib yamux_interop -- --ignored
+
       # The out-of-tree plugin interface's example: the Shadowsocks plugin.
       - name: the Shadowsocks plugin
         run: cargo test --locked -p shadowsocks --lib

@@ -23,9 +23,14 @@ needing nothing). An L1 test may bind a loopback socket on a port the
 system chooses (port 0) and may read the host's state (its interfaces,
 its neighbour table); it binds no fixed port, starts no sail instance
 through the test harness, needs no root and reaches no network.
+So do muxcore's yamux tests against hashicorp/yamux (`yamux_interop`),
+with its peer built by Go from `scripts/yamux-peer`: ignored in a plain
+run, they fail without `YAMUX_PEER`.
 
 ```sh
 cargo test -p sail -p sail-netstack --features sail/auto-reload --lib
+(cd scripts/yamux-peer && go build -o /tmp/yamux-peer .)
+YAMUX_PEER=/tmp/yamux-peer cargo test -p sail --lib yamux_interop -- --ignored
 cargo test -p sail-netstack --test '*'
 cargo test -p sail -p sail-netstack --features sail/auto-reload --doc
 ```
