@@ -57,6 +57,11 @@ const READ_SMALL: usize = 4 << 10;
 const READ_IDLE_AFTER: Duration = Duration::from_secs(1);
 /// Streams one session carries at once.
 pub const MAX_STREAMS: usize = 1024;
+/// Streams this end opened that the peer has not acknowledged, at most,
+/// where it acknowledges them: the accept backlog of the yamux spec, past
+/// which hashicorp/yamux resets them, and what its client and rust-yamux
+/// wait at.
+pub const MAX_UNACKED: usize = 256;
 /// The most a peer may grant a stream, beyond which it is taken to be
 /// misbehaving.
 const MAX_SEND_WINDOW: u32 = 1 << 30;
@@ -88,6 +93,9 @@ struct Slot {
     stalled: bool,
     /// The peer failed to open the stream, and said why.
     refused: Option<String>,
+    /// Opened by this end, and not yet acknowledged by the peer, nor reset
+    /// or refused (`State::unacked`).
+    unacked: bool,
     /// Without half-close: the peer still sent data after this end's FIN.
     sent_past_fin: bool,
     /// Since when what is in the inbox has waited unread: when data came
@@ -125,6 +133,7 @@ impl Slot {
             reset: false,
             stalled: false,
             refused: None,
+            unacked: false,
             sent_past_fin: false,
             progress: now,
             send_window: window,
@@ -185,6 +194,9 @@ struct State {
     retired: bool,
     /// The id of the next stream this end opens.
     next_id: u32,
+    /// Streams this end opened that the peer has not answered, where it
+    /// acknowledges them: no more than `MAX_UNACKED`.
+    unacked: usize,
     /// Stream data received, all told.
     received: u64,
     /// Without windows: the streams whose inbox is full, which stop the
@@ -223,6 +235,8 @@ struct Shared {
     writer: Notify,
     /// Wakes the reader waiting for a full inbox to be read.
     reader: Notify,
+    /// Wakes the opens waiting for streams to be acknowledged.
+    answered: Notify,
     /// Stops the task that reads and writes the connection.
     task: Mutex<Option<AbortHandle>>,
 }
@@ -255,6 +269,17 @@ impl Shared {
         drop(accept);
         self.writer.notify_one();
         self.reader.notify_one();
+        self.answered.notify_waiters();
+    }
+
+    /// The peer answered stream `id`, which this end opened: it no longer
+    /// counts against `MAX_UNACKED`.
+    fn answer(&self, state: &mut State, id: u32) {
+        if let Some(slot) = state.streams.get_mut(&id).filter(|slot| slot.unacked) {
+            slot.unacked = false;
+            state.unacked -= 1;
+            self.answered.notify_waiters();
+        }
     }
 
     /// Ends the session at once.
@@ -324,6 +349,7 @@ impl Shared {
                     });
                 }
             }
+            Event::Ack(id) => self.answer(state, id),
             Event::Data(id, data) => self.deliver(state, id, data)?,
             Event::Window(id, delta) => {
                 if let Some(slot) = state.streams.get_mut(&id) {
@@ -351,6 +377,7 @@ impl Shared {
                     slot.reset = true;
                     slot.wake();
                 }
+                self.answer(state, id);
             }
             Event::Ping(opaque) => {
                 if let Some(frame) = self.codec.ping(true, opaque) {
@@ -374,6 +401,7 @@ impl Shared {
                     slot.refused = Some(why);
                     slot.wake();
                 }
+                self.answer(state, id);
             }
             Event::Reply(frame) => self.control(state, frame)?,
             Event::Close(why) => return Err(io::Error::other(why)),
@@ -583,6 +611,7 @@ impl Session {
                 going_away: false,
                 retired: false,
                 next_id: codec.first_id(server),
+                unacked: 0,
                 received: 0,
                 full: 0,
                 write_waiting: None,
@@ -601,6 +630,7 @@ impl Session {
             counters,
             writer: Notify::new(),
             reader: Notify::new(),
+            answered: Notify::new(),
             task: Mutex::new(None),
         });
         // Read and written by one task: a connection's halves polled from
@@ -635,14 +665,28 @@ impl Session {
         (Session { shared }, accept_rx)
     }
 
-    /// Opens a stream.
-    pub fn open(&self) -> io::Result<Stream> {
-        self.open_with(&[])
+    /// Opens a stream, once fewer than `MAX_UNACKED` the peer has not
+    /// acknowledged are open.
+    pub async fn open(&self) -> io::Result<Stream> {
+        self.open_with(&[]).await
     }
 
     /// Opens a stream whose first data, sent with what opens it, is
     /// `first`: no more than `INITIAL_WINDOW`.
-    pub fn open_with(&self, first: &[u8]) -> io::Result<Stream> {
+    pub async fn open_with(&self, first: &[u8]) -> io::Result<Stream> {
+        loop {
+            let answered = self.shared.answered.notified();
+            tokio::pin!(answered);
+            answered.as_mut().enable();
+            if let Some(stream) = self.try_open(first)? {
+                return Ok(stream);
+            }
+            answered.await;
+        }
+    }
+
+    /// Opens a stream, or `None` while `MAX_UNACKED` are unacknowledged.
+    fn try_open(&self, first: &[u8]) -> io::Result<Option<Stream>> {
         let name = self.shared.codec.name();
         let mut state = self.shared.lock();
         if let Some(e) = &state.error {
@@ -653,6 +697,9 @@ impl Session {
                 io::ErrorKind::BrokenPipe,
                 format!("{}: going away", name),
             ));
+        }
+        if state.unacked >= MAX_UNACKED {
+            return Ok(None);
         }
         if state.streams.len() >= MAX_STREAMS {
             return Err(io::Error::other(format!("{}: too many streams", name)));
@@ -677,15 +724,19 @@ impl Session {
             }
             slot.send_window -= first.len() as u32;
         }
+        if self.shared.codec.acknowledges() {
+            slot.unacked = true;
+            state.unacked += 1;
+        }
         state.streams.insert(id, slot);
         self.shared.counters.stream_opened();
         state.data.push(self.shared.codec.open(id, first));
         drop(state);
         self.shared.wake_writer();
-        Ok(Stream {
+        Ok(Some(Stream {
             id,
             shared: self.shared.clone(),
-        })
+        }))
     }
 
     pub fn num_streams(&self) -> usize {
@@ -1194,6 +1245,10 @@ impl Drop for Stream {
             return;
         };
         shared.counters.stream_closed();
+        if slot.unacked {
+            state.unacked -= 1;
+            shared.answered.notify_waiters();
+        }
         if shared.flow == Flow::Pause && slot.inbox >= shared.tuning.inbox {
             state.full -= 1;
             shared.reader.notify_one();

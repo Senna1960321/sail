@@ -7,7 +7,9 @@
 //!
 //! A server acknowledges a stream as soon as it takes it: the reference
 //! client closes the whole session if a stream is not acknowledged within
-//! its open timeout.
+//! its open timeout. A client opens no more than `muxcore::MAX_UNACKED`
+//! streams the server has not acknowledged, as the reference client does:
+//! the reference server resets those past its accept backlog of as many.
 //!
 //! See <https://github.com/hashicorp/yamux/blob/master/spec.md>.
 
@@ -82,6 +84,10 @@ impl Codec for Yamux {
         }
     }
 
+    fn acknowledges(&self) -> bool {
+        true
+    }
+
     fn open(&self, id: u32, first: &[u8]) -> Bytes {
         let mut buf = BytesMut::from(&window_update(FLAG_SYN, id, 0)[..]);
         for chunk in first.chunks(MAX_FRAME_DATA) {
@@ -153,9 +159,12 @@ impl Decoder for YamuxDecoder {
             buf.advance(HEADER);
             match kind {
                 TYPE_DATA | TYPE_WINDOW_UPDATE => {
-                    let mut before = Vec::with_capacity(2);
+                    let mut before = Vec::with_capacity(3);
                     if flags & FLAG_SYN != 0 {
                         before.push(Event::Open(id));
+                    }
+                    if flags & FLAG_ACK != 0 {
+                        before.push(Event::Ack(id));
                     }
                     let mut data = None;
                     if kind == TYPE_WINDOW_UPDATE && len > 0 {

@@ -110,7 +110,7 @@ impl Client {
     /// Opens a TCP stream; its request goes with the first write.
     async fn open(&self) -> ClientStream {
         let mut stream: ClientStream = match self {
-            Client::Frames(session) => Box::new(session.open().unwrap()),
+            Client::Frames(session) => Box::new(session.open().await.unwrap()),
             Client::H2(client) => Box::new(
                 timeout(PATIENCE, client.open())
                     .await

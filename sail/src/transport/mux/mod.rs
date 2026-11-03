@@ -45,6 +45,8 @@ mod smux;
 #[cfg(test)]
 mod stall_tests;
 mod yamux;
+#[cfg(test)]
+mod yamux_interop;
 
 /// The destination a mux connection asks for.
 pub const MAGIC_DOMAIN: &str = "sp.mux.sing-box.arpa";

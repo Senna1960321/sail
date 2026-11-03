@@ -322,7 +322,7 @@ impl MuxConnector {
         {
             return None;
         }
-        let stream = self.session.open().ok()?;
+        let stream = self.session.open().await.ok()?;
         self.total_accepted += 1;
         Some(stream)
     }

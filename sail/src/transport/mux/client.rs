@@ -128,7 +128,7 @@ impl Conn {
     /// A new stream, which holds the connection.
     async fn open(self: &Arc<Self>) -> io::Result<AnyStream> {
         let stream: AnyStream = match &**self {
-            Conn::Frames(session) => Box::new(session.open()?),
+            Conn::Frames(session) => Box::new(session.open().await?),
             Conn::H2(client) => Box::new(client.open().await?),
         };
         Ok(Box::new(Held {

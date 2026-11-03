@@ -130,7 +130,7 @@ pub(crate) fn session(data: &[u8]) {
                 let (session, _) = Session::new(ours, codec, false, tuning, "fuzz");
                 let mut streams = FuturesUnordered::new();
                 for _ in 0..3 {
-                    if let Ok(mut stream) = session.open_with(b"request") {
+                    if let Ok(mut stream) = session.open_with(b"request").await {
                         streams.push(async move {
                             let mut buffer = [0; 4096];
                             let _ = stream.read(&mut buffer).await;

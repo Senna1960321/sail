@@ -488,7 +488,7 @@ impl Session {
     /// Opens a stream whose first data is `first`: the destination, and
     /// whatever else is known to follow it.
     pub async fn open_stream(self: &Arc<Self>, first: &[u8]) -> io::Result<Stream> {
-        let inner = self.core.open_with(first)?;
+        let inner = self.core.open_with(first).await?;
         if inner.id() >= 2 && self.proto.peer_version.load(Ordering::Relaxed) >= 2 {
             self.watch_synack(inner.id());
         }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::transport::muxcore::{Codec, Session, Tuning};
+use crate::transport::muxcore::{Codec, Session, Tuning, MAX_UNACKED};
 
 use super::smux::Smux;
 use super::yamux::Yamux;
@@ -55,7 +55,7 @@ async fn echo(flavor: Flavor, streams: usize, size: usize) {
     });
     let mut tasks = Vec::new();
     for i in 0..streams {
-        let stream = client.open().unwrap();
+        let stream = client.open().await.unwrap();
         tasks.push(tokio::spawn(async move {
             let data: Vec<u8> = (0..size).map(|j| (i + j) as u8).collect();
             let (mut r, mut w) = tokio::io::split(stream);
@@ -93,7 +93,7 @@ fn yamux_half_close_and_reset() {
         let (_server, accept) =
             Session::new(b, Flavor::Yamux.codec(), true, Tuning::default(), "test");
         let mut accept = accept.unwrap();
-        let mut stream = client.open().unwrap();
+        let mut stream = client.open().await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         stream.shutdown().await.unwrap();
         let mut served = accept.recv().await.unwrap();
@@ -107,7 +107,7 @@ fn yamux_half_close_and_reset() {
         stream.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"pong");
         // Dropped before the peer finished: reset.
-        let stream = client.open().unwrap();
+        let stream = client.open().await.unwrap();
         let mut served = accept.recv().await.unwrap();
         drop(stream);
         let err = served.read_to_end(&mut Vec::new()).await.unwrap_err();
@@ -128,7 +128,7 @@ fn smux_shutdown_ends_the_stream() {
         let (_server, accept) =
             Session::new(b, Flavor::Smux.codec(), true, Tuning::default(), "test");
         let mut accept = accept.unwrap();
-        let mut stream = client.open().unwrap();
+        let mut stream = client.open().await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         stream.shutdown().await.unwrap();
         let mut served = accept.recv().await.unwrap();
@@ -151,12 +151,12 @@ fn a_closed_connection_fails_the_streams() {
     runtime().block_on(async {
         let (a, b) = tokio::io::duplex(64 << 10);
         let (client, _) = Session::new(a, Flavor::Smux.codec(), false, Tuning::default(), "test");
-        let mut stream = client.open().unwrap();
+        let mut stream = client.open().await.unwrap();
         drop(b);
         let err = stream.read(&mut [0u8; 4]).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
         assert!(client.is_closed());
-        assert!(client.open().is_err());
+        assert!(client.open().await.is_err());
     });
 }
 
@@ -175,7 +175,7 @@ fn an_abrupt_end_retires_a_smux_session() {
         let mut accept = accept.unwrap();
         // Finished by the peer before it is dropped on the server, while
         // the client has not finished.
-        let mut ended = client.open().unwrap();
+        let mut ended = client.open().await.unwrap();
         ended.write_all(b"x").await.unwrap();
         let mut served = accept.recv().await.unwrap();
         served.write_all(b"bye").await.unwrap();
@@ -193,10 +193,10 @@ fn an_abrupt_end_retires_a_smux_session() {
             "a server's stream retired its session"
         );
         // Two streams, and one dropped while the peer still sends.
-        let mut kept = client.open().unwrap();
+        let mut kept = client.open().await.unwrap();
         kept.write_all(b"k").await.unwrap();
         let mut kept_served = accept.recv().await.unwrap();
-        let mut cut = client.open().unwrap();
+        let mut cut = client.open().await.unwrap();
         cut.write_all(b"c").await.unwrap();
         let mut cut_served = accept.recv().await.unwrap();
         cut_served.write_all(b"more").await.unwrap();
@@ -209,7 +209,7 @@ fn an_abrupt_end_retires_a_smux_session() {
         );
         assert!(!client.is_closed(), "the session ended with a stream open");
         assert!(
-            client.open().is_err(),
+            client.open().await.is_err(),
             "a retired session took a new stream"
         );
         kept_served.write_all(b"on").await.unwrap();
@@ -240,7 +240,7 @@ fn a_reset_stream_keeps_a_yamux_session() {
             Session::new(b, Flavor::Yamux.codec(), true, Tuning::default(), "test");
         let mut accept = accept.unwrap();
         // Reset by the peer.
-        let mut ended = client.open().unwrap();
+        let mut ended = client.open().await.unwrap();
         ended.write_all(b"x").await.unwrap();
         drop(accept.recv().await.unwrap());
         let _ = ended.read_to_end(&mut Vec::new()).await;
@@ -250,7 +250,7 @@ fn a_reset_stream_keeps_a_yamux_session() {
             "a stream the peer reset retired the session"
         );
         // Dropped mid-transfer.
-        let mut cut = client.open().unwrap();
+        let mut cut = client.open().await.unwrap();
         cut.write_all(b"c").await.unwrap();
         let mut cut_served = accept.recv().await.unwrap();
         let sender = tokio::spawn(async move {
@@ -265,7 +265,7 @@ fn a_reset_stream_keeps_a_yamux_session() {
             .expect("the peer's stream was not reset")
             .unwrap();
         assert!(client.is_reusable(), "a reset stream retired the session");
-        let mut next = client.open().unwrap();
+        let mut next = client.open().await.unwrap();
         next.write_all(b"next").await.unwrap();
         next.shutdown().await.unwrap();
         let mut served = accept.recv().await.unwrap();
@@ -284,6 +284,57 @@ fn a_reset_stream_keeps_a_yamux_session() {
         drop(served);
         assert!(client.is_reusable());
         assert!(!client.is_closed());
+    });
+}
+
+/// A yamux client opens no more than `MAX_UNACKED` streams the peer has
+/// not acknowledged: the next open waits until one of them is, or is gone.
+#[test]
+fn a_yamux_open_waits_while_256_streams_are_unacknowledged() {
+    use tokio::time::timeout;
+    runtime().block_on(async {
+        let yamux = Flavor::Yamux.codec();
+        let (a, b) = tokio::io::duplex(64 << 10);
+        let (client, _) = Session::new(a, yamux.clone(), false, Tuning::default(), "test");
+        let (mut r, mut peer) = tokio::io::split(b);
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut r, &mut tokio::io::sink()).await;
+        });
+        let mut streams = Vec::new();
+        for _ in 0..MAX_UNACKED {
+            let stream = timeout(Duration::from_secs(1), client.open())
+                .await
+                .expect("an open waited with room");
+            streams.push(stream.unwrap());
+        }
+        let next = client.open();
+        tokio::pin!(next);
+        assert!(
+            timeout(Duration::from_millis(200), next.as_mut())
+                .await
+                .is_err(),
+            "an open past 256 unacknowledged went ahead"
+        );
+        peer.write_all(&yamux.ack(streams[0].id()).unwrap())
+            .await
+            .unwrap();
+        let _next = timeout(Duration::from_secs(5), next)
+            .await
+            .expect("an acknowledgement let no open go")
+            .unwrap();
+        let after = client.open();
+        tokio::pin!(after);
+        assert!(
+            timeout(Duration::from_millis(200), after.as_mut())
+                .await
+                .is_err(),
+            "an acknowledged stream left room twice"
+        );
+        drop(streams.pop());
+        timeout(Duration::from_secs(5), after)
+            .await
+            .expect("a stream gone let no open go")
+            .unwrap();
     });
 }
 
@@ -319,7 +370,7 @@ fn smux_data_past_a_fin_retires_the_session() {
         let smux = Flavor::Smux.codec();
         // Nothing after the FIN.
         let (client, _peer) = raw_smux_peer().await;
-        let mut stream = client.open().unwrap();
+        let mut stream = client.open().await.unwrap();
         stream.write_all(b"x").await.unwrap();
         stream.shutdown().await.unwrap();
         drop(stream);
@@ -329,7 +380,7 @@ fn smux_data_past_a_fin_retires_the_session() {
         );
         // Data after the FIN, while the stream is held.
         let (client, mut peer) = raw_smux_peer().await;
-        let mut stream = client.open().unwrap();
+        let mut stream = client.open().await.unwrap();
         stream.write_all(b"x").await.unwrap();
         stream.shutdown().await.unwrap();
         peer.write_all(&smux.data(stream.id(), b"late"))
@@ -346,7 +397,7 @@ fn smux_data_past_a_fin_retires_the_session() {
         );
         // Data once the stream is gone: the session, without streams, ends.
         let (client, mut peer) = raw_smux_peer().await;
-        let mut stream = client.open().unwrap();
+        let mut stream = client.open().await.unwrap();
         stream.write_all(b"x").await.unwrap();
         stream.shutdown().await.unwrap();
         let id = stream.id();
@@ -375,7 +426,7 @@ async fn pair(
     let (client, _) = Session::new(a, flavor.codec(), false, tuning, "test");
     let (server, accept) = Session::new(b, flavor.codec(), true, tuning, "test");
     let mut accept = accept.unwrap();
-    let mut stream = client.open().unwrap();
+    let mut stream = client.open().await.unwrap();
     // smux opens a stream the peer sees only once it is written to.
     stream.write_all(b"x").await.unwrap();
     let mut served = accept.recv().await.unwrap();
@@ -459,7 +510,7 @@ fn a_burst_of_a_thousand_streams_is_all_accepted() {
             let mut accept = accept.unwrap();
             let mut clients = Vec::new();
             for i in 0..1000u32 {
-                let mut stream = client.open().unwrap();
+                let mut stream = client.open().await.unwrap();
                 clients.push(tokio::spawn(async move {
                     stream.write_all(&i.to_be_bytes()).await?;
                     let mut echo = [0u8; 4];
@@ -505,7 +556,7 @@ fn a_dropped_session_keeps_its_streams_until_they_end() {
             let (_server, accept) =
                 Session::new(b, flavor.codec(), true, Tuning::default(), "test");
             let mut accept = accept.unwrap();
-            let mut stream = client.open().unwrap();
+            let mut stream = client.open().await.unwrap();
             stream.write_all(b"x").await.unwrap();
             let mut served = accept.recv().await.unwrap();
             drop(client);
@@ -583,7 +634,7 @@ async fn download(
     crate::transport::muxcore::Stream,
     crate::transport::muxcore::Stream,
 ) {
-    let mut stream = client.open().unwrap();
+    let mut stream = client.open().await.unwrap();
     stream.write_all(b"x").await.unwrap();
     stream.pin_rtt(Duration::from_secs(1));
     let served = accept.recv().await.unwrap();
@@ -700,7 +751,7 @@ async fn stuck_session(
         next: Box::pin(tokio::time::sleep(Duration::ZERO)),
     };
     let (client, _) = Session::new(conn, smux.clone(), false, tuning, "test");
-    let mut stream = client.open().unwrap();
+    let mut stream = client.open().await.unwrap();
     stream.write_all(&[1u8; 32 << 10]).await.unwrap();
     if fill {
         let chunk = vec![2u8; 8 << 10];
@@ -748,7 +799,7 @@ async fn a_connection_that_takes_nothing_while_not_read_ends_the_session() {
         client.is_closed(),
         "still open past the write stall timeout"
     );
-    let Err(err) = client.open() else {
+    let Err(err) = client.open().await else {
         panic!("a stream opened on the session ended");
     };
     assert!(err.to_string().contains("write timed out"), "{}", err);

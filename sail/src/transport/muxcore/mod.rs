@@ -29,6 +29,10 @@
 //!   ahead of data, in a queue of their own the reader never waits on.
 //! - Streams the peer opens are never turned away for being many at
 //!   once, only past `MAX_STREAMS`.
+//! - Where the peer acknowledges the streams this end opens (yamux), no
+//!   more than `MAX_UNACKED` wait for it: an open waits for one of them to
+//!   be. hashicorp/yamux resets streams past that many it has not
+//!   accepted.
 //! - A stream holds its session: dropping the session's handle takes no
 //!   new streams and closes it once the last stream is done.
 //! - Without half-close (smux, AnyTLS), so does a client's session once
@@ -65,7 +69,7 @@ mod session;
 pub mod stall;
 pub mod stats;
 
-pub use session::{Session, Stream, MAX_STREAMS};
+pub use session::{Session, Stream, MAX_STREAMS, MAX_UNACKED};
 
 /// The window every stream starts with, where there are windows.
 pub const INITIAL_WINDOW: u32 = 256 << 10;
@@ -157,6 +161,8 @@ pub enum Closing {
 pub enum Event {
     /// The peer opens a stream.
     Open(u32),
+    /// The peer acknowledges a stream this end opened.
+    Ack(u32),
     /// Data on a stream, all of a frame's or part of it.
     Data(u32, Bytes),
     /// The peer is done sending on a stream.
@@ -195,6 +201,11 @@ pub trait Codec: Send + Sync + 'static {
     /// The largest id a stream may have.
     fn max_id(&self) -> u32 {
         u32::MAX - 2
+    }
+    /// Whether the peer acknowledges the streams this end opens
+    /// (`Event::Ack`), and opening waits while `MAX_UNACKED` are not.
+    fn acknowledges(&self) -> bool {
+        false
     }
 
     /// Opens stream `id` with `first` as its first data, which is no more
