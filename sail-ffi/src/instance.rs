@@ -421,11 +421,13 @@ pub unsafe extern "C" fn sail_instance_reload(
 /// "reloaded" | "added" | "removed" | "replaced" | "lost"}], "notes":
 /// [{"kind": "endpoint_keeps_defaults", "text", "endpoint", "options"}],
 /// "recheck": {"closed": [{"id", "rule"}], "differ": [{"id", "old",
-/// "new"}]}}`, `recheck` only where `sail_instance_reload_with` asked for
-/// one. Only the inbounds removed and replaced had their connections
-/// closed; with `inbounds_only`, the outbounds, groups, DNS and routing,
-/// and what they held, are those that ran. A reload that fails tells
-/// nothing and leaves the instance as it was.
+/// "new"}]}, "user_limits_dropped": [user]}`, `recheck` only where
+/// `sail_instance_reload_with` asked for one; `user_limits_dropped`, the
+/// users whose limits the host set the reload dropped, changing what the
+/// configuration sets for them. Only the inbounds removed and replaced had
+/// their connections closed; with `inbounds_only`, the outbounds, groups,
+/// DNS and routing, and what they held, are those that ran. A reload that
+/// fails tells nothing and leaves the instance as it was.
 ///
 /// @return SAIL_ERR_NEEDS_RESTART when it adds, removes or changes what
 ///     only a start sets up (a TUN); SAIL_ERR_INBOUND_LOST when an inbound

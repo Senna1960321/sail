@@ -513,6 +513,10 @@ pub struct UserLimits {
     /// Its rate down, what its clients receive, in Mbps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down_mbps: Option<u64>,
+    /// Its rate up and down together, in Mbps: both directions draw from
+    /// it, and from `up_mbps` and `down_mbps` too where they are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_mbps: Option<u64>,
 }
 
 impl UserLimits {
@@ -537,7 +541,11 @@ impl UserLimits {
                 ));
             }
         }
-        for (name, mbps) in [("up_mbps", self.up_mbps), ("down_mbps", self.down_mbps)] {
+        for (name, mbps) in [
+            ("up_mbps", self.up_mbps),
+            ("down_mbps", self.down_mbps),
+            ("total_mbps", self.total_mbps),
+        ] {
             if mbps == Some(0) {
                 return Err(anyhow!(
                     "{}: must be more than 0; leave it out for no limit",

@@ -1087,7 +1087,7 @@ const EXTENSIONS: &[(&str, &str, &str)] = &[
     (
         "user_limits",
         "{}",
-        "What each user, by name, may do across its inbounds: `max_connections`, `max_tcp_connections` (TCP alone; both apply when both are set), `quota_bytes` (up and down together; needs `cache_file`), `expire_at`, and `up_mbps` and `down_mbps`",
+        "What each user, by name, may do across its inbounds: `max_connections`, `max_tcp_connections` (TCP alone; both apply when both are set), `quota_bytes` (up and down together; needs `cache_file`), `expire_at`, and `up_mbps`, `down_mbps` and `total_mbps` (up and down together)",
     ),
     ("log.format", r#""compact""#, "`compact` writes the message alone"),
     (

@@ -79,6 +79,17 @@ impl Gcra {
         }
     }
 
+    /// Takes back `n` bytes counted at `bps` that did not go after all:
+    /// another rate refused them.
+    pub(crate) fn refund(&self, n: u64, bps: u64) {
+        let cost = cost(n, bps);
+        let _ = self
+            .due
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |due| {
+                Some(due.saturating_sub(cost))
+            });
+    }
+
     /// Whether `n` bytes may go now at `bps`, counting them if so; those
     /// that may not are dropped, not counted. Policing, as UDP is.
     pub(crate) fn admit(&self, n: u64, bps: u64) -> bool {

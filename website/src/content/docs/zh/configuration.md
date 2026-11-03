@@ -174,7 +174,7 @@ sing-box 的 `ntp` 段会被读取：测得的时间用于各协议的时间校�
 以下字段是 Sail 自有的，sing-box 不接受。完整列表在[兼容性](/sail/zh/reference/compatibility/)页面所链接的 sing-box 支持表末尾。
 
 - `outbound_providers`：下载（`remote`）、从文件读取（`local`）或直接写在配置中（`inline`）的一组出站，对应 Mihomo 的 proxy-providers。下载内容或文件可以是带 `proxies` 的 Clash YAML，也可以是分享链接。`selector`、`urltest`、`fallback`、`load-balance` 和 `smart` 组通过 `providers` 使用它们，详见[路由规则](/sail/zh/routing/#策略组与提供者)。
-- `user_limits`：按用户名设置，作用于该用户所在的所有入站：`max_connections`、`max_tcp_connections`（只计 TCP 连接和多路复用的流，不计 UDP 会话；两者都设时都生效）、`quota_bytes`（上下行合计；需要 `experimental.cache_file`）、`expire_at`（RFC 3339），以及 `up_mbps` 和 `down_mbps`。未写的字段不限制；任何字段都不能为 0。
+- `user_limits`：按用户名设置，作用于该用户所在的所有入站：`max_connections`、`max_tcp_connections`（只计 TCP 连接和多路复用的流，不计 UDP 会话；两者都设时都生效）、`quota_bytes`（上下行合计；需要 `experimental.cache_file`）、`expire_at`（RFC 3339），以及 `up_mbps`、`down_mbps` 和 `total_mbps`（上下行合计：每个已设的速率都允许时字节才通过）。未写的字段不限制；任何字段都不能为 0。通过管理 API 设置的限额在重载后仍覆盖这里的配置，除非重载改了该用户的配置限额：这时覆盖被丢弃，重载报告的 `user_limits_dropped` 列出该用户。
 - `api`，以及顶层的 `clash_api`。
 - 路由方面的扩展，如 `geoip`、`geosite`、`external`、`ip_asn` 和 `no_resolve`，以及 `fallback`、`load-balance`、`smart`、`network`、`tryall` 和 `pass` 出站。详见[路由规则](/sail/zh/routing/)与[协议与兼容性](/sail/zh/protocols/)。
 

@@ -85,6 +85,9 @@ pub struct ReloadReport {
     /// the reload was asked for one (`"recheck_open": "close_rejected"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recheck: Option<Recheck>,
+    /// The users whose limits the host set the reload dropped: it changed
+    /// what the configuration sets for them.
+    pub user_limits_dropped: Vec<String>,
 }
 
 /// What a reload's recheck of the connections open found.
@@ -217,6 +220,7 @@ impl ReloadReport {
                 })
                 .collect(),
             recheck: report.recheck.as_ref().map(Recheck::of),
+            user_limits_dropped: report.user_limits_dropped.clone(),
         }
     }
 }
@@ -799,6 +803,8 @@ pub struct Limits {
     pub expire_at_ms: Option<u64>,
     pub up_mbps: Option<u64>,
     pub down_mbps: Option<u64>,
+    /// Up and down together.
+    pub total_mbps: Option<u64>,
 }
 
 impl Limits {
@@ -810,6 +816,7 @@ impl Limits {
             expire_at_ms: l.expire_at.map(millis_since_epoch),
             up_mbps: l.up_mbps,
             down_mbps: l.down_mbps,
+            total_mbps: l.total_mbps,
         }
     }
 }
@@ -1356,6 +1363,7 @@ mod tests {
                     closed: vec![RecheckClosed { id: 3, rule: Some(1) }],
                     differ: vec![RecheckDiffer { id: 4, old: "proxy".into(), new: "direct".into() }],
                 }),
+                user_limits_dropped: vec!["alice".into()],
             },
             "routed": Routed {
                 id: Some(7), network: "tcp".into(), inbound: "tun-in".into(),
@@ -1448,7 +1456,7 @@ mod tests {
                 name: "alice".into(), inbounds: vec!["t".into()], active: false, over_quota: true,
                 expired: false,
                 limits: Limits { max_connections: Some(2), max_tcp_connections: Some(1), quota_bytes: Some(10), expire_at_ms: Some(millis_since_epoch(at)),
-                                 up_mbps: None, down_mbps: Some(5) },
+                                 up_mbps: None, down_mbps: Some(5), total_mbps: Some(8) },
                 traffic: Counts { up: 1, down: 2, tcp: 3, udp: 4 }, live: 1, quota_used: 12,
             }] },
             "inbounds": Inbounds { inbounds: vec![Inbound {

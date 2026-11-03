@@ -51,6 +51,9 @@ public struct ReloadReport: Decodable, Equatable, Sendable {
     /// What a recheck of the connections open did; only when one was asked
     /// for.
     public let recheck: Recheck?
+    /// The users whose limits the host set the reload dropped: it changed
+    /// what the configuration sets for them.
+    public let userLimitsDropped: [String]
 }
 
 /// What a reload does with the connections open.

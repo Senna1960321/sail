@@ -28,6 +28,9 @@ pub struct Limits {
     pub up_mbps: Option<u64>,
     /// Its rate down, what its clients receive, in Mbps.
     pub down_mbps: Option<u64>,
+    /// Its rate up and down together, in Mbps: a byte either way passes
+    /// when this and the rate its way, where set, both allow it.
+    pub total_mbps: Option<u64>,
 }
 
 impl Limits {
@@ -40,6 +43,7 @@ impl Limits {
             expire_at: limits.expire_at().map(SystemTime::from),
             up_mbps: limits.up_mbps,
             down_mbps: limits.down_mbps,
+            total_mbps: limits.total_mbps,
         }
     }
 }

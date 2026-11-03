@@ -78,6 +78,8 @@ mod models {
         pub up_mbps: Option<u64>,
         #[serde(default)]
         pub down_mbps: Option<u64>,
+        #[serde(default)]
+        pub total_mbps: Option<u64>,
     }
 
     impl Limits {
@@ -104,6 +106,7 @@ mod models {
                 expire_at,
                 up_mbps: self.up_mbps,
                 down_mbps: self.down_mbps,
+                total_mbps: self.total_mbps,
             })
         }
     }

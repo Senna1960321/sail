@@ -719,8 +719,11 @@ impl Instance {
     /// as the management API's `PUT /users/{name}/limits` does: a user
     /// over a new quota or past a new expiry is shut out at once, one
     /// with more connections than a new maximum keeps them but opens no
-    /// more. A user not made yet takes them when it is. A reload or
-    /// restart sets the configuration's `user_limits` again.
+    /// more. A user not made yet takes them when it is. They stay over the
+    /// configuration's `user_limits` through reloads, but for a reload
+    /// that changes what it sets for the user: that drops them, and its
+    /// `ReloadReport::user_limits_dropped` names the user. A restart
+    /// starts from the configuration's.
     pub fn set_user_limits(&self, user: &str, limits: UserLimits) -> Result<(), Error> {
         self.set_users_limits([(user.to_string(), limits)])
     }

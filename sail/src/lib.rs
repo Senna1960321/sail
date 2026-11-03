@@ -1016,7 +1016,8 @@ impl RuntimeManager {
             inbounds.commit_reload(inbound_reload)
         };
         // The users the new inbounds bound are limited as configured now.
-        self.env
+        let user_limits_dropped = self
+            .env
             .users
             .set_limits(user::UserRegistry::configured(&config));
         self.dns_client.store(dns_client.into_arc());
@@ -1077,6 +1078,7 @@ impl RuntimeManager {
             inbounds: reloaded.changes,
             notes,
             recheck: None,
+            user_limits_dropped,
         })
     }
 
@@ -1101,7 +1103,8 @@ impl RuntimeManager {
             .lock()
             .map_err(|_| Error::RuntimeManager)?
             .commit_reload(inbound_reload);
-        self.env
+        let user_limits_dropped = self
+            .env
             .users
             .set_limits(user::UserRegistry::configured(config));
         self.finish_inbounds(&mut reloaded).await;
@@ -1116,6 +1119,7 @@ impl RuntimeManager {
             inbounds: reloaded.changes,
             notes: Vec::new(),
             recheck: None,
+            user_limits_dropped,
         })
     }
 

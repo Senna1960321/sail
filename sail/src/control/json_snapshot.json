@@ -220,7 +220,10 @@
           "old": "proxy"
         }
       ]
-    }
+    },
+    "user_limits_dropped": [
+      "alice"
+    ]
   },
   "routed": {
     "action": "outbound",
@@ -342,6 +345,7 @@
           "max_connections": 2,
           "max_tcp_connections": 1,
           "quota_bytes": 10,
+          "total_mbps": 8,
           "up_mbps": null
         },
         "live": 1,

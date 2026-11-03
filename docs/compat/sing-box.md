@@ -3145,7 +3145,7 @@ Fields and types sail accepts that sing-box does not.
 | `route.block_quic` | The outbounds QUIC is refused to: a UDP connection sniffed as QUIC that the rules send to one is rejected, for the app to go on over TCP (Surge's block-quic) |
 | `clash_api` | The Clash API at the top level, as well as under `experimental` |
 | `outbound_providers` | Outbounds given together, downloaded or in place, for groups to take (Mihomo's proxy-providers) |
-| `user_limits` | What each user, by name, may do across its inbounds: `max_connections`, `max_tcp_connections` (TCP alone; both apply when both are set), `quota_bytes` (up and down together; needs `cache_file`), `expire_at`, and `up_mbps` and `down_mbps` |
+| `user_limits` | What each user, by name, may do across its inbounds: `max_connections`, `max_tcp_connections` (TCP alone; both apply when both are set), `quota_bytes` (up and down together; needs `cache_file`), `expire_at`, and `up_mbps`, `down_mbps` and `total_mbps` (up and down together) |
 | `log.format` | `compact` writes the message alone |
 | `log.redact` | What lines at INFO, WARN and ERROR leave out: `destination` (the host or address a connection goes to; the port is kept), `source` (the client's address, and the LAN devices learned of) and `process`; DEBUG and TRACE lines are not redacted |
 | `dns.client_strategy` | The address families of the answers to clients' queries |

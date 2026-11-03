@@ -103,6 +103,8 @@ data class ReloadReport(
     val notes: List<ReloadNote> = emptyList(),
     /** What a recheck of the connections open did; only when one was asked for. */
     val recheck: Recheck? = null,
+    /** The users whose limits the host set the reload dropped: it changed theirs. */
+    @SerialName("user_limits_dropped") val userLimitsDropped: List<String> = emptyList(),
 )
 
 /** A reload's recheck of the connections open. */

@@ -59,12 +59,14 @@ pub struct UserState {
     quota_base: AtomicU64,
     /// What shuts the user out, as `Status` bits; none when it may connect.
     status: AtomicU8,
-    /// Its rates, bytes a second, up and down; 0 for none. Read on the
-    /// data path, where `limits` is not.
+    /// Its rates, bytes a second, up, down and both together; 0 for none.
+    /// Read on the data path, where `limits` is not.
     up_bps: AtomicU64,
     down_bps: AtomicU64,
+    total_bps: AtomicU64,
     up_rate: rate::Gcra,
     down_rate: rate::Gcra,
+    total_rate: rate::Gcra,
     /// The live connections, by id.
     live: Mutex<HashMap<u64, Arc<Counter>>>,
     /// The connections that carry others, a QUIC connection or a
@@ -120,8 +122,10 @@ impl UserState {
             status: AtomicU8::new(0),
             up_bps: AtomicU64::new(0),
             down_bps: AtomicU64::new(0),
+            total_bps: AtomicU64::new(0),
             up_rate: rate::Gcra::default(),
             down_rate: rate::Gcra::default(),
+            total_rate: rate::Gcra::default(),
             live: Mutex::default(),
             carriers: Mutex::default(),
             removed: Mutex::default(),
@@ -323,6 +327,8 @@ impl UserState {
         self.up_bps.store(bps(limits.up_mbps), Ordering::Relaxed);
         self.down_bps
             .store(bps(limits.down_mbps), Ordering::Relaxed);
+        self.total_bps
+            .store(bps(limits.total_mbps), Ordering::Relaxed);
         *self.limits.lock().unwrap_or_else(|e| e.into_inner()) = limits;
         self.quota_at.store(at, Ordering::Relaxed);
         let c = self.traffic.counts();
@@ -341,11 +347,13 @@ impl UserState {
     }
 
     /// How much a stream of its reads or writes at once `up` or down, when
-    /// its rate that way is limited.
+    /// a rate limits it that way: the least of them.
     pub(crate) fn chunk(&self, up: bool) -> Option<usize> {
-        match self.bps(up) {
-            0 => None,
-            bps => Some(rate::chunk(bps)),
+        let total = self.total_bps.load(Ordering::Relaxed);
+        match (self.bps(up), total) {
+            (0, 0) => None,
+            (0, bps) | (bps, 0) => Some(rate::chunk(bps)),
+            (one_way, total) => Some(rate::chunk(one_way.min(total))),
         }
     }
 
@@ -364,22 +372,37 @@ impl UserState {
         }
     }
 
-    /// Counts `n` bytes against its rate `up` or down: how long what comes
-    /// next that way must wait. TCP is shaped.
+    /// Counts `n` bytes against its rate `up` or down and its rate both
+    /// ways: how long what comes next that way must wait, the longer of
+    /// the two. TCP is shaped.
     pub(crate) fn shape(&self, up: bool, n: u64) -> Option<std::time::Duration> {
-        match self.bps(up) {
+        let one_way = match self.bps(up) {
             0 => None,
             bps => self.rate(up).take(n, bps),
-        }
+        };
+        let total = match self.total_bps.load(Ordering::Relaxed) {
+            0 => None,
+            bps => self.total_rate.take(n, bps),
+        };
+        one_way.max(total)
     }
 
-    /// Whether a datagram of `n` bytes may go `up` or down within its rate;
-    /// one that may not is dropped. UDP is policed.
+    /// Whether a datagram of `n` bytes may go `up` or down within its rate
+    /// that way and its rate both ways; one that may not is dropped,
+    /// counted by neither. UDP is policed.
     pub(crate) fn police(&self, up: bool, n: u64) -> bool {
-        match self.bps(up) {
-            0 => true,
-            bps => self.rate(up).admit(n, bps),
+        let one_way = self.bps(up);
+        if one_way != 0 && !self.rate(up).admit(n, one_way) {
+            return false;
         }
+        let total = self.total_bps.load(Ordering::Relaxed);
+        if total != 0 && !self.total_rate.admit(n, total) {
+            if one_way != 0 {
+                self.rate(up).refund(n, one_way);
+            }
+            return false;
+        }
+        true
     }
 
     /// Resets the quota: what was used so far no longer counts.
@@ -601,6 +624,10 @@ struct Registry {
     limits: HashMap<String, Limits>,
     /// The limits configured, by name, which a user's go back to.
     configured: HashMap<String, Limits>,
+    /// The limits the host set (the management API, embed), by name: over
+    /// those configured, through reloads that leave the user's configured
+    /// limits as they were.
+    overrides: HashMap<String, Limits>,
     /// Wakes what expires users when the limits change.
     changed: Arc<tokio::sync::Notify>,
     /// Where what happens to users is told.
@@ -614,6 +641,7 @@ impl Default for Registry {
             kept: HashMap::new(),
             limits: HashMap::new(),
             configured: HashMap::new(),
+            overrides: HashMap::new(),
             changed: Arc::default(),
             events: tokio::sync::broadcast::channel(api::EVENTS).0,
         }
@@ -663,13 +691,28 @@ impl UserRegistry {
             .collect()
     }
 
-    /// Limits the users by `limits`, those there are and those made from
-    /// now on; the users `limits` does not name are not limited.
-    pub fn set_limits(&self, limits: HashMap<String, Limits>) {
-        let (users, changed) = {
+    /// Limits the users by `limits`, the configuration's, those there are
+    /// and those made from now on; the users `limits` does not name are
+    /// not limited. Limits the host set for a user stay over them, unless
+    /// `limits` changes the user's own: those are dropped, and their users
+    /// named, in order.
+    pub fn set_limits(&self, limits: HashMap<String, Limits>) -> Vec<String> {
+        let (users, changed, effective, mut dropped) = {
             let mut registry = self.lock();
-            registry.limits = limits.clone();
-            registry.configured = limits.clone();
+            let was = std::mem::replace(&mut registry.configured, limits.clone());
+            let mut dropped = Vec::new();
+            registry.overrides.retain(|name, _| {
+                let kept = was.get(name) == limits.get(name);
+                if !kept {
+                    dropped.push(name.clone());
+                }
+                kept
+            });
+            let mut effective = limits;
+            for (name, set) in &registry.overrides {
+                effective.insert(name.clone(), set.clone());
+            }
+            registry.limits = effective.clone();
             (
                 registry
                     .users
@@ -677,14 +720,18 @@ impl UserRegistry {
                     .filter_map(Weak::upgrade)
                     .collect::<Vec<_>>(),
                 registry.changed.clone(),
+                effective,
+                dropped,
             )
         };
         let now = SystemTime::now();
         for user in users {
-            let limits = limits.get(&*user.name).cloned().unwrap_or_default();
+            let limits = effective.get(&*user.name).cloned().unwrap_or_default();
             user.apply(limits, now);
         }
         changed.notify_one();
+        dropped.sort();
+        dropped
     }
 
     /// Expires each user at its time: sleeps until the next one is due,
@@ -722,13 +769,16 @@ impl UserRegistry {
             .map(UserRef)
     }
 
-    /// Limits `user` by `limits`, until the limits are set again.
+    /// Limits `user` by `limits`, over what the configuration sets, until
+    /// `restore_limit`, or a reload that changes what it sets for the user.
     pub fn set_limit(&self, user: &UserRef, limits: Limits) {
         self.set_limits_named([(user.name.to_string(), limits)]);
     }
 
-    /// Limits each user named by its limits, until the limits are set
-    /// again: those there are at once, those not made yet as they are made.
+    /// Limits each user named by its limits, over what the configuration
+    /// sets, until `restore_limit_named`, or a reload that changes what it
+    /// sets for the user: those there are at once, those not made yet as
+    /// they are made.
     /// One lock for them all, and what expires users is woken only when an
     /// expiry changed: a host setting thousands of users' limits often
     /// costs a map insertion a user.
@@ -738,6 +788,7 @@ impl UserRegistry {
             let mut apply = Vec::new();
             let mut expiry_changed = false;
             for (name, limits) in limits {
+                registry.overrides.insert(name.clone(), limits.clone());
                 let was = registry.limits.insert(name.clone(), limits.clone());
                 expiry_changed |= was.map(|was| was.expire_at) != Some(limits.expire_at);
                 if let Some(user) = registry.users.get(name.as_str()).and_then(Weak::upgrade) {
@@ -760,6 +811,7 @@ impl UserRegistry {
     pub fn restore_limit_named(&self, name: &str) {
         let (user, limits, changed) = {
             let mut registry = self.lock();
+            registry.overrides.remove(name);
             let limits = registry.configured.get(name).cloned().unwrap_or_default();
             registry.limits.insert(name.to_string(), limits.clone());
             (
@@ -779,6 +831,7 @@ impl UserRegistry {
     pub fn restore_limit(&self, user: &UserRef) {
         let (limits, changed) = {
             let mut registry = self.lock();
+            registry.overrides.remove(&*user.name);
             let limits = registry
                 .configured
                 .get(&*user.name)
@@ -1204,6 +1257,133 @@ mod tests {
             assert_eq!(users.bind("u7").limits().quota_bytes, Some(8));
         }
 
+        /// Limits the host set stay over the configuration's through a
+        /// reload that leaves the user's configured limits alone; one that
+        /// changes them, adds them or takes them away drops the override and
+        /// names its user. Restoring drops it too.
+        #[test]
+        fn an_override_survives_a_reload_that_leaves_its_user_alone() {
+            let users = UserRegistry::default();
+            let of = |n: u32| Limits {
+                max_connections: Some(n),
+                ..Default::default()
+            };
+            let configured = |pairs: &[(&str, u32)]| -> HashMap<String, Limits> {
+                pairs
+                    .iter()
+                    .map(|(name, n)| (name.to_string(), of(*n)))
+                    .collect()
+            };
+            let (alice, bob, carol) = (users.bind("alice"), users.bind("bob"), users.bind("carol"));
+            assert!(users
+                .set_limits(configured(&[("alice", 9), ("bob", 9)]))
+                .is_empty());
+            users.set_limits_named([
+                ("alice".to_string(), of(1)),
+                ("bob".to_string(), of(2)),
+                ("carol".to_string(), of(3)),
+            ]);
+            // Bob's and carol's configured limits change, alice's do not.
+            let dropped = users.set_limits(configured(&[("alice", 9), ("bob", 8), ("carol", 7)]));
+            assert_eq!(dropped, ["bob", "carol"]);
+            assert_eq!(alice.limits(), of(1));
+            assert_eq!(bob.limits(), of(8));
+            assert_eq!(carol.limits(), of(7));
+            // The same again: nothing dropped; taken away: dropped.
+            assert!(users
+                .set_limits(configured(&[("alice", 9), ("bob", 8), ("carol", 7)]))
+                .is_empty());
+            assert_eq!(alice.limits(), of(1));
+            assert_eq!(users.set_limits(configured(&[])), ["alice"]);
+            assert_eq!(alice.limits(), Limits::default());
+            // Restored: the configuration's, and no override to drop.
+            users.set_limits_named([("bob".to_string(), of(2))]);
+            users.restore_limit_named("bob");
+            assert_eq!(bob.limits(), Limits::default());
+            assert!(users.set_limits(configured(&[("bob", 5)])).is_empty());
+            assert_eq!(bob.limits(), of(5));
+        }
+
+        /// A combined rate is drawn from both ways, by every connection of
+        /// the user, alongside the rates one way; it changes live.
+        #[test]
+        fn a_combined_rate_is_drawn_from_both_ways() {
+            let users = UserRegistry::default();
+            let alice = users.bind("alice");
+            // 1 Mbps both ways together: 125 kB/s, a burst of 12.5 kB.
+            limited(
+                &users,
+                "alice",
+                Limits {
+                    total_mbps: Some(1),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(alice.chunk(true), Some(1024));
+            // Half a second up, then half a second down: the second waits
+            // for both, less the burst.
+            let up = alice.shape(true, 62_500).unwrap();
+            let down = alice.shape(false, 62_500).unwrap();
+            assert!(up < Duration::from_millis(450), "{:?}", up);
+            assert!(down >= Duration::from_millis(850), "{:?}", down);
+            // Datagrams either way are dropped now, and counted by neither.
+            assert!(!alice.police(true, 1000));
+            assert!(!alice.police(false, 1000));
+            // The rate one way and the combined one both apply: the one
+            // way that has room still waits for the combined.
+            limited(
+                &users,
+                "alice",
+                Limits {
+                    up_mbps: Some(1000),
+                    total_mbps: Some(1),
+                    ..Default::default()
+                },
+            );
+            assert!(alice.shape(true, 1).unwrap() >= Duration::from_millis(800));
+            assert!(!alice.police(true, 1000));
+            // Taken away, live: nothing holds it back.
+            limited(&users, "alice", Limits::default());
+            assert_eq!(alice.shape(false, 62_500), None);
+            assert!(alice.police(false, 1000));
+            assert_eq!(alice.chunk(false), None);
+        }
+
+        /// A combined rate shapes a user's TCP: what it sent up and what
+        /// it received down share it.
+        #[tokio::test]
+        async fn tcp_both_ways_shares_a_combined_rate() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let users = UserRegistry::default();
+            let alice = users.bind("alice");
+            limited(
+                &users,
+                "alice",
+                Limits {
+                    total_mbps: Some(1),
+                    ..Default::default()
+                },
+            );
+            let sm = StatManager::new(0, users.clone());
+            let (a, _far) = tokio::io::duplex(1 << 20);
+            let (b, mut bfar) = tokio::io::duplex(1 << 20);
+            let mut up = sm.stat_stream(Box::new(a), session(&alice));
+            let mut down = sm.stat_stream(Box::new(b), session(&alice));
+            let started = std::time::Instant::now();
+            up.write_all(&[0u8; 50_000]).await.unwrap();
+            bfar.write_all(&[0u8; 50_000]).await.unwrap();
+            let mut buf = vec![0u8; 50_000];
+            down.read_exact(&mut buf).await.unwrap();
+            let took = started.elapsed();
+            // (100 kB - the burst) at 125 kB/s: 0.7 s; each way alone at
+            // the same rate would be 0.3 s.
+            assert!(
+                took >= Duration::from_millis(600) && took < Duration::from_secs(5),
+                "{:?}",
+                took
+            );
+        }
+
         /// Crossing the quota closes every live connection of the user, and
         /// refuses new ones, until the quota is raised.
         #[tokio::test]
@@ -1524,7 +1704,7 @@ mod tests {
                 r#"{"alice": {"max_connections": 3, "max_tcp_connections": 2,
                               "quota_bytes": 100,
                               "expire_at": "2026-12-31T16:00:00+08:00",
-                              "up_mbps": 5, "down_mbps": 50},
+                              "up_mbps": 5, "down_mbps": 50, "total_mbps": 40},
                     "bob": {}}"#,
                 true,
             )
@@ -1539,6 +1719,7 @@ mod tests {
                     expire_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_798_704_000)),
                     up_mbps: Some(5),
                     down_mbps: Some(50),
+                    total_mbps: Some(40),
                 }
             );
             assert_eq!(limits["bob"], Limits::default());
@@ -1573,6 +1754,11 @@ mod tests {
                     r#"{"alice": {"down_mbps": 0}}"#,
                     true,
                     "user_limits.alice.down_mbps: must be more than 0",
+                ),
+                (
+                    r#"{"alice": {"total_mbps": 0}}"#,
+                    true,
+                    "user_limits.alice.total_mbps: must be more than 0",
                 ),
                 (
                     r#"{"alice": {"quota_bytes": 1}}"#,

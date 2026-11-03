@@ -54,6 +54,7 @@ Rust 定义：[`UserLimits`](https://github.com/peakpassvpn/sail/blob/master/sai
 | `expire_at` | string | 未设置 | sail 扩展 | When it may no longer connect, in RFC 3339. |
 | `up_mbps` | number | 未设置 | sail 扩展 | Its rate up, what its clients send, in Mbps: the unit of sing-box's Hysteria2 `up_mbps`, not its direction. |
 | `down_mbps` | number | 未设置 | sail 扩展 | Its rate down, what its clients receive, in Mbps. |
+| `total_mbps` | number | 未设置 | sail 扩展 | Its rate up and down together, in Mbps: both directions draw from it, and from `up_mbps` and `down_mbps` too where they are set. |
 
 <a id="log"></a>
 

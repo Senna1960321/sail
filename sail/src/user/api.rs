@@ -99,8 +99,9 @@ impl RuntimeManager {
         self.stat_manager.read_traffic(clear)
     }
 
-    /// Limits the user `name` by `limits` from now on, until a reload
-    /// sets those of the configuration.
+    /// Limits the user `name` by `limits` from now on, over those the
+    /// configuration sets, until a reload changes what it sets for the
+    /// user.
     pub fn set_user_limits(&self, name: &str, limits: Limits) -> Result<(), Error> {
         let user = self.user_ref(name)?;
         self.env.users.set_limit(&user, limits);
@@ -128,9 +129,10 @@ impl RuntimeManager {
         Ok(self.user_ref(name)?.disconnect())
     }
 
-    /// Limits each user named by its limits from now on, until a reload
-    /// sets those of the configuration: a user not made yet takes them
-    /// when it is (embed's `set_user_limits`).
+    /// Limits each user named by its limits from now on, over those the
+    /// configuration sets, until a reload changes what it sets for the
+    /// user: a user not made yet takes them when it is (embed's
+    /// `set_user_limits`).
     pub fn set_users_limits(&self, limits: impl IntoIterator<Item = (String, Limits)>) {
         self.env.users.set_limits_named(limits);
     }

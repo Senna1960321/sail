@@ -25806,6 +25806,10 @@
     "down_mbps": {
      "type": "number",
      "description": "Its rate down, what its clients receive, in Mbps."
+    },
+    "total_mbps": {
+     "type": "number",
+     "description": "Its rate up and down together, in Mbps: both directions draw from it, and from `up_mbps` and `down_mbps` too where they are set."
     }
    },
    "additionalProperties": false

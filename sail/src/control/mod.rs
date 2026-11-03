@@ -42,6 +42,10 @@ pub struct ReloadReport {
     /// What the recheck of the connections open found, when the reload
     /// was asked for one (`RecheckOpen::CloseRejected`).
     pub recheck: Option<RecheckReport>,
+    /// The users whose limits the host set (`set_user_limits`, the
+    /// management API) the reload dropped, in order: it changed what the
+    /// configuration sets for them, which they are limited by now.
+    pub user_limits_dropped: Vec<String>,
 }
 
 /// How a reload treats what is not in its configuration.

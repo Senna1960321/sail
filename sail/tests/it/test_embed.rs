@@ -1709,7 +1709,7 @@ async fn a_host_limits_and_disconnects_a_user_without_a_reload() {
     })
     .to_string();
     let instance = Instance::new(options()).unwrap();
-    instance.start(Config::Json(config)).await.unwrap();
+    instance.start(Config::Json(config.clone())).await.unwrap();
 
     async fn as_alice(socks: u16, port: u16) -> (tokio::net::TcpStream, u8) {
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", socks))
@@ -1760,6 +1760,31 @@ async fn a_host_limits_and_disconnects_a_user_without_a_reload() {
         .await
         .expect("closed in time");
     assert!(matches!(read, Ok(0) | Err(_)), "{:?}", read);
+
+    // A reload that leaves alice's configured limits as they were keeps
+    // hers: one at once still.
+    let report = instance
+        .reload(Some(Config::Json(config.clone())))
+        .await
+        .unwrap();
+    assert!(report.user_limits_dropped.is_empty(), "{:?}", report);
+    let (mut held, code) = as_alice(socks, echo.port()).await;
+    assert_eq!(code, 0);
+    round_trip(&mut held, b"h").await;
+    let (_over, code) = as_alice(socks, echo.port()).await;
+    assert_ne!(code, 0, "kept through the reload");
+    // One that changes them drops hers, and names her.
+    let mut changed: serde_json::Value = serde_json::from_str(&config).unwrap();
+    changed["user_limits"] = serde_json::json!({ "alice": { "max_connections": 5 } });
+    let report = instance
+        .reload(Some(Config::Json(changed.to_string())))
+        .await
+        .unwrap();
+    assert_eq!(report.user_limits_dropped, ["alice"]);
+    let (mut second, code) = as_alice(socks, echo.port()).await;
+    assert_eq!(code, 0, "the configuration's now");
+    round_trip(&mut second, b"s").await;
+    drop((held, second));
 
     // Put back to the configuration's, none: two at once again.
     instance.restore_user_limits("alice").unwrap();
