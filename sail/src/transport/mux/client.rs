@@ -19,9 +19,10 @@
 //! A stream holds its connection. A client that goes away, as an outbound
 //! a reload or a provider's refresh removes does, closes the connections
 //! without streams and makes no more; those with streams end when their
-//! last stream does. So does a connection retired because one of its
-//! streams ended before the server finished it: it takes no new streams,
-//! whose data would wait behind what that stream was still sent.
+//! last stream does. So does a smux or h2mux connection retired because
+//! one of its streams ended before the server finished it: it takes no new
+//! streams, whose data would wait behind what that stream was still sent.
+//! yamux resets such a stream, alone, and the connection goes on.
 
 use std::io;
 use std::pin::Pin;
@@ -1036,6 +1037,27 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_h2mux_stream_retires_its_connection() {
         an_abandoned_stream_retires_its_connection(Protocol::H2Mux).await;
+    }
+
+    /// With yamux, a stream dropped before the server finished it is reset,
+    /// alone: the next stream goes on the same connection.
+    #[tokio::test]
+    async fn an_abandoned_yamux_stream_keeps_its_connection() {
+        use std::sync::atomic::Ordering;
+        let (port, ended, accepted) = echo_server().await;
+        let mux = mux_to(port, Protocol::Yamux);
+        let handler = mux.stream().unwrap();
+        let mut cut = handler.handle(&echo_session(), None, None).await.unwrap();
+        round_trip(&mut cut, b"cut").await;
+        drop(cut);
+        let mut next = handler.handle(&echo_session(), None, None).await.unwrap();
+        round_trip(&mut next, b"next").await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the next stream went on a new connection"
+        );
+        assert_eq!(ended.load(Ordering::SeqCst), 0);
     }
 
     /// A stream on a connection another session made goes out where the

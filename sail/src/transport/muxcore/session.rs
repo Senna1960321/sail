@@ -386,7 +386,9 @@ impl Shared {
     fn deliver(&self, state: &mut State, id: u32, data: Bytes) -> io::Result<()> {
         let Some(slot) = state.streams.get_mut(&id) else {
             // For a stream this end dropped: the peer was still sending it.
-            if !self.server {
+            // With half-close the stream was reset, alone, and what the
+            // peer sent before it heard is dropped here.
+            if !self.server && self.closing == Closing::Whole {
                 self.retire_abrupt(state, id);
                 if state.retired && state.streams.is_empty() && state.error.is_none() {
                     let reason = "retired, and its last stream is done";
@@ -428,9 +430,10 @@ impl Shared {
         Ok(())
     }
 
-    /// Takes no new streams on a client session one of whose streams, `id`,
-    /// ended while the peer was still sending it: what the peer sent is on
-    /// its way, ahead of anything a new stream would get. The session ends
+    /// Takes no new streams on a client session without half-close one of
+    /// whose streams, `id`, ended while the peer was still sending it: what
+    /// the peer sent is on its way, ahead of anything a new stream would
+    /// get, and the protocol has no reset that stops it. The session ends
     /// with its last stream.
     fn retire_abrupt(&self, state: &mut State, id: u32) {
         if state.retired || state.error.is_some() {
@@ -1196,17 +1199,20 @@ impl Drop for Stream {
             shared.reader.notify_one();
         }
         state.grown -= u64::from(slot.window.saturating_sub(INITIAL_WINDOW));
-        // Dropped while the peer may still be sending -- before its FIN,
-        // unless it reset the stream -- or reset here for stalling: the
-        // session takes no new streams (`retire_abrupt`). A server's peer
-        // opens the streams, and decides for itself. Without half-close
-        // the peer never answers this end's FIN: a stream shut down here
-        // is taken to be finished unless data came after the FIN, or comes
-        // once it is gone (`deliver`).
-        let finished = slot.remote_fin
-            || slot.reset
-            || (shared.closing == Closing::Whole && slot.local_fin && !slot.sent_past_fin);
-        if !shared.server && slot.refused.is_none() && (slot.stalled || !finished) {
+        // Without half-close, dropped while the peer may still be sending
+        // -- before its FIN, unless it reset the stream -- or reset here
+        // for stalling: the session takes no new streams (`retire_abrupt`).
+        // The peer never answers this end's FIN: a stream shut down here is
+        // taken to be finished unless data came after the FIN, or comes
+        // once it is gone (`deliver`). With half-close the stream is reset,
+        // alone, and the session goes on. A server's peer opens the
+        // streams, and decides for itself.
+        let finished = slot.remote_fin || slot.reset || (slot.local_fin && !slot.sent_past_fin);
+        if !shared.server
+            && shared.closing == Closing::Whole
+            && slot.refused.is_none()
+            && (slot.stalled || !finished)
+        {
             shared.retire_abrupt(state, self.id);
         }
         let last = state.retired && state.streams.is_empty();
@@ -1216,7 +1222,8 @@ impl Drop for Stream {
                 Closing::Whole if !slot.local_fin && !slot.remote_fin => Some(codec.fin(self.id)),
                 Closing::Whole => None,
                 // Abandoned before the peer finished: reset, so that it
-                // stops sending. Otherwise finish, if not done yet.
+                // stops sending, where Go's yamux `Close` sends a FIN and
+                // reads on. Otherwise finish, if not done yet.
                 Closing::Half if !slot.remote_fin && !slot.reset => Some(codec.reset(self.id)),
                 Closing::Half if !slot.local_fin && !slot.reset => Some(codec.fin(self.id)),
                 Closing::Half => None,

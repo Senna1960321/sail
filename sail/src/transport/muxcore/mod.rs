@@ -31,11 +31,15 @@
 //!   once, only past `MAX_STREAMS`.
 //! - A stream holds its session: dropping the session's handle takes no
 //!   new streams and closes it once the last stream is done.
-//! - So does a client's session once one of its streams ended while the
-//!   peer may still be sending it: dropped before the peer's FIN or reset,
-//!   reset for stalling, or, without half-close, with data still coming
-//!   after its FIN. What the peer sent is on its way, ahead of anything a
-//!   new stream would get: on a slow link, long enough for it to fail.
+//! - Without half-close (smux, AnyTLS), so does a client's session once
+//!   one of its streams ended while the peer may still be sending it:
+//!   dropped before the peer's FIN, reset for stalling, or with data still
+//!   coming after its FIN. What the peer sent is on its way, ahead of
+//!   anything a new stream would get, and nothing tells the peer to stop:
+//!   on a slow link, long enough for it to fail. With half-close (yamux,
+//!   amux), a stream dropped before the peer's FIN is reset, alone, and
+//!   what the peer sent it meanwhile, no more than its window, is dropped
+//!   as it comes: the session goes on.
 //!
 //! How many sessions and streams there are, and how many were reset for
 //! stalling, is counted per protocol (`stats`).
@@ -136,7 +140,8 @@ pub enum Flow {
 /// What finishing a stream means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Closing {
-    /// A FIN ends one direction; the other goes on (yamux).
+    /// A FIN ends one direction; the other goes on, and a reset ends one
+    /// stream alone (yamux, amux).
     Half,
     /// There is no half-close: a FIN ends a stream both ways, sent when it
     /// is shut down: what comes after is dropped, what came before is

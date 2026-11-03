@@ -160,77 +160,131 @@ fn a_closed_connection_fails_the_streams() {
     });
 }
 
-/// A client's stream dropped before the peer finished it retires its
-/// session: what the peer sent it is still on its way, ahead of what a new
-/// stream would get. The session takes no new streams, the others go on,
-/// and it ends with the last. A stream the peer ended, or reset, leaves it
-/// reusable, and so does any stream on a server's session.
-async fn an_abrupt_end_retires_the_session(flavor: Flavor) {
-    let (a, b) = tokio::io::duplex(64 << 10);
-    let (client, _) = Session::new(a, flavor.codec(), false, Tuning::default(), "test");
-    let (server, accept) = Session::new(b, flavor.codec(), true, Tuning::default(), "test");
-    let mut accept = accept.unwrap();
-    // Ended by the peer: finished (smux), or reset (yamux), before it is
-    // dropped on the server, while the client has not finished.
-    let mut ended = client.open().unwrap();
-    ended.write_all(b"x").await.unwrap();
-    let mut served = accept.recv().await.unwrap();
-    served.write_all(b"bye").await.unwrap();
-    drop(served);
-    let mut got = Vec::new();
-    let _ = ended.read_to_end(&mut got).await;
-    assert_eq!(got, b"bye");
-    drop(ended);
-    assert!(
-        client.is_reusable(),
-        "a stream the peer ended retired the session"
-    );
-    assert!(
-        server.is_reusable(),
-        "a server's stream retired its session"
-    );
-    // Two streams, and one dropped while the peer still sends.
-    let mut kept = client.open().unwrap();
-    kept.write_all(b"k").await.unwrap();
-    let mut kept_served = accept.recv().await.unwrap();
-    let mut cut = client.open().unwrap();
-    cut.write_all(b"c").await.unwrap();
-    let mut cut_served = accept.recv().await.unwrap();
-    cut_served.write_all(b"more").await.unwrap();
-    let mut first = [0u8; 4];
-    cut.read_exact(&mut first).await.unwrap();
-    drop(cut);
-    assert!(
-        !client.is_reusable(),
-        "a stream cut short left the session reusable"
-    );
-    assert!(!client.is_closed(), "the session ended with a stream open");
-    assert!(
-        client.open().is_err(),
-        "a retired session took a new stream"
-    );
-    kept_served.write_all(b"on").await.unwrap();
-    let mut on = [0u8; 2];
-    tokio::time::timeout(Duration::from_secs(5), kept.read_exact(&mut on))
-        .await
-        .expect("the other stream stopped")
-        .unwrap();
-    assert_eq!(&on, b"on");
-    drop(kept);
-    assert!(
-        client.is_closed(),
-        "a retired session outlived its last stream"
-    );
-}
-
+/// Without half-close, a client's stream dropped before the peer finished
+/// it retires its session: what the peer sent it is still on its way,
+/// ahead of what a new stream would get. The session takes no new streams,
+/// the others go on, and it ends with the last. A stream the peer ended
+/// leaves it reusable, and so does any stream on a server's session.
 #[test]
 fn an_abrupt_end_retires_a_smux_session() {
-    runtime().block_on(an_abrupt_end_retires_the_session(Flavor::Smux));
+    runtime().block_on(async {
+        let flavor = Flavor::Smux;
+        let (a, b) = tokio::io::duplex(64 << 10);
+        let (client, _) = Session::new(a, flavor.codec(), false, Tuning::default(), "test");
+        let (server, accept) = Session::new(b, flavor.codec(), true, Tuning::default(), "test");
+        let mut accept = accept.unwrap();
+        // Finished by the peer before it is dropped on the server, while
+        // the client has not finished.
+        let mut ended = client.open().unwrap();
+        ended.write_all(b"x").await.unwrap();
+        let mut served = accept.recv().await.unwrap();
+        served.write_all(b"bye").await.unwrap();
+        drop(served);
+        let mut got = Vec::new();
+        let _ = ended.read_to_end(&mut got).await;
+        assert_eq!(got, b"bye");
+        drop(ended);
+        assert!(
+            client.is_reusable(),
+            "a stream the peer ended retired the session"
+        );
+        assert!(
+            server.is_reusable(),
+            "a server's stream retired its session"
+        );
+        // Two streams, and one dropped while the peer still sends.
+        let mut kept = client.open().unwrap();
+        kept.write_all(b"k").await.unwrap();
+        let mut kept_served = accept.recv().await.unwrap();
+        let mut cut = client.open().unwrap();
+        cut.write_all(b"c").await.unwrap();
+        let mut cut_served = accept.recv().await.unwrap();
+        cut_served.write_all(b"more").await.unwrap();
+        let mut first = [0u8; 4];
+        cut.read_exact(&mut first).await.unwrap();
+        drop(cut);
+        assert!(
+            !client.is_reusable(),
+            "a stream cut short left the session reusable"
+        );
+        assert!(!client.is_closed(), "the session ended with a stream open");
+        assert!(
+            client.open().is_err(),
+            "a retired session took a new stream"
+        );
+        kept_served.write_all(b"on").await.unwrap();
+        let mut on = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), kept.read_exact(&mut on))
+            .await
+            .expect("the other stream stopped")
+            .unwrap();
+        assert_eq!(&on, b"on");
+        drop(kept);
+        assert!(
+            client.is_closed(),
+            "a retired session outlived its last stream"
+        );
+    });
 }
 
+/// With half-close, a client's stream dropped while the peer still sends
+/// is reset, alone: what the peer sent meanwhile is dropped, and the
+/// session goes on, the next stream on it as any other. A stream the peer
+/// reset leaves it reusable too.
 #[test]
-fn an_abrupt_end_retires_a_yamux_session() {
-    runtime().block_on(an_abrupt_end_retires_the_session(Flavor::Yamux));
+fn a_reset_stream_keeps_a_yamux_session() {
+    runtime().block_on(async {
+        let (a, b) = tokio::io::duplex(64 << 10);
+        let (client, _) = Session::new(a, Flavor::Yamux.codec(), false, Tuning::default(), "test");
+        let (_server, accept) =
+            Session::new(b, Flavor::Yamux.codec(), true, Tuning::default(), "test");
+        let mut accept = accept.unwrap();
+        // Reset by the peer.
+        let mut ended = client.open().unwrap();
+        ended.write_all(b"x").await.unwrap();
+        drop(accept.recv().await.unwrap());
+        let _ = ended.read_to_end(&mut Vec::new()).await;
+        drop(ended);
+        assert!(
+            client.is_reusable(),
+            "a stream the peer reset retired the session"
+        );
+        // Dropped mid-transfer.
+        let mut cut = client.open().unwrap();
+        cut.write_all(b"c").await.unwrap();
+        let mut cut_served = accept.recv().await.unwrap();
+        let sender = tokio::spawn(async move {
+            let chunk = vec![7u8; 16 << 10];
+            while cut_served.write_all(&chunk).await.is_ok() {}
+        });
+        let mut first = [0u8; 4];
+        cut.read_exact(&mut first).await.unwrap();
+        drop(cut);
+        tokio::time::timeout(Duration::from_secs(5), sender)
+            .await
+            .expect("the peer's stream was not reset")
+            .unwrap();
+        assert!(client.is_reusable(), "a reset stream retired the session");
+        let mut next = client.open().unwrap();
+        next.write_all(b"next").await.unwrap();
+        next.shutdown().await.unwrap();
+        let mut served = accept.recv().await.unwrap();
+        let mut got = Vec::new();
+        served.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"next");
+        served.write_all(b"done").await.unwrap();
+        served.shutdown().await.unwrap();
+        let mut back = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), next.read_to_end(&mut back))
+            .await
+            .expect("the next stream stopped")
+            .unwrap();
+        assert_eq!(back, b"done");
+        drop(next);
+        drop(served);
+        assert!(client.is_reusable());
+        assert!(!client.is_closed());
+    });
 }
 
 /// A client session over a pipe whose peer writes raw smux frames, and
