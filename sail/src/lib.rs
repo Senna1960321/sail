@@ -44,6 +44,8 @@ pub mod fetch;
 pub mod fuzzing;
 pub mod generate;
 mod include;
+#[cfg(feature = "muxcore")]
+pub mod muxcore;
 pub mod net;
 pub mod platform;
 pub mod protocol;

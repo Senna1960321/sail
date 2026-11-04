@@ -55,7 +55,8 @@
         feature = "inbound-amux",
         feature = "outbound-amux",
         feature = "inbound-anytls",
-        feature = "outbound-anytls"
+        feature = "outbound-anytls",
+        feature = "muxcore"
     )),
     allow(dead_code, unused_imports)
 )]
@@ -68,6 +69,8 @@ use bytes::{Bytes, BytesMut};
 mod session;
 pub mod stall;
 pub mod stats;
+#[cfg(any(feature = "mux", feature = "muxcore"))]
+pub mod yamux;
 
 pub use session::{Session, Stream, MAX_STREAMS, MAX_UNACKED};
 

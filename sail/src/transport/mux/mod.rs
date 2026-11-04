@@ -44,7 +44,6 @@ mod session_tests;
 mod smux;
 #[cfg(test)]
 mod stall_tests;
-mod yamux;
 #[cfg(test)]
 mod yamux_interop;
 
@@ -71,7 +70,7 @@ impl Protocol {
     fn codec(self) -> Option<std::sync::Arc<dyn crate::transport::muxcore::Codec>> {
         match self {
             Protocol::Smux => Some(std::sync::Arc::new(smux::Smux)),
-            Protocol::Yamux => Some(std::sync::Arc::new(yamux::Yamux)),
+            Protocol::Yamux => Some(std::sync::Arc::new(crate::transport::muxcore::yamux::Yamux)),
             Protocol::H2Mux => None,
         }
     }

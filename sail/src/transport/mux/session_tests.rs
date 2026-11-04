@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::transport::muxcore::yamux::Yamux;
 use crate::transport::muxcore::{Codec, Session, Tuning, MAX_UNACKED};
 
 use super::smux::Smux;
-use super::yamux::Yamux;
 
 #[derive(Clone, Copy)]
 enum Flavor {

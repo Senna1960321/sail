@@ -17,9 +17,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
+use crate::transport::muxcore::yamux::Yamux;
 use crate::transport::muxcore::{Session, Tuning};
-
-use super::yamux::Yamux;
 
 /// Streams opened at once, past the reference's accept backlog of 256.
 const STREAMS: usize = 500;

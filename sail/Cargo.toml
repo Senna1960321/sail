@@ -201,6 +201,9 @@ wireguard = ["netstack", "btls", "btls-sys", "blake2", "base64"]
 
 # sing-box's multiplex (sing-mux): smux, yamux, and h2mux over HTTP/2.
 mux = ["h2", "http"]
+# sail::muxcore, for a host's own links: yamux sessions over any
+# connection (docs/embed.md).
+muxcore = []
 
 plugin = ["async-ffi", "libloading"]
 api = ["axum", "hyper-util"]

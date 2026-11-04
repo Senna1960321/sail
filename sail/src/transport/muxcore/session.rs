@@ -579,16 +579,38 @@ pub struct Session {
 }
 
 impl Session {
-    /// Starts a session over `conn`; a server also gets the streams the
-    /// peer opens. `label` says who the session serves in its logs, as
-    /// `inbound=tag user=name` or `outbound=tag`.
-    pub fn new<S>(
+    /// Starts a session over `conn`, in the current task's scope; a server
+    /// also gets the streams the peer opens. `label` says who the session
+    /// serves in its logs, as `inbound=tag user=name` or `outbound=tag`.
+    #[allow(dead_code)] // Not every protocol on the core uses it.
+    pub(crate) fn new<S>(
         conn: S,
         codec: Arc<dyn Codec>,
         server: bool,
         tuning: Tuning,
         label: impl Into<Arc<str>>,
     ) -> (Self, Option<mpsc::UnboundedReceiver<Stream>>)
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (session, accept, driver) = Self::start(conn, codec, server, tuning, label);
+        crate::runtime::scope::spawn("mux session", driver);
+        (session, accept)
+    }
+
+    /// A session over `conn`, and the task that reads and writes it, for
+    /// the caller to spawn.
+    pub(crate) fn start<S>(
+        conn: S,
+        codec: Arc<dyn Codec>,
+        server: bool,
+        tuning: Tuning,
+        label: impl Into<Arc<str>>,
+    ) -> (
+        Self,
+        Option<mpsc::UnboundedReceiver<Stream>>,
+        impl std::future::Future<Output = ()> + Send + 'static,
+    )
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -660,9 +682,8 @@ impl Session {
             }
         });
         *shared.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
-        crate::runtime::scope::spawn("mux session", driver);
         shared.ping();
-        (Session { shared }, accept_rx)
+        (Session { shared }, accept_rx, driver.map(drop))
     }
 
     /// Opens a stream, once fewer than `MAX_UNACKED` the peer has not
@@ -673,7 +694,7 @@ impl Session {
 
     /// Opens a stream whose first data, sent with what opens it, is
     /// `first`: no more than `INITIAL_WINDOW`.
-    pub async fn open_with(&self, first: &[u8]) -> io::Result<Stream> {
+    pub(crate) async fn open_with(&self, first: &[u8]) -> io::Result<Stream> {
         loop {
             let answered = self.shared.answered.notified();
             tokio::pin!(answered);
@@ -739,12 +760,14 @@ impl Session {
         }))
     }
 
+    /// The streams open on the session.
     pub fn num_streams(&self) -> usize {
         self.shared.lock().streams.len()
     }
 
     /// Stream data received, all told.
-    pub fn received(&self) -> u64 {
+    #[allow(dead_code)] // Not every protocol on the core uses it.
+    pub(crate) fn received(&self) -> u64 {
         self.shared.lock().received
     }
 
@@ -757,7 +780,8 @@ impl Session {
     /// Whether a new stream may go on the session: it is not closed, and
     /// not retired, as it is once one of its streams ended abruptly. A
     /// retired session's streams go on, and it ends with the last.
-    pub fn is_reusable(&self) -> bool {
+    #[allow(dead_code)] // Not every protocol on the core uses it.
+    pub(crate) fn is_reusable(&self) -> bool {
         let state = self.shared.lock();
         state.error.is_none() && !state.going_away && !state.retired
     }
@@ -768,7 +792,8 @@ impl Session {
     }
 
     /// What closes the session, as `close` does, without keeping it.
-    pub fn closer(&self) -> impl Fn() + Send + Sync + 'static {
+    #[allow(dead_code)] // Not every protocol on the core uses it.
+    pub(crate) fn closer(&self) -> impl Fn() + Send + Sync + 'static {
         let shared = Arc::downgrade(&self.shared);
         move || {
             if let Some(shared) = shared.upgrade() {
@@ -779,7 +804,7 @@ impl Session {
 
     /// Takes no new streams, and ends the session once the last stream is
     /// done.
-    pub fn retire(&self) {
+    pub(crate) fn retire(&self) {
         let mut state = self.shared.lock();
         state.retired = true;
         let accept = state.accept.take();
@@ -963,13 +988,15 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// The stream's id on the session.
     pub fn id(&self) -> u32 {
         self.id
     }
 
     /// Sends a control frame of the protocol's about this stream, ahead of
     /// stream data.
-    pub fn send_control(&self, frame: Bytes) -> io::Result<()> {
+    #[allow(dead_code)] // Not every protocol on the core uses it.
+    pub(crate) fn send_control(&self, frame: Bytes) -> io::Result<()> {
         let mut state = self.shared.lock();
         if state.error.is_some() {
             return Err(closed(&self.shared, &state));

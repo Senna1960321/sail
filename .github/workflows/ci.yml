@@ -277,7 +277,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features sail/muxcore -- -D warnings
 
       - name: BoringSSL linked
         run: scripts/prebuilt-boringssl.sh --check "$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"
@@ -381,6 +381,7 @@ jobs:
           cargo clippy -p sail --no-default-features --all-targets
           echo "::endgroup::"
           for features in \
+            muxcore \
             inbound-socks,outbound-direct \
             inbound-shadowsocks,outbound-shadowsocks \
             inbound-trojan,inbound-tls,outbound-trojan,outbound-tls \
@@ -465,7 +466,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: libraries
-        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/plugin --lib
+        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/plugin,sail/muxcore --lib
 
       # muxcore's yamux against hashicorp/yamux, the reference
       # (scripts/yamux-peer): ignored in a plain run, and failing here
@@ -480,7 +481,7 @@ jobs:
         run: |
           (cd scripts/yamux-peer && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/yamux-peer" .)
           YAMUX_PEER="$RUNNER_TEMP/yamux-peer" cargo test --locked -p sail -p sail-netstack \
-            --features sail/auto-reload,sail/plugin --lib yamux_interop -- --ignored
+            --features sail/auto-reload,sail/plugin,sail/muxcore --lib yamux_interop -- --ignored
 
       # The out-of-tree plugin interface's example: the Shadowsocks plugin.
       - name: the Shadowsocks plugin
@@ -490,7 +491,7 @@ jobs:
         run: cargo test --locked -p sail-netstack --test '*'
 
       - name: doc tests
-        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload --doc
+        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/muxcore --doc
 
       - name: BoringSSL linked
         run: scripts/prebuilt-boringssl.sh --check "$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"

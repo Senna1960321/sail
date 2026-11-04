@@ -3,7 +3,7 @@
 `sail::embed` runs sail inside a host's own process, as a library. An
 in-process engine, a desktop service or a command-line tool links the
 `sail` crate and drives instances through it. It is the only stable part of
-the crate. The C ABI (`sail-ffi`, docs/ffi.md) is built on it, so the two
+the crate, with `sail::muxcore` (A host's own links). The C ABI (`sail-ffi`, docs/ffi.md) is built on it, so the two
 behave the same.
 
 ```rust
@@ -27,6 +27,8 @@ instance.stop().await?;
 - **Breaking changes.** Before 1.0 a breaking change raises the minor
   version (0.16 → 0.17) and is listed in the release notes, so a host
   should pin the version it builds with.
+- **`sail::muxcore`** (feature `muxcore`, A host's own links) follows the
+  same rules.
 - **Everything else.** Every other module of the crate is public only for
   sail's own crates. It is hidden from the docs and changes without notice.
 - **Configuration.** sing-box's JSON is the configuration contract. Clash
@@ -773,6 +775,51 @@ NAT64 and no IPv4, IPv4 destinations go through its prefix. The prefix is
 the process's, as the network is: found through the system's resolver, or
 pushed by the host, the last discovery or push wins for every instance in
 the process, and an instance that stops leaves it as it was.
+
+## A host's own links
+
+`sail::muxcore` (feature `muxcore`) is the stream multiplexer sail's
+yamux, smux, amux and AnyTLS run on, for a host that links its nodes
+itself: many streams over one connection, any `AsyncRead + AsyncWrite`
+(TCP, TLS, a pipe). It speaks yamux as hashicorp/yamux does, and CI runs
+it against hashicorp/yamux both ways. It needs no instance.
+
+```rust
+use sail::muxcore::{Config, Protocol, Session};
+
+// The node that accepts: each stream its peer opens.
+let (server, mut incoming) = Session::server(tls, Config::new(Protocol::Yamux));
+while let Some(stream) = incoming.accept().await {
+    tokio::spawn(serve(stream));
+}
+
+// The node that dials: streams on one connection.
+let link = Session::client(tls, Config::new(Protocol::Yamux).label("node-2"));
+let mut stream = link.open().await?;
+stream.write_all(&request).await?;
+```
+
+- **Its task is the host's.** A session's task, which reads and writes
+  the connection, runs on the tokio runtime it is made in, with I/O and
+  timers enabled; no instance's stop ends it. It ends when the connection
+  does, on `close()`, or once the `Session` is dropped and its last
+  stream is done. Dropping it takes no new streams, on either side;
+  `accept` then gives `None`.
+- **A stream is one connection's worth.** `Stream` is `AsyncRead +
+  AsyncWrite`. `shutdown()` sends a FIN, and the other way goes on until
+  the peer's. A stream dropped before the peer's FIN is reset, alone:
+  the session and its other streams go on (where Go's yamux `Close`
+  sends a FIN).
+- **Bounded.** No more than `MAX_UNACKED` (256) streams the peer has not
+  accepted wait at once: `open` waits for one of them, as
+  hashicorp/yamux's backlog is that many. A session carries
+  `MAX_STREAMS` (1024) at once; past that `open` fails. A stream's
+  window starts at 256 KiB and grows, as it is read fast, to
+  `Config::window_max` (16 MiB by default); a stream whose data nothing
+  reads for `Config::stall_timeout` (60 s) is reset.
+- **Errors.** `open` fails once the session has ended or the peer takes
+  no more streams; a stream's reads and writes fail once it is reset or
+  its session ends. Neither retries: the host makes a new session.
 
 ## Host kinds
 

@@ -39,7 +39,8 @@ pub mod mux;
     feature = "outbound-anytls",
     feature = "inbound-http",
     feature = "outbound-http",
-    feature = "quic"
+    feature = "quic",
+    feature = "muxcore"
 ))]
 pub mod muxcore;
 #[cfg(feature = "outbound-obfs")]

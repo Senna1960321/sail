@@ -8,10 +8,11 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::transport::muxcore::yamux::Yamux;
 use crate::transport::muxcore::{Codec, Decoder, Session, Tuning};
 
 use super::server::{read_stream, Server};
-use super::{read_request, read_status, smux::Smux, yamux::Yamux, StreamRequest};
+use super::{read_request, read_status, smux::Smux, StreamRequest};
 
 /// Feeds `data` to `decoder` in pieces of `step`, as a connection gives
 /// it, until it fails. A frame gives a few events at most: the bound only
