@@ -16,8 +16,8 @@ resolver = "2"
 btls = { git = "https://github.com/peakpassvpn/btls.git", rev = "132da2caff5d94c0f9ea52aa82bbc170bf2baaa6" }
 btls-sys = { git = "https://github.com/peakpassvpn/btls.git", rev = "132da2caff5d94c0f9ea52aa82bbc170bf2baaa6" }
 # One revision for both; FORK.md there says what each carries.
-quinn = { git = "https://github.com/peakpassvpn/quinn.git", rev = "b19aa3ec659ff90d068deb14fafa594136fd86e8" }
-quinn-proto = { git = "https://github.com/peakpassvpn/quinn.git", rev = "b19aa3ec659ff90d068deb14fafa594136fd86e8" }
+quinn = { git = "https://github.com/peakpassvpn/quinn.git", rev = "072a218460c77006dbc799079cd7bf5866c2a678" }
+quinn-proto = { git = "https://github.com/peakpassvpn/quinn.git", rev = "072a218460c77006dbc799079cd7bf5866c2a678" }
 
 [profile.release]
 opt-level = 3
