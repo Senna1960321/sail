@@ -61,13 +61,14 @@ pub struct Closer {
     write: futures::task::AtomicWaker,
 }
 
-const CLOSED_BY: [ClosedBy; 6] = [
+const CLOSED_BY: [ClosedBy; 7] = [
     ClosedBy::Api,
     ClosedBy::User,
     ClosedBy::Inbound,
     ClosedBy::Rules,
     ClosedBy::Network,
     ClosedBy::Stopped,
+    ClosedBy::Host,
 ];
 
 impl Closer {
@@ -409,12 +410,14 @@ impl Counter {
     /// closed with how it ended and was used, or interim. Nothing when no
     /// one listens, nor anything once its closed record went, nor an
     /// interim one with nothing new unless the host `asked` for it: what
-    /// is not told is in the next. Whether one was told.
+    /// is not told is in the next. Whether one was told. `reason` is why
+    /// the host's check refused it, for a closed record that tells so.
     fn report(
         &self,
         events: &EventHub,
         run: SystemTime,
         closed: Option<(End, Outcome)>,
+        reason: Option<String>,
         asked: bool,
     ) -> bool {
         if !events.records_wanted() {
@@ -442,6 +445,7 @@ impl Counter {
                 None => RecordKind::Interim,
             },
             outcome: closed.map(|(_, outcome)| outcome),
+            reason,
             network: sess.network,
             user: crate::user::name(&sess.user).map(str::to_owned),
             inbound: sess.inbound_tag.clone(),
@@ -452,7 +456,11 @@ impl Counter {
             domain,
             domain_source,
             outbound: (!sess.outbound_tag.is_empty()).then(|| sess.outbound_tag.clone()),
-            chain: crate::app::dispatcher::outbound_chain(sess, &sess.outbound_tag),
+            // Empty where no outbound was asked: rejected, blocked.
+            chain: match sess.outbound_tag.is_empty() {
+                true => Vec::new(),
+                false => crate::app::dispatcher::outbound_chain(sess, &sess.outbound_tag),
+            },
             up_total,
             down_total,
             start: self.started,
@@ -655,6 +663,8 @@ struct Unlisted {
     at: SystemTime,
     end: Option<End>,
     outcome: Outcome,
+    /// Why the host's check refused it.
+    reason: Option<String>,
 }
 
 impl std::fmt::Debug for Number {
@@ -688,6 +698,7 @@ impl Number {
                 at: SystemTime::now(),
                 end: None,
                 outcome: Outcome::Ok,
+                reason: None,
             }));
         }
     }
@@ -706,6 +717,16 @@ impl Number {
     /// tell: what its closed record tells, unless it is listed after
     /// all. Nothing while no one listens for records.
     pub fn closed(&self, sess: &Session, outcome: Outcome, end: End) {
+        self.closed_for(sess, outcome, end, None);
+    }
+
+    /// The host's check refused it, for `reason` (none for a check that
+    /// panicked), `sess` as it was checked.
+    pub(crate) fn refused_by_host(&self, sess: &Session, reason: Option<String>) {
+        self.closed_for(sess, Outcome::Rejected, End::Closed(ClosedBy::Host), reason);
+    }
+
+    fn closed_for(&self, sess: &Session, outcome: Outcome, end: End, reason: Option<String>) {
         let Some(recorder) = &self.recorder else {
             return;
         };
@@ -721,6 +742,7 @@ impl Number {
             at,
             end: Some(end),
             outcome,
+            reason,
         }));
     }
 
@@ -757,6 +779,7 @@ impl Drop for Number {
             &recorder.events,
             recorder.run,
             Some((end, unlisted.outcome)),
+            unlisted.reason,
             false,
         );
     }
@@ -816,8 +839,13 @@ impl Drop for Accounts {
         if recorder.events.records_wanted() {
             let end = self.counter.end(recorder.stopping.load(Ordering::Relaxed));
             let outcome = self.counter.outcome();
-            self.counter
-                .report(&recorder.events, recorder.run, Some((end, outcome)), false);
+            self.counter.report(
+                &recorder.events,
+                recorder.run,
+                Some((end, outcome)),
+                None,
+                false,
+            );
         }
         self.counter.recv_completed.store(true, Ordering::Relaxed);
         self.counter.send_completed.store(true, Ordering::Relaxed);
@@ -1176,7 +1204,7 @@ impl StatManager {
         }
         self.connections()
             .iter()
-            .filter(|counter| counter.report(&recorder.events, recorder.run, None, asked))
+            .filter(|counter| counter.report(&recorder.events, recorder.run, None, None, asked))
             .count()
     }
 

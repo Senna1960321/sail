@@ -158,10 +158,13 @@ public struct ConnectionRecord: Decodable, Equatable, Sendable {
     /// finished, error, idle_timeout, write_stall, closed or aborted.
     public let end: String?
     public let error: String?
-    /// api, user, inbound, rules, network or stopped.
+    /// api, user, inbound, rules, network, stopped or host.
     public let closedBy: String?
     /// For a closed record: ok, dial_failed, blocked or rejected.
     public let outcome: String?
+    /// For one the host's check rejected (closed_by host): why, as the
+    /// check told it.
+    public let reason: String?
     public let network: String
     public let user: String?
     public let inbound: String

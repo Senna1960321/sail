@@ -381,54 +381,61 @@ impl Admission {
             .is_some_and(|h| h.admit_source.is_some())
     }
 
+    /// Whether the host checks each session before it is routed.
+    pub(crate) fn checks_sessions(&self) -> bool {
+        self.hooks.as_ref().is_some_and(|h| h.admit.is_some())
+    }
+
     /// Whether the host takes in a connection from `source` to `local`, as
     /// it is accepted, before its handshake: sail's own admission took it.
     pub(crate) fn host_admits_source(&self, source: SocketAddr, local: SocketAddr) -> bool {
         match self.hooks.as_ref().and_then(|h| h.admit_source.as_ref()) {
-            Some(check) => self.host_verdict(|| check(source, local)),
+            Some(check) => self.host_verdict(|| check(source, local)).is_ok(),
             None => true,
         }
     }
 
     /// Whether the host takes in the session `sess`, which its inbound
-    /// authenticated, before it is routed.
-    pub(crate) fn host_admits(&self, sess: &crate::session::Session) -> bool {
+    /// authenticated, before it is routed; else why not, none for a check
+    /// that panicked.
+    pub(crate) fn host_admits(
+        &self,
+        sess: &crate::session::Session,
+    ) -> Result<(), Option<Cow<'static, str>>> {
         match self.hooks.as_ref().and_then(|h| h.admit.as_ref()) {
             Some(check) => self.host_verdict(|| check(sess)),
-            None => true,
+            None => Ok(()),
         }
     }
 
     /// What a host's check says, counted: a panic refuses, and goes no
-    /// further than here. On a runtime of many threads it runs as blocking
-    /// work (`block_in_place`): the worker's other tasks move to another
-    /// thread meanwhile, so that a check slower than it should be holds
-    /// back its own connection alone.
-    fn host_verdict(&self, check: impl FnOnce() -> HostVerdict) -> bool {
-        let caught = || std::panic::catch_unwind(std::panic::AssertUnwindSafe(check));
-        let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
-            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-        });
-        let verdict = match multi_thread {
-            true => tokio::task::block_in_place(caught),
-            false => caught(),
-        };
-        match verdict {
-            Ok(Ok(())) => true,
+    /// further than here. It is called inline, in the connection's task:
+    /// a check is to answer in microseconds, and one slower holds back
+    /// the worker thread it runs on. As blocking work (`block_in_place`)
+    /// it held back its own connection alone, but cost about 10 µs of CPU
+    /// and a tenth of the accept rate of a churn of short connections
+    /// (measured, the check returning at once), for a check that breaks
+    /// its contract.
+    fn host_verdict(
+        &self,
+        check: impl FnOnce() -> HostVerdict,
+    ) -> Result<(), Option<Cow<'static, str>>> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)) {
+            Ok(Ok(())) => Ok(()),
             Ok(Err(reason)) => {
                 let mut refused = self.host_refused.lock().unwrap_or_else(|e| e.into_inner());
                 let counted = refused.contains_key(reason.as_ref()) || refused.len() < HOST_REASONS;
-                let reason = match counted {
-                    true => reason.into_owned(),
+                let key = match counted {
+                    true => reason.to_string(),
                     false => "other".to_string(),
                 };
-                *refused.entry(reason).or_default() += 1;
-                false
+                *refused.entry(key).or_default() += 1;
+                Err(Some(reason))
             }
             Err(_) => {
                 self.host_panics.fetch_add(1, Ordering::Relaxed);
                 warn!("admission: the host's check panicked: the connection is refused");
-                false
+                Err(None)
             }
         }
     }

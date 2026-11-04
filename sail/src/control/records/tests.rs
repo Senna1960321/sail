@@ -14,6 +14,7 @@ fn record(id: u64, up: u64, closed: bool) -> Arc<ConnectionRecord> {
             false => RecordKind::Interim,
         },
         outcome: closed.then_some(Outcome::Ok),
+        reason: None,
         network: Network::Tcp,
         user: Some("a".into()),
         inbound: "in".into(),

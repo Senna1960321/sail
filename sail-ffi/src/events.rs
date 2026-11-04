@@ -110,8 +110,8 @@ pub const SAIL_EVENT_SYSTEM: u32 = 14;
 /// "seq", "kind": "interim" | "closed", "end": "finished" | "error" |
 /// "idle_timeout" | "write_stall" | "closed" | "aborted", "error",
 /// "closed_by": "api" | "user" | "inbound" | "rules" | "network" |
-/// "stopped", "outcome": "ok" | "dial_failed" | "blocked" | "rejected",
-/// "network", "user", "inbound", "source", "local", "destination",
+/// "stopped" | "host", "outcome": "ok" | "dial_failed" | "blocked" |
+/// "rejected", "reason" (why the host's check refused it), "network", "user", "inbound", "source", "local", "destination",
 /// "request_destination", "domain", "domain_source", "outbound", "chain",
 /// "up_total", "down_total", "start_ms", "at_ms"}`; a connection's closed
 /// record has what its user was counted. Built only

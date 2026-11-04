@@ -184,6 +184,9 @@ pub enum ClosedBy {
     Network,
     /// The instance stopped while it was open.
     Stopped,
+    /// The host's own check refused it as it connected
+    /// (`embed::Options::admit`).
+    Host,
 }
 
 /// Which record of a connection it is.
@@ -211,8 +214,8 @@ pub enum Outcome {
     /// Its `End` is `Closed(Rules)`.
     Blocked,
     /// Its user may not connect now: shut out, over quota, not of the
-    /// inbound, or at its most connections. Its `End` is
-    /// `Closed(User)`.
+    /// inbound, or at its most connections; its `End` is `Closed(User)`.
+    /// Or the host's own check refused it; its `End` is `Closed(Host)`.
     Rejected,
 }
 
@@ -226,10 +229,11 @@ pub enum Outcome {
 /// quotas).
 ///
 /// A connection that never relayed has a closed record too, with no
-/// bytes: one the rules blocked, whose dial failed, or whose user was
-/// refused (`Outcome`). One refused before it was routed, as
-/// `inbound.max_connections` or a lossless sink that is full refuses,
-/// has none.
+/// bytes: one the rules blocked, whose dial failed, or that its user's
+/// limits or the host's check refused (`Outcome`). One refused before it was
+/// routed, as `inbound.max_connections`, a lossless sink that is full or
+/// the host's check of its source (`embed::Options::admit_source`)
+/// refuses, has none.
 ///
 /// One a TCP connection, a UDP session, or a stream of a multiplexed
 /// connection, as `RoutedConnection` tells them, its addresses whole as
@@ -247,6 +251,10 @@ pub struct ConnectionRecord {
     pub kind: RecordKind,
     /// How it was used, for a closed record; none for an interim one.
     pub outcome: Option<Outcome>,
+    /// Why the host's check refused it, as the check told it, for a record
+    /// that ended `Closed(Host)`; none for any other, and for one whose
+    /// check panicked.
+    pub reason: Option<String>,
     pub network: Network,
     pub user: Option<String>,
     pub inbound: String,

@@ -1,17 +1,19 @@
 //! A host's own admission (`Options::admit`, `Options::admit_source`):
-//! what it rejects is never routed and counted by its reason; it is never
-//! awaited, so a slow check holds back its own connection alone; one that
-//! panics rejects and sail serves on; and the check of a connection's
-//! addresses runs before its handshake.
+//! what it rejects is never routed, counted by its reason and has a
+//! closed record that tells the reason; one that panics rejects and sail
+//! serves on; and the check of a connection's addresses runs before its
+//! handshake.
 #![cfg(all(feature = "outbound-direct", feature = "inbound-socks"))]
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::StreamExt;
-use sail::embed::{Config, Event, Instance, Kinds, Options, RecordKind, Threads, Verdict};
+use sail::embed::{
+    ClosedBy, Config, End, Event, Instance, Kinds, Options, Outcome, RecordKind, Threads, Verdict,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -108,7 +110,8 @@ async fn a_session_the_host_rejects_is_never_routed_and_is_counted() {
     assert_eq!(info.host_refused.get("blocked"), Some(&2), "{:?}", info);
     assert_eq!(info.host_panics, 0);
 
-    // The one that went through has its record; those rejected none.
+    // Each has one closed record: those rejected for the host's reason,
+    // with no bytes.
     let mut closed = Vec::new();
     while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), events.next()).await {
         if let Event::ConnectionRecord(record) = event {
@@ -117,37 +120,20 @@ async fn a_session_the_host_rejects_is_never_routed_and_is_counted() {
             }
         }
     }
-    assert!(
-        closed.iter().all(|r| r.destination.port() != blocked_port),
-        "{:?}",
-        closed
-    );
-    instance.stop().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_slow_check_holds_back_its_own_connection_alone() {
-    let (slow, _) = counted_echo().await;
-    let (fast, _) = counted_echo().await;
-    let slow_port = slow.port();
-    let options = Options::new().admit(move |session| {
-        if session.destination.port() == slow_port {
-            // Blocks its thread, as a check never should.
-            std::thread::sleep(Duration::from_secs(2));
-        }
-        Verdict::Accept
-    });
-    let (instance, port) = start(options).await;
-    let slowly = tokio::spawn(async move { through(port, slow).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let started = Instant::now();
-    assert!(through(port, fast).await);
-    let took = started.elapsed();
-    assert!(took < Duration::from_millis(1500), "{:?}", took);
-    assert!(
-        slowly.await.unwrap(),
-        "the slow one gets through in the end"
-    );
+    let (rejected, passed): (Vec<_>, Vec<_>) = closed
+        .iter()
+        .partition(|r| r.destination.port() == blocked_port);
+    assert_eq!(passed.len(), 1, "{:?}", closed);
+    assert_eq!(passed[0].outcome, Some(Outcome::Ok));
+    assert_eq!(passed[0].reason, None);
+    assert_eq!(rejected.len(), 2, "{:?}", closed);
+    for r in rejected {
+        assert_eq!(r.kind, RecordKind::Closed(End::Closed(ClosedBy::Host)));
+        assert_eq!(r.outcome, Some(Outcome::Rejected));
+        assert_eq!(r.reason.as_deref(), Some("blocked"));
+        assert_eq!((r.up_total, r.down_total), (0, 0));
+        assert!(r.chain.is_empty(), "never routed: {:?}", r);
+    }
     instance.stop().await.unwrap();
 }
 

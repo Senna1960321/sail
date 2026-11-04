@@ -715,7 +715,9 @@ impl Dispatcher {
         // of the session is made, and held until it has one among the
         // sessions, or is refused one.
         let handshake = sess.handshake.take();
-        if self.env.events.records_refuse() || !self.admitted(&mut sess) || !self.host_admits(&sess)
+        if self.env.events.records_refuse()
+            || !self.admitted(&mut sess)
+            || !self.host_admits(&mut sess)
         {
             return None;
         }
@@ -1197,7 +1199,7 @@ impl Dispatcher {
                 "the user may not connect",
             ));
         }
-        if !self.host_admits(&sess) {
+        if !self.host_admits(&mut sess) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "refused by the host",
@@ -1743,20 +1745,29 @@ impl Dispatcher {
         }
     }
 
-    /// Whether the host's own check takes the session in, after sail's:
-    /// one it refuses was never admitted, and has no record, its number
-    /// told to a host or not.
-    fn host_admits(&self, sess: &Session) -> bool {
-        match &self.env.admission {
-            Some(admission) if !admission.host_admits(sess) => {
-                if let Some(number) = &sess.number {
-                    number.forget();
-                }
-                debug!("session refused by the host");
-                false
-            }
-            _ => true,
+    /// Whether the host's own check takes the session in, after sail's.
+    /// It is numbered first, while someone listens for records, so that
+    /// the check sees the id its record has; one refused has its closed
+    /// record, `Rejected` for the reason the check told.
+    fn host_admits(&self, sess: &mut Session) -> bool {
+        let Some(admission) = self.env.admission.as_ref().filter(|a| a.checks_sessions()) else {
+            return true;
+        };
+        if self.env.events.records_wanted() {
+            self.stat_manager.numbering().number(sess);
         }
+        let Err(reason) = admission.host_admits(sess) else {
+            return true;
+        };
+        let reason = reason.map(std::borrow::Cow::into_owned);
+        debug!(
+            "session refused by the host: {}",
+            reason.as_deref().unwrap_or("its check panicked")
+        );
+        if let Some(number) = &sess.number {
+            number.refused_by_host(sess, reason);
+        }
+        false
     }
 }
 

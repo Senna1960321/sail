@@ -194,10 +194,12 @@ data class ConnectionRecord(
     /** finished, error, idle_timeout, write_stall, closed or aborted. */
     val end: String? = null,
     val error: String? = null,
-    /** api, user, inbound, rules, network or stopped. */
+    /** api, user, inbound, rules, network, stopped or host. */
     @SerialName("closed_by") val closedBy: String? = null,
     /** For a closed record: ok, dial_failed, blocked or rejected. */
     val outcome: String? = null,
+    /** For one the host's check rejected (closed_by host): why, as the check told it. */
+    val reason: String? = null,
     val network: String,
     val user: String? = null,
     val inbound: String,

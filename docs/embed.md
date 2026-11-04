@@ -571,8 +571,8 @@ missed interim record loses nothing. A connection's closed record has
 what its user, inbound and outbound were counted (`/stats`, quotas), the
 bytes a side wrote after the last read included. Each connection routed
 has exactly one closed record, those that never relayed too: a dial
-that failed, one the rules blocked, one its user was refused. Its
-fields:
+that failed, one the rules blocked, one its user's limits or the host's
+check refused. Its fields:
 
 - `id`, as `Kinds::ROUTE` and `connections()` number it, and `run`, when
   the instance's run started: numbers start again with each run, so
@@ -584,14 +584,16 @@ fields:
   nothing for `relay.write_stall_timeout`), `Closed(by)` (sail closed it:
   `Api`, `User` — removed, over quota, shut out, at its most
   connections —, `Inbound` removed, `Rules` that reject or drop it or a
-  reload's, `Network` changed, `Stopped` instance) or `Aborted` (nothing
+  reload's, `Network` changed, `Stopped` instance, `Host`, its check
+  (`Options::admit`)) or `Aborted` (nothing
   told how, a handshake that failed after its first bytes, say).
 - `outcome`, for a closed record: how the connection was used. `Ok`
   (relayed through an outbound, or hijacked DNS served), `DialFailed`
   (its outbound's dial or handshake failed, or there was no outbound:
   its end is the error where one was told), `Blocked` (a reject or drop
   rule, `route.block_quic`: `Closed(Rules)`) or `Rejected` (its user may
-  not connect: `Closed(User)`). None for an interim record.
+  not connect: `Closed(User)`; or the host's check refused it:
+  `Closed(Host)`, and `reason` tells why). None for an interim record.
 - `network`, `user`, `inbound`, `source`, `destination`,
   `request_destination`, `domain`, `domain_source` and `chain`, as
   `Kinds::ROUTE` tells them; `local`, the address the client connected
@@ -663,22 +665,26 @@ yet, a source of its own list):
 
 - `admit_source(|source, local| ...)` sees each TCP connection an inbound
   accepts and each QUIC handshake, before its handshake. One it rejects
-  is closed at once, a QUIC one refused.
+  is closed at once, a QUIC one refused, and has no connection record:
+  it is no session yet, as one `inbound.max_connections` refuses.
 - `admit(|session: &SessionInfo| ...)` sees each session once its
   inbound authenticated it, before it is routed: a TCP connection, a
   stream of a multiplexed one, a UDP session to each destination, a
   session a host submitted. One it rejects is closed as a session of a
-  user that may not connect is, never routed, and has no connection
-  record.
+  user that may not connect is, never routed. Its one closed record is
+  `Rejected`, ended `Closed(Host)`, with no bytes and the check's
+  `reason` (none where the check panicked): a host that counts only what
+  it took in leaves out those `Closed(Host)`.
 
 Each returns `Verdict::Accept` or `Verdict::reject(reason)`. sail's own
 admission and its users' checks run first: the host sees only what sail
-would take in. The checks are synchronous and never awaited; each runs in
-the task of its own connection, as blocking work (`block_in_place`) where
-the instance has several threads, so that a slow one holds back that
-connection alone. With one thread (`Threads::One`) a slow check holds
-back the instance. They are to answer in microseconds from what the host
-holds.
+would take in. The checks are synchronous and never awaited; each is
+called in the task of its own connection. They are to answer in
+microseconds from what the host holds: one slower holds back the worker
+thread it runs on, and the connections that thread serves (with
+`Threads::One`, the instance). That is the host's to keep; sail does not
+move a check off its thread, which cost a tenth of the accept rate of
+short connections for checks that keep it.
 `instance.admission()` counts what they rejected by reason
 (`host_refused`, 64 reasons apart and the rest as `other`), with admission
 on whenever a check is registered. A check that panics rejects its
@@ -719,7 +725,8 @@ rules say, with no user, as the control plane's dials. What they return is
 the outbound's own stream or datagrams, read and written with no relay or
 copy between; each poll is made within the instance's runtime, so any
 executor of the host's may drive them. No idle or stall timeout of sail's
-applies to them, as the host reads them itself; once the instance stops,
+applies to them: their timeouts are the host's, which reads them itself
+and closes them when it is done waiting. Once the instance stops,
 they fail. To send a user's traffic, with the rules, limits and records
 that come with one, submit it to `Instance::sessions` instead (Host kinds).
 

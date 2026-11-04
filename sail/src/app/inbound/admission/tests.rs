@@ -292,7 +292,7 @@ fn a_hosts_checks_are_counted_by_their_reasons() {
         assert!(!a.host_admits_source(at(port), at(443)));
     }
     assert!(!a.host_admits_source(at(2), at(443)));
-    assert!(!a.host_admits(&crate::session::Session::default()));
+    assert!(a.host_admits(&crate::session::Session::default()).is_err());
     let info = a.info();
     assert_eq!(info.host_panics, 1);
     assert_eq!(info.host_refused.len(), HOST_REASONS + 1);

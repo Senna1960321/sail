@@ -260,12 +260,15 @@ pub struct ConnectionRecord {
     pub end: Option<String>,
     /// For `error`: what failed, as the dial errors are told.
     pub error: Option<String>,
-    /// For `closed`: `api`, `user`, `inbound`, `rules`, `network` or
-    /// `stopped`.
+    /// For `closed`: `api`, `user`, `inbound`, `rules`, `network`,
+    /// `stopped` or `host`.
     pub closed_by: Option<String>,
     /// How it was used, for a closed record: `ok`, `dial_failed`,
     /// `blocked` or `rejected`.
     pub outcome: Option<String>,
+    /// For one the host's check refused (`closed_by` `host`): why, as the
+    /// check told it.
+    pub reason: Option<String>,
     /// `tcp` or `udp`.
     pub network: String,
     pub user: Option<String>,
@@ -332,6 +335,7 @@ impl ConnectionRecord {
                         ClosedBy::Inbound => "inbound",
                         ClosedBy::Rules => "rules",
                         ClosedBy::Network => "network",
+                        ClosedBy::Host => "host",
                         _ => "stopped",
                     }
                     .into(),
@@ -347,6 +351,7 @@ impl ConnectionRecord {
                 }
                 .into()
             }),
+            reason: r.reason.clone(),
             network: r.network.to_string(),
             user: r.user.clone(),
             inbound: r.inbound.clone(),
@@ -1385,7 +1390,7 @@ mod tests {
             "connection_record": ConnectionRecord {
                 id: 7, run_ms: 1_759_300_000_000, seq: 2, kind: "closed".into(),
                 end: Some("error".into()), error: Some("connection reset".into()), closed_by: None,
-                outcome: Some("ok".into()),
+                outcome: Some("ok".into()), reason: None,
                 network: "tcp".into(), user: Some("alice".into()), inbound: "in".into(),
                 source: "172.19.0.1:50000".into(), local: "203.0.113.1:443".into(),
                 destination: "example.com:443".into(),

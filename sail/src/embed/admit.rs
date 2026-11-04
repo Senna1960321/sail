@@ -40,10 +40,12 @@ impl Options {
     /// stream of a multiplexed connection, a UDP session to each
     /// destination, a session a host inbound or `Instance::sessions`
     /// submits. A session it rejects is closed as one of a user that may
-    /// not connect is, never routed, and has no connection record. It runs
-    /// in the session's own task, as blocking work where the instance has
-    /// several threads, and is never awaited: it is to answer in
-    /// microseconds, from what the host holds. A panic in it rejects the
+    /// not connect is, never routed; its closed record is `Rejected`, ended
+    /// `Closed(ClosedBy::Host)`, with the reason told. It is called in
+    /// the session's own task and never awaited: it is to answer in
+    /// microseconds, from what the host holds, as one slower holds back
+    /// the worker thread it runs on and the connections that thread
+    /// serves. A panic in it rejects the
     /// session, and is counted (`AdmissionInfo::host_panics`) where the
     /// host is built to unwind. Kept for every run and reload.
     pub fn admit<F>(mut self, check: F) -> Self

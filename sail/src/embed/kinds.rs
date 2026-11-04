@@ -1051,7 +1051,8 @@ impl SessionInfo {
     }
 
     /// What a host is told of `sess`, its number not yet told: a session a
-    /// host's check refuses has no record.
+    /// host's check refuses has the record of a refused one, not of one
+    /// told.
     pub(super) fn untold(sess: &Session) -> Self {
         // Every session sail dispatches is numbered before it is dialled.
         let id = sess.number.as_ref().map_or(0, |number| number.id());
