@@ -402,7 +402,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/peakpassvpn/btls.git?rev=132da2caff5d94c0f9ea52aa82bbc170bf2baaa6#132da2caff5d94c0f9ea52aa82bbc170bf2baaa6"
+source = "git+https://github.com/peakpassvpn/btls.git?rev=447310e4d6c2d1e33d869558d8c6a1a1b27b2433#447310e4d6c2d1e33d869558d8c6a1a1b27b2433"
 dependencies = [
  "bitflags 2.13.2",
  "btls-sys",
@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/peakpassvpn/btls.git?rev=132da2caff5d94c0f9ea52aa82bbc170bf2baaa6#132da2caff5d94c0f9ea52aa82bbc170bf2baaa6"
+source = "git+https://github.com/peakpassvpn/btls.git?rev=447310e4d6c2d1e33d869558d8c6a1a1b27b2433#447310e4d6c2d1e33d869558d8c6a1a1b27b2433"
 dependencies = [
  "bindgen 0.73.2",
  "cmake",
@@ -2404,7 +2404,7 @@ dependencies = [
 [[package]]
 name = "quinn-btls"
 version = "0.1.0"
-source = "git+https://github.com/peakpassvpn/quinn-btls.git?rev=e57c89ddb9e3e661b1226977764bc299226b8472#e57c89ddb9e3e661b1226977764bc299226b8472"
+source = "git+https://github.com/peakpassvpn/quinn-btls.git?rev=4d4dbd81d4861f8c9f6cdb85ecd5099f80e60a3b#4d4dbd81d4861f8c9f6cdb85ecd5099f80e60a3b"
 dependencies = [
  "btls",
  "btls-sys",
