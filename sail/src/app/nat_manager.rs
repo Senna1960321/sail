@@ -10,6 +10,7 @@ use tokio::sync::{
 use tracing::{debug, error, trace, Instrument};
 
 use crate::app::dispatcher::{DatagramSniffer, Dispatcher};
+use crate::app::router::hijack_dns::PendingAnswers;
 use crate::session::{DatagramSource, Network, Session, SocksAddr, UdpAssociation};
 
 #[derive(Debug)]
@@ -65,10 +66,24 @@ impl std::fmt::Display for NatKey {
     }
 }
 
-/// Per session: the uplink, the downlink's abort signal (true when the
-/// session stood idle too long, false when its client ended it), the last
-/// activity, and how long the session may be idle.
-type SessionMap = HashMap<NatKey, (Sender<UdpPacket>, oneshot::Sender<bool>, Instant, Duration)>;
+struct NatSession {
+    uplink: Sender<UdpPacket>,
+    /// True for idle expiry, false when the client ended its association.
+    abort: oneshot::Sender<bool>,
+    last_activity: Instant,
+    idle_timeout: Duration,
+    dns_answered: bool,
+    pending: Option<PendingAnswers>,
+}
+
+impl NatSession {
+    fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.last_activity) >= self.idle_timeout
+            || (self.dns_answered && self.pending.as_ref().is_none_or(PendingAnswers::is_idle))
+    }
+}
+
+type SessionMap = HashMap<NatKey, NatSession>;
 
 /// Ends the sessions whose keys `ends` picks, returning how many.
 async fn end_sessions(sessions: &Mutex<SessionMap>, ends: impl Fn(&NatKey) -> bool) -> usize {
@@ -78,7 +93,7 @@ async fn end_sessions(sessions: &Mutex<SessionMap>, ends: impl Fn(&NatKey) -> bo
         if let Some(sess) = sessions.remove(key) {
             // The uplink ends with its channel, dropped with the entry; the
             // downlink is told to.
-            let _ = sess.1.send(false);
+            let _ = sess.abort.send(false);
             debug!("udp session {} ended", key);
         }
     }
@@ -118,7 +133,7 @@ impl NatManager {
                 let now = Instant::now();
                 let mut to_be_remove = Vec::new();
                 for (key, val) in sessions.iter() {
-                    if now.duration_since(val.2) >= val.3 {
+                    if val.expired(now) {
                         to_be_remove.push(key.to_owned());
                     }
                 }
@@ -127,7 +142,7 @@ impl NatManager {
                         // Sends a signal to abort downlink task, uplink task will
                         // end automatically when we drop the channel's tx side upon
                         // session removal.
-                        if let Err(e) = sess.1.send(true) {
+                        if let Err(e) = sess.abort.send(true) {
                             debug!("failed to send abort signal on session {}: {}", key, e);
                         }
                         debug!("udp session {} ended", key);
@@ -207,10 +222,17 @@ impl NatManager {
 
     fn _send(&self, guard: &mut MutexGuard<'_, SessionMap>, key: &NatKey, pkt: UdpPacket) {
         if let Some(sess) = guard.get_mut(key) {
-            if let Err(err) = sess.0.try_send(pkt) {
+            if let Some(pending) = &sess.pending {
+                pending.add(1);
+            }
+            if let Err(err) = sess.uplink.try_send(pkt) {
+                if let Some(pending) = &sess.pending {
+                    pending.finish(1);
+                }
                 trace!("send uplink packet failed {}", err);
             }
-            sess.2 = Instant::now(); // activity update
+            sess.last_activity = Instant::now();
+            sess.dns_answered = false;
         } else {
             error!("no nat association found");
         }
@@ -321,7 +343,14 @@ impl NatManager {
         let key = NatKey::new(&sess.inbound_tag, &raddr);
         guard.insert(
             key.clone(),
-            (target_ch_tx, downlink_abort_tx, Instant::now(), udp_timeout),
+            NatSession {
+                uplink: target_ch_tx,
+                abort: downlink_abort_tx,
+                last_activity: Instant::now(),
+                idle_timeout: udp_timeout,
+                dns_answered: false,
+                pending: None,
+            },
         );
 
         let dispatcher = self.dispatcher.clone();
@@ -341,19 +370,30 @@ impl NatManager {
                 // they are sent before the rest.
                 let mut sniffer = DatagramSniffer::new(&mut target_ch_rx);
                 let socket = dispatcher
-                    .dispatch_datagram(sess, &mut sniffer)
+                    .dispatch_datagram_tracked(sess, &mut sniffer)
                     .instrument(tracing::Span::current())
                     .await;
                 let sniffed = sniffer.into_read();
-                let (socket, listed) = match socket {
-                    Ok((s, udp_timeout, listed)) => {
+                let (socket, listed, pending) = match socket {
+                    Ok((s, udp_timeout, listed, pending)) => {
                         // A rule's udp_timeout, over the inbound's.
-                        if let Some(udp_timeout) = udp_timeout {
-                            if let Some(entry) = sessions.lock().await.get_mut(&key) {
-                                entry.3 = udp_timeout;
+                        let mut entries = sessions.lock().await;
+                        if let Some(entry) = entries.get_mut(&key) {
+                            if let Some(udp_timeout) = udp_timeout {
+                                entry.idle_timeout = udp_timeout;
                             }
+                            if let Some(pending) = &pending {
+                                // Include admitted queries not yet handed to
+                                // the DNS responder. Later admissions add under
+                                // this same session lock.
+                                pending.add(sniffed.len() + target_ch_rx.len());
+                                entry.pending = Some(pending.clone());
+                            }
+                        } else {
+                            // Its association ended while it was being routed.
+                            return;
                         }
-                        (s, listed)
+                        (s, listed, pending)
                     }
                     Err(e) => {
                         debug!("dispatch {} failed: {}", &raddr_cloned, e);
@@ -397,16 +437,12 @@ impl NatManager {
                                 {
                                     let mut sessions = sessions.lock().await;
                                     if let Some(sess) = sessions.get_mut(&key_downlink) {
-                                        if addr.port() == 53 {
-                                            // If the destination port is 53, we assume it's a
-                                            // DNS query and set a negative timeout so it will
-                                            // be removed on next check.
-                                            if let Some(new_time) = sess.2.checked_sub(sess.3) {
-                                                sess.2 = new_time;
-                                            }
-                                        } else {
-                                            sess.2 = Instant::now();
-                                        }
+                                        // DNS sessions can be reclaimed promptly
+                                        // once every admitted query's reply has
+                                        // reached the client. A first answer must
+                                        // not retire other queries on this socket.
+                                        sess.last_activity = Instant::now();
+                                        sess.dns_answered = addr.port() == 53;
                                     }
                                 }
                             }
@@ -452,8 +488,13 @@ impl NatManager {
                                 &pkt.dst_addr,
                                 pkt.data.len()
                             );
-                            if let Err(e) = target_sock_send.send_to(&pkt.data, &pkt.dst_addr).await
-                            {
+                            let sent = target_sock_send.send_to(&pkt.data, &pkt.dst_addr).await;
+                            if let Some(pending) = &pending {
+                                // send_to created the answer's own guard before
+                                // giving back this queued-query reservation.
+                                pending.finish(1);
+                            }
+                            if let Err(e) = sent {
                                 debug!(
                                     "Failed to send uplink packets on session {} to {}: {:?}",
                                     &raddr_uplink, &pkt.dst_addr, e
@@ -470,5 +511,208 @@ impl NatManager {
             }
             .instrument(span),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "outbound-direct")]
+    fn instance(config: &crate::config::Config) -> crate::app::instance::Instance {
+        let mut env = crate::runtime::RuntimeEnv::default();
+        env.options.udp.session_check_interval = Duration::from_millis(20);
+        crate::app::instance::Instance::build(
+            config,
+            config.route.rules.clone(),
+            Arc::new(env),
+            Arc::default(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "outbound-direct")]
+    #[tokio::test]
+    async fn rejected_uplink_packets_do_not_leave_pending_answers() {
+        let instance = instance(&crate::config::Config::from_json("{}").unwrap());
+        let (uplink, mut receive) = mpsc::channel(1);
+        let (abort, _aborted) = oneshot::channel();
+        let pending = PendingAnswers::default();
+        let source = DatagramSource::new("192.0.2.1:50000".parse().unwrap(), None);
+        let key = NatKey::new("test", &source);
+        let sessions = Mutex::new(HashMap::from([(
+            key.clone(),
+            NatSession {
+                uplink,
+                abort,
+                last_activity: Instant::now(),
+                idle_timeout: Duration::from_secs(30),
+                dns_answered: false,
+                pending: Some(pending.clone()),
+            },
+        )]));
+        let mut entries = sessions.lock().await;
+        for _ in 0..3 {
+            instance.nat_manager._send(
+                &mut entries,
+                &key,
+                UdpPacket::new(
+                    vec![0],
+                    SocksAddr::Ip(source.address),
+                    SocksAddr::Ip("203.0.113.53:53".parse().unwrap()),
+                ),
+            );
+        }
+        assert!(!pending.is_idle(), "the accepted query is reserved");
+        receive.try_recv().unwrap();
+        assert!(
+            receive.try_recv().is_err(),
+            "the full channel rejected the rest"
+        );
+        pending.finish(1);
+        assert!(
+            pending.is_idle(),
+            "rejected packets must release their reservations"
+        );
+        drop(receive);
+        instance.nat_manager._send(
+            &mut entries,
+            &key,
+            UdpPacket::new(
+                vec![0],
+                SocksAddr::Ip(source.address),
+                SocksAddr::Ip("203.0.113.53:53".parse().unwrap()),
+            ),
+        );
+        assert!(
+            pending.is_idle(),
+            "a closed channel also releases its reservation"
+        );
+    }
+
+    #[test]
+    fn pending_dns_answers_do_not_extend_the_configured_idle_bound() {
+        let (uplink, _receive) = mpsc::channel(1);
+        let (abort, _aborted) = oneshot::channel();
+        let pending = PendingAnswers::default();
+        pending.add(2);
+        let now = Instant::now();
+        let mut session = NatSession {
+            uplink,
+            abort,
+            last_activity: now,
+            idle_timeout: Duration::from_millis(50),
+            dns_answered: true,
+            pending: Some(pending.clone()),
+        };
+        assert!(!session.expired(now + Duration::from_millis(49)));
+        pending.finish(1);
+        assert!(!session.expired(now + Duration::from_millis(49)));
+        assert!(session.expired(now + Duration::from_millis(50)));
+        pending.finish(1);
+        assert!(session.expired(now), "finished DNS is reclaimed promptly");
+        session.dns_answered = false;
+        assert!(!session.expired(now), "ordinary UDP keeps its idle timeout");
+        assert!(session.expired(now + Duration::from_millis(50)));
+    }
+
+    /// Three queries share a UDP session. A fast answer precedes two slow
+    /// ones across multiple cleanup passes; the final answer then waits
+    /// behind a full inbound channel. None may be cut off by eager DNS
+    /// cleanup, and the session must be reclaimed after they are drained.
+    #[cfg(feature = "outbound-direct")]
+    #[tokio::test]
+    async fn dns_cleanup_waits_for_pending_and_backpressured_answers() {
+        use crate::util::DnsMessageExt;
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use tokio::net::UdpSocket;
+        use tokio::time::{sleep, timeout};
+
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = crate::config::Config::from_json(
+            &serde_json::json!({
+                "dns": { "servers": [{ "type": "udp", "server": "127.0.0.1",
+                    "server_port": upstream.local_addr().unwrap().port() }] },
+                "outbounds": [{ "type": "direct", "tag": "direct" }],
+                "route": { "rules": [{ "port": 53, "action": "hijack-dns" }] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let instance = instance(&config);
+        let nat = &instance.nat_manager;
+        let source = DatagramSource::new("192.0.2.1:50000".parse().unwrap(), None);
+        let destination = SocksAddr::Ip("203.0.113.53:53".parse().unwrap());
+        let (client, mut received) = mpsc::channel(1);
+        for id in 0..3 {
+            let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+            query.add_query(Query::query(
+                Name::from_ascii(format!("q{id}.example.")).unwrap(),
+                RecordType::A,
+            ));
+            nat.send(
+                None,
+                &source,
+                "test",
+                &client,
+                UdpPacket::new(
+                    query.to_vec().unwrap(),
+                    SocksAddr::Ip(source.address),
+                    destination.clone(),
+                ),
+            )
+            .await;
+        }
+        let mut queries = Vec::new();
+        for _ in 0..3 {
+            let mut buf = [0; 512];
+            let (n, peer) = timeout(Duration::from_secs(2), upstream.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut answer = Message::from_vec(&buf[..n]).unwrap();
+            answer.set_message_type(MessageType::Response);
+            queries.push((answer.to_vec().unwrap(), peer));
+        }
+        upstream.send_to(&queries[0].0, queries[0].1).await.unwrap();
+        let first = timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ids = vec![Message::from_vec(&first.data).unwrap().id()];
+        sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            nat.sessions.lock().await.len(),
+            1,
+            "a fast answer must not retire pending queries"
+        );
+        for (answer, peer) in &queries[1..] {
+            upstream.send_to(answer, peer).await.unwrap();
+        }
+        // One answer fills client_ch_tx; the other must remain protected
+        // while the NAT's downlink waits for the client to make room.
+        sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            nat.sessions.lock().await.len(),
+            1,
+            "a backpressured answer must keep its session"
+        );
+        for _ in 0..2 {
+            let answer = timeout(Duration::from_secs(2), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            ids.push(Message::from_vec(&answer.data).unwrap().id());
+        }
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2]);
+        timeout(Duration::from_secs(1), async {
+            while !nat.sessions.lock().await.is_empty() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("finished DNS sessions are reclaimed at the next cleanup");
     }
 }

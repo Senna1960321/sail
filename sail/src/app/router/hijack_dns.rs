@@ -70,6 +70,40 @@ where
 pub(crate) struct Datagram {
     dns: SyncDnsClient,
     sess: Arc<Session>,
+    pending: PendingAnswers,
+}
+
+/// Queries admitted by the NAT, being answered, or awaiting delivery to
+/// its client. A query's answer is finished only when the relay asks for
+/// the next datagram, after forwarding the previous one.
+#[derive(Clone, Default)]
+pub(crate) struct PendingAnswers(Arc<std::sync::atomic::AtomicUsize>);
+
+impl PendingAnswers {
+    pub(crate) fn add(&self, n: usize) {
+        self.0.fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn finish(&self, n: usize) {
+        self.0.fetch_sub(n, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
+    fn begin(&self) -> PendingAnswer {
+        self.add(1);
+        PendingAnswer(self.clone())
+    }
+}
+
+struct PendingAnswer(PendingAnswers);
+
+impl Drop for PendingAnswer {
+    fn drop(&mut self) {
+        self.0.finish(1);
+    }
 }
 
 impl Datagram {
@@ -77,7 +111,12 @@ impl Datagram {
         Datagram {
             dns,
             sess: Arc::new(sess),
+            pending: PendingAnswers::default(),
         }
+    }
+
+    pub(crate) fn pending(&self) -> PendingAnswers {
+        self.pending.clone()
     }
 }
 
@@ -90,28 +129,37 @@ impl OutboundDatagram for Datagram {
     ) {
         let (tx, rx) = mpsc::channel(32);
         (
-            Box::new(RecvHalf(rx)),
+            Box::new(RecvHalf {
+                answers: rx,
+                delivering: None,
+            }),
             Box::new(SendHalf {
                 dns: self.dns,
                 sess: self.sess,
                 answers: tx,
+                pending: self.pending,
             }),
         )
     }
 }
 
-struct RecvHalf(mpsc::Receiver<(Vec<u8>, SocksAddr)>);
+struct RecvHalf {
+    answers: mpsc::Receiver<(Vec<u8>, SocksAddr, PendingAnswer)>,
+    delivering: Option<PendingAnswer>,
+}
 
 #[async_trait]
 impl OutboundDatagramRecvHalf for RecvHalf {
     async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocksAddr)> {
-        let (reply, from) = self
-            .0
+        self.delivering = None;
+        let (reply, from, pending) = self
+            .answers
             .recv()
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))?;
         let n = reply.len().min(buf.len());
         buf[..n].copy_from_slice(&reply[..n]);
+        self.delivering = Some(pending);
         Ok((n, from))
     }
 }
@@ -119,7 +167,8 @@ impl OutboundDatagramRecvHalf for RecvHalf {
 struct SendHalf {
     dns: SyncDnsClient,
     sess: Arc<Session>,
-    answers: mpsc::Sender<(Vec<u8>, SocksAddr)>,
+    answers: mpsc::Sender<(Vec<u8>, SocksAddr, PendingAnswer)>,
+    pending: PendingAnswers,
 }
 
 #[async_trait]
@@ -127,10 +176,13 @@ impl OutboundDatagramSendHalf for SendHalf {
     async fn send_to(&mut self, buf: &[u8], target: &SocksAddr) -> io::Result<usize> {
         let (dns, sess, answers) = (self.dns.clone(), self.sess.clone(), self.answers.clone());
         let (query, target) = (buf.to_vec(), target.clone());
+        let pending = self.pending.begin();
         // Answered apart, so that a slow query holds up none after it.
         crate::runtime::scope::spawn("hijacked dns query", async move {
             if let Some(reply) = answer(&dns, &query, &sess).await {
-                let _ = answers.send((fit_datagram(&query, reply), target)).await;
+                let _ = answers
+                    .send((fit_datagram(&query, reply), target, pending))
+                    .await;
             }
         });
         Ok(buf.len())
