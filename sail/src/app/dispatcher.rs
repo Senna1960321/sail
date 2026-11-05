@@ -1745,6 +1745,59 @@ impl Dispatcher {
         }
     }
 
+    /// A new target on an already admitted UDP association. It has its
+    /// connection place already: only user revocation/quota/expiry and
+    /// the host policy apply, not another max_connections reservation.
+    /// Accepted targets stay accounted to the association; a rejection
+    /// has an independent, unlisted number and a zero-byte closed record.
+    pub(crate) fn admit_datagram_destination(&self, base: &Session, to: &SocksAddr) -> bool {
+        use crate::control::events::{ClosedBy, End, Outcome};
+        // Same first gate as a newly dispatched session. There is no
+        // host verdict to lose yet: the public RecordStream::refused
+        // counter reports these backlog refusals, without queueing yet
+        // another closed record behind a reader that is not keeping up.
+        if self.env.events.records_refuse() {
+            return false;
+        }
+        let mut probe = Session {
+            destination: to.clone(),
+            number: None,
+            state: Default::default(),
+            chain: Default::default(),
+            outbound_tag: String::new(),
+            fake_ip: false,
+            sniffed: None,
+            sniffed_protocol: None,
+            sniffed_http: None,
+            route: Default::default(),
+            matched_rule: None,
+            matched_rule_set: None,
+            routed_by: 0,
+            ..base.clone()
+        };
+        if probe
+            .user
+            .as_ref()
+            .is_some_and(|user| !user.active() || user.removed_from(&probe.inbound_tag))
+        {
+            if self.env.events.records_wanted() {
+                self.stat_manager.numbering().number(&mut probe);
+                if let Some(number) = &probe.number {
+                    number.closed(&probe, Outcome::Rejected, End::Closed(ClosedBy::User));
+                }
+            }
+            return false;
+        }
+        self.host_admits(&mut probe)
+    }
+
+    pub(crate) fn checks_datagram_destinations(&self) -> bool {
+        self.env
+            .admission
+            .as_ref()
+            .is_some_and(|a| a.checks_sessions())
+    }
+
     /// Whether the host's own check takes the session in, after sail's.
     /// It is numbered first, while someone listens for records, so that
     /// the check sees the id its record has; one refused has its closed

@@ -150,8 +150,9 @@ impl RecordStream {
         self.0.lock().dropped
     }
 
-    /// Connections refused since the sink was made, its closed records
-    /// at the cap.
+    /// Admission attempts refused since the sink was made, its closed
+    /// records at the cap: new connections and uncached UDP targets.
+    /// The host's admission hook has not run for these attempts.
     pub fn refused(&self) -> u64 {
         self.0.lock().refused
     }

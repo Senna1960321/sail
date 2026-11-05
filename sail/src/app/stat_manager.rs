@@ -617,9 +617,10 @@ impl Numbering {
 
     /// The number of a session about to be routed or dialled, unless it
     /// has one not listed yet: the one it is listed by once it is counted.
-    /// A UDP session of an inbound is a template, each destination's NAT
-    /// session dispatched from a copy: the first listed takes its number,
-    /// and each after a number of its own.
+    /// A UDP session of an inbound is a template: each NAT association
+    /// dispatched from a copy takes a number. Destinations sharing that
+    /// association share its counter; independent target rejections use
+    /// an unlisted probe number instead.
     pub fn number(&self, sess: &mut Session) {
         let listed = |number: &Arc<Number>| number.listed.load(Ordering::Relaxed);
         if sess.number.as_ref().is_none_or(listed) {

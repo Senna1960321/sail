@@ -698,8 +698,11 @@ impl Sessions {
         .await
     }
 
-    /// Submits a UDP session: its datagrams are `datagrams`'. Returned, and
-    /// recorded, as `tcp`.
+    /// Submits a UDP association: its datagrams are `datagrams`'. Returned,
+    /// and recorded, as `tcp`. Its targets share one outbound, connection
+    /// place and byte counter. With `Options::admit`, uncached targets are
+    /// checked before forwarding; only rejected target attempts have
+    /// additional, independent zero-byte closed records.
     pub async fn udp(&self, session: NewSession, datagrams: Datagrams) -> Result<u64, Refused> {
         self.established();
         let mut sess = self.session(session, Network::Udp)?;
@@ -1019,7 +1022,9 @@ pub struct SessionInfo {
     /// records' `ConnectionRecord::id`, and what `Sessions::tcp` and `udp`
     /// returned for a session of the host's inbound. A session the
     /// outbound refuses has a closed record still, with nothing sent or
-    /// received.
+    /// received. In `Options::admit`, an additional UDP target instead
+    /// has an attempt id: only rejection records that id; acceptance
+    /// keeps accounting to the association's original id.
     pub id: u64,
     pub network: Network,
     /// The client.

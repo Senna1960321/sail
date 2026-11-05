@@ -275,7 +275,9 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
     let dials = Arc::new(AtomicUsize::new(0));
     let echo = dials.clone();
     let options = Options::new()
-        .connection_records_lossless(64)
+        .settings_json(r#"{"set":["inbound.max_connections=1"]}"#)
+        .unwrap()
+        .connection_records_lossless(1)
         .admit(move |session| {
             seen.lock()
                 .unwrap()
@@ -298,7 +300,8 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         "inbounds": [{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": common::free_port(),
             "users": [{"username": "alice", "password": "test-password"}] }],
         "outbounds": [{"type": "admission-echo", "tag": "echo"}],
-        "route": {"final": "echo"}, "user_limits": {"alice": {"max_connections": 1}}
+        "route": {"rules": [{"domain": ["blocked.example"], "action": "reject"}], "final": "echo"},
+        "user_limits": {"alice": {"max_connections": 1}}
     }).to_string())).await.unwrap();
     let (send, recv) = tokio::sync::mpsc::channel(64);
     let (answer, mut answers) = tokio::sync::mpsc::channel(64);
@@ -374,7 +377,234 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
     assert_eq!((live.upload, live.download), (13, 13));
     let calls = checked.lock().unwrap().clone();
     assert_eq!(calls.iter().filter(|(to, _)| *to == open).count(), 1);
-    assert!(calls.contains(&(denied, rejected.id)));
+    assert!(calls.contains(&(denied.clone(), rejected.id)));
+    // Fill the lossless sink, using an already authorized packet as a
+    // FIFO barrier. Backlog refusal precedes host admission and is
+    // publicly counted, without creating more rejection records.
+    for round in 0..2 {
+        send.send((b"blocked".to_vec(), denied.clone()))
+            .await
+            .unwrap();
+        send.send((b"pressure".to_vec(), open.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), answers.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"pressure".to_vec(), open.clone())
+        );
+        assert_eq!(records.queued(), 1);
+        assert_eq!(records.refused(), round);
+    }
+    assert_eq!(
+        checked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(to, _)| *to == denied)
+            .count(),
+        2
+    );
+    let pressure_rejection = records.next().await;
+    assert_eq!(pressure_rejection.reason.as_deref(), Some("domain_blocked"));
+    assert_eq!(
+        (pressure_rejection.up_total, pressure_rejection.down_total),
+        (0, 0)
+    );
+    assert_eq!(
+        pressure_rejection.kind,
+        RecordKind::Closed(End::Closed(ClosedBy::Host))
+    );
+    // IP and port are both part of the cache key. Queue concurrently on
+    // one source, and require every allowed packet to return correctly.
+    for port in 1000u16..1065 {
+        send.send((
+            port.to_be_bytes().to_vec(),
+            Address::Ip(([192, 0, 2, 1], port).into()),
+        ))
+        .await
+        .unwrap();
+    }
+    for _ in 1000..1065 {
+        let (data, from) = tokio::time::timeout(Duration::from_secs(5), answers.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, from.port().to_be_bytes());
+    }
+    // The first target was evicted, so its next packet must be checked
+    // again. Refusing a target never caches that refusal: it can recover.
+    send.send((b"again".to_vec(), open.clone())).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), answers.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        (b"again".to_vec(), open.clone())
+    );
+    assert_eq!(
+        checked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(to, _)| *to == open)
+            .count(),
+        2
+    );
+    blocked.store(false, Ordering::SeqCst);
+    send.send((b"recovered".to_vec(), denied.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), answers.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        (b"recovered".to_vec(), denied)
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    let connections = instance.connections().await.unwrap();
+    assert_eq!(connections.len(), 1);
+    assert_eq!(connections[0].id, id);
+    assert_eq!((connections[0].upload, connections[0].download), (173, 173));
     drop(send);
+    instance.stop().await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), records.next())
+        .await
+        .unwrap();
+    assert_eq!(closed.id, id);
+    assert_eq!((closed.up_total, closed.down_total), (173, 173));
+    assert_ne!(closed.outcome, Some(Outcome::Rejected));
+    assert!(
+        records.try_next().is_none(),
+        "accepted target checks must not invent closed records"
+    );
+}
+
+#[cfg(feature = "inbound-direct")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_checks_the_restored_fake_ip_domain_of_each_target() {
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RData, RecordType};
+    use sail::embed::{Address, Datagrams, DomainSource, NewSession};
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counted = dials.clone();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let checks = seen.clone();
+    let options = Options::new()
+        .threads(Threads::Workers(2, 2 << 20))
+        .connection_records_lossless(64)
+        .admit(move |session| {
+            if session.inbound_tag != "in" {
+                return Verdict::Accept;
+            }
+            checks.lock().unwrap().push((
+                session.destination.clone(),
+                session.domain.clone(),
+                session.domain_source,
+            ));
+            match session.domain.as_deref() {
+                Some("blocked.example") => Verdict::reject("fake_domain_blocked"),
+                _ => Verdict::Accept,
+            }
+        })
+        .outbound_kind("admission-echo", move |_| {
+            Ok(Arc::new(AdmissionEcho(counted.clone())))
+        })
+        .unwrap();
+    let instance = Instance::new(options).unwrap();
+    let mut records = instance.connection_records().unwrap();
+    let dns_port = common::free_port();
+    instance.start(Config::Json(serde_json::json!({
+        "dns": {"servers": [{"type": "fakeip", "tag": "fake", "inet4_range": "198.18.0.0/15"}]},
+        "inbounds": [
+            {"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": common::free_port()},
+            {"type": "direct", "tag": "dns-in", "listen": "127.0.0.1", "listen_port": dns_port}
+        ],
+        "outbounds": [{"type": "admission-echo", "tag": "echo"}],
+        "route": {"rules": [{"inbound": ["dns-in"], "action": "hijack-dns"}], "final": "echo"}
+    }).to_string())).await.unwrap();
+    let fake = |name: &'static str| async move {
+        let mut query = Message::new(42, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(&query.to_vec().unwrap(), ("127.0.0.1", dns_port))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1500];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = Message::from_vec(&buf[..n]).unwrap();
+        let Some(RData::A(ip)) = reply.answers.first().map(|r| &r.data) else {
+            panic!("fake IP answer: {reply:?}")
+        };
+        Address::Ip((ip.0, 5353).into())
+    };
+    let open = fake("open.example").await;
+    let blocked = fake("blocked.example").await;
+    let (send, recv) = tokio::sync::mpsc::channel(8);
+    let (back, mut answers) = tokio::sync::mpsc::channel(8);
+    instance
+        .sessions("in")
+        .unwrap()
+        .udp(
+            NewSession::new(open.clone()),
+            Datagrams {
+                recv: Box::new(AdmissionPackets(recv)),
+                send: Box::new(AdmissionSend(back)),
+            },
+        )
+        .await
+        .unwrap();
+    send.send((b"first".to_vec(), open.clone())).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), answers.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        (
+            b"first".to_vec(),
+            Address::Domain("open.example".into(), 5353)
+        )
+    );
+    send.send((b"blocked".to_vec(), blocked)).await.unwrap();
+    let rejected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                response = answers.recv() => panic!("blocked fake IP reached outbound: {response:?}"),
+                record = records.next() => if record.reason.as_deref() == Some("fake_domain_blocked") { break record; },
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(
+        rejected.destination,
+        Address::Domain("blocked.example".into(), 5353)
+    );
+    assert_eq!((rejected.up_total, rejected.down_total), (0, 0));
+    assert!(rejected.chain.is_empty());
+    assert_eq!(
+        rejected.kind,
+        RecordKind::Closed(End::Closed(ClosedBy::Host))
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    let checks = seen.lock().unwrap().clone();
+    assert!(checks.contains(&(
+        Address::Domain("blocked.example".into(), 5353),
+        Some("blocked.example".into()),
+        Some(DomainSource::Request)
+    )));
+    send.send((b"still open".to_vec(), open)).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), answers.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        b"still open"
+    );
     instance.stop().await.unwrap();
 }

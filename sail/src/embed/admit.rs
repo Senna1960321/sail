@@ -37,10 +37,17 @@ fn verdict(verdict: Verdict) -> HostVerdict {
 impl Options {
     /// The host's check of each session, once its inbound authenticated it
     /// and sail's own checks of its user took it, before it is routed: a
-    /// stream of a multiplexed connection, a UDP session to each
-    /// destination, a session a host inbound or `Instance::sessions`
-    /// submits. A session it rejects is closed as one of a user that may
-    /// not connect is, never routed; its closed record is `Rejected`, ended
+    /// stream of a multiplexed connection, a UDP association's first
+    /// target and each later uncached target (including its port), and
+    /// sessions a host inbound or `Instance::sessions` submits. A UDP
+    /// association remembers at most 64 recently accepted targets; an
+    /// evicted target is checked again, and rejections are not cached.
+    /// Later accepted targets keep the association's original outbound,
+    /// connection place and counter; only a rejected target has a separate
+    /// zero-byte closed record by its check's attempt id. Record backlog
+    /// admission runs before the hook (`RecordStream::refused`). A session
+    /// it rejects is closed as one of a user that may not connect is,
+    /// never routed; its closed record is `Rejected`, ended
     /// `Closed(ClosedBy::Host)`, with the reason told. It is called in
     /// the session's own task and never awaited: it is to answer in
     /// microseconds, from what the host holds, as one slower holds back
