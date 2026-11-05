@@ -10,6 +10,12 @@
 //!
 //! The client body is type, timestamp, padding, address, payload; the
 //! server's adds the client's session ID after the timestamp.
+//!
+//! An authenticated source pins its reply encryption session until its
+//! datagrams, NAT and queued replies release their leases. A new session
+//! from the same address is refused while the old one is pinned, including
+//! when no host context is installed. TTL and capacity eviction never
+//! replace a pinned peer; clients may retry after its owners release it.
 
 use std::collections::HashMap;
 use std::io;
@@ -21,7 +27,7 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use rand::{Rng, RngCore};
 
-use crate::session::{SocksAddr, SocksAddrWireType};
+use crate::session::{DatagramResourceLease, SocksAddr, SocksAddrWireType};
 
 use super::{
     check_timestamp, crypto_err, now_secs, psk_hash, session_subkey, Aead, AesBlock, Method,
@@ -346,6 +352,15 @@ struct ServerSession {
     server_aead: Option<Aead>,
     header: Option<AesBlock>,
     last_seen: Instant,
+    /// The table owns one reference. In-flight packets, NAT and queued
+    /// replies pin this exact authentication/encryption generation.
+    lease: Arc<()>,
+}
+
+impl ServerSession {
+    fn pinned(&self) -> bool {
+        Arc::strong_count(&self.lease) > 1
+    }
 }
 
 /// A packet a server accepted.
@@ -353,6 +368,8 @@ pub struct Received {
     pub destination: SocksAddr,
     pub payload: Range<usize>,
     pub user: Option<crate::user::UserRef>,
+    /// Keep until the source and every queued reply stop using this peer.
+    pub lease: DatagramResourceLease,
 }
 
 impl Server {
@@ -411,7 +428,7 @@ impl Server {
         if state
             .sessions
             .get(&from)
-            .is_some_and(|s| s.last_seen.elapsed() >= SERVER_SESSION_TTL)
+            .is_some_and(|s| !s.pinned() && s.last_seen.elapsed() >= SERVER_SESSION_TTL)
         {
             state.sessions.remove(&from);
         }
@@ -499,9 +516,19 @@ impl Server {
             Some(s) if s.client_id == client_id && s.user == user
         );
         if fresh {
+            // Authentication and framing succeeded, but do not replace the
+            // reply key while any old source or plaintext reply still uses
+            // it. encode takes this same lock, so replacement cannot race
+            // encryption. This applies with or without host context.
+            if state.sessions.get(&from).is_some_and(ServerSession::pinned) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "previous udp session still in use",
+                ));
+            }
             let session = self.new_session(client_id, user, new_aead)?;
             if !state.sessions.contains_key(&from) {
-                make_room(&mut state.sessions, now);
+                make_room(&mut state.sessions, now)?;
             }
             state.sessions.insert(from, session);
         }
@@ -514,6 +541,7 @@ impl Server {
             destination,
             payload: body.start + 9 + offset..body.end,
             user,
+            lease: DatagramResourceLease(session.lease.clone()),
         })
     }
 
@@ -544,6 +572,7 @@ impl Server {
             server_aead,
             header,
             last_seen: Instant::now(),
+            lease: Arc::new(()),
         })
     }
 
@@ -596,21 +625,29 @@ impl Server {
 }
 
 /// Makes room for one more session: drops idle ones, and if the table is
-/// still full, the least recently used.
-fn make_room(sessions: &mut HashMap<SocketAddr, ServerSession>, now: Instant) {
+/// still full, the least recently used unpinned peer. An active peer is
+/// never evicted: that could hand a queued reply to another credential.
+fn make_room(sessions: &mut HashMap<SocketAddr, ServerSession>, now: Instant) -> io::Result<()> {
     if sessions.len() < MAX_SERVER_SESSIONS {
-        return;
+        return Ok(());
     }
-    sessions.retain(|_, s| now.duration_since(s.last_seen) < SERVER_SESSION_TTL);
+    sessions.retain(|_, s| s.pinned() || now.duration_since(s.last_seen) < SERVER_SESSION_TTL);
     if sessions.len() >= MAX_SERVER_SESSIONS {
         if let Some(oldest) = sessions
             .iter()
+            .filter(|(_, s)| !s.pinned())
             .min_by_key(|(_, s)| s.last_seen)
             .map(|(a, _)| *a)
         {
             sessions.remove(&oldest);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "udp session table in use",
+            ));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
