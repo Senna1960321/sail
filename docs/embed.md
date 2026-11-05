@@ -433,6 +433,13 @@ that some connections may not survive (a move), as `Event::Network`:
   TUN flow ends at the app with a reset. The log line `network changed:
   generation N, …, closed=K` counts them, and the next line names what
   differed.
+- **DNS over TLS.** A move aborts every DoT connection, including an
+  older one still finishing queries. It also cancels waits for a
+  connection slot and TLS handshakes, so those waits do not hold the
+  network change up. Closing idle DNS connections after a long sleep
+  lets active DoT queries finish on their existing connection; new
+  queries use a new one. A cancelled query's late reply cannot answer
+  another query on the shared connection.
 - **Sleep and wake.** A wake is no move: after a sleep shorter than 2
   minutes nothing is closed; after one of 2 minutes or more the carriers
   left idle (pooled connections with nothing open, the DNS servers'
