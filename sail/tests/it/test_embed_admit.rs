@@ -326,7 +326,6 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
             tokio::select! {
                 response = answers.recv() => panic!("denied UDP destination reached the outbound: {response:?}"),
                 record = records.next() => {
-                    let record = record.expect("record stream ended");
                     if record.destination == denied && matches!(record.kind, RecordKind::Closed(_)) { break record; }
                 }
             }
