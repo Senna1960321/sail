@@ -19,6 +19,8 @@ pub struct UdpPacket {
     pub data: Vec<u8>,
     pub src_addr: SocksAddr,
     pub dst_addr: SocksAddr,
+    // Keep queued plaintext tied to its authenticated encryption peer.
+    resource_lease: Option<crate::session::DatagramResourceLease>,
 }
 
 impl UdpPacket {
@@ -27,7 +29,31 @@ impl UdpPacket {
             data,
             src_addr,
             dst_addr,
+            resource_lease: None,
         }
+    }
+
+    fn with_resource_lease(mut self, lease: Option<crate::session::DatagramResourceLease>) -> Self {
+        self.resource_lease = lease;
+        self
+    }
+
+    /// Consumes the whole reply, keeping its peer pinned through encode
+    /// and socket send, including error and cancellation. Both inbound
+    /// delivery loops use this ownership boundary.
+    pub(crate) async fn send_through(
+        self,
+        sender: &mut dyn crate::adapter::InboundDatagramSendHalf,
+    ) -> std::io::Result<usize> {
+        let result = match self.dst_addr.as_socket_addr() {
+            Some(dst) => sender.send_to(&self.data, &self.src_addr, dst).await,
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "datagram reply is not an IP address",
+            )),
+        };
+        drop(self);
+        result
     }
 }
 
@@ -396,7 +422,8 @@ impl NatManager {
                                     buf[..n].to_vec(),
                                     addr.clone(),
                                     SocksAddr::from(raddr_downlink.address),
-                                );
+                                )
+                                .with_resource_lease(raddr_downlink.resource_lease.clone());
                                 if let Err(err) = client_ch_tx.send(pkt).await {
                                     debug!(
                                         "Failed to send downlink packets on session {} to {}: {}",

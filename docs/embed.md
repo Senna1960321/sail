@@ -818,10 +818,20 @@ this registration snapshot; their `credential_context` is `None`. A host
 must explicitly handle that state, restrict its supported inbounds, or
 supply a binding through its own authenticated inbound extensions.
 Changing a named credential snapshot also distinguishes its UDP source
-identity: same source/name with a different snapshot creates a different
-NAT association. This does not change the rule that multiple targets of
+identity: an admitted source with a different snapshot cannot reuse the
+old NAT association. This does not change the rule that multiple targets of
 one association share one connection place and counter. Global user quota
 identity/equality remains name based.
+
+SS2022 also pins the authenticated encryption peer while a received
+packet, NAT task/source, queued plaintext reply or inbound delivery owns
+its protocol lease. A new session from that same source is explicitly
+refused while the old peer is pinned; it can retry after those owners
+release it. TTL/LRU cleanup cannot remove a pinned peer. NAT propagates
+the lease to every reply packet, and network/cat/host delivery keeps the
+whole packet through encode and socket-send completion, error or
+cancellation. This applies with or without record context and does not
+reserve another connection place for a target of the same association.
 
 Use `RecordStream::next_envelope` / `try_next_envelope` to read the record
 and its optional context together. A late child owns the frozen binding
