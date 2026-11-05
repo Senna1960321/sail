@@ -75,7 +75,7 @@ impl Options {
         let pool = crate::control::context::ContextPool::new(capacity);
         self.admission.credential = Some(Box::new(move |info| {
             pool.bind(|| bind(info))
-                .ok_or_else(|| Cow::Borrowed("credential_context_capacity"))
+                .ok_or(Cow::Borrowed("credential_context_capacity"))
         }));
         Ok(self)
     }
@@ -113,7 +113,7 @@ impl Options {
                     .cloned(),
                 || bind(&SessionInfo::untold(sess)),
             )
-            .ok_or_else(|| Cow::Borrowed("record_context_capacity"))
+            .ok_or(Cow::Borrowed("record_context_capacity"))
         }));
         Ok(self)
     }

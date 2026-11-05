@@ -272,6 +272,17 @@ impl sail::embed::HostOutbound for AdmissionEcho {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_rechecks_a_new_destination_without_spending_another_session_place() {
     use sail::embed::{Address, Datagrams, NewSession};
+    let binding = Arc::new(std::sync::Mutex::new(None));
+    let hook_binding = binding.clone();
+    async fn next_bound(
+        records: &mut sail::embed::RecordStream,
+        binding: &std::sync::Mutex<Option<sail::embed::RecordContext>>,
+    ) -> Arc<sail::embed::ConnectionRecord> {
+        let envelope = records.next_envelope().await;
+        assert_eq!(envelope.context.as_ref(), binding.lock().unwrap().as_ref());
+        assert_eq!(envelope.context.as_ref().unwrap().get::<u64>(), Some(&7));
+        envelope.record
+    }
     let blocked = Arc::new(AtomicBool::new(false));
     let policy = blocked.clone();
     let checked = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -282,7 +293,23 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         .settings_json(r#"{"set":["inbound.max_connections=1"]}"#)
         .unwrap()
         .connection_records_lossless(1)
+        .record_context(8, |session| {
+            session
+                .extensions
+                .get::<FrozenAdmissionContext>()
+                .unwrap()
+                .0
+        })
+        .unwrap()
         .admit(move |session| {
+            if session.parent_id.is_some() {
+                assert_eq!(
+                    session.record_context.as_ref(),
+                    hook_binding.lock().unwrap().as_ref()
+                );
+            } else {
+                *hook_binding.lock().unwrap() = session.record_context.clone();
+            }
             seen.lock().unwrap().push((
                 session.destination.clone(),
                 session.id,
@@ -356,7 +383,7 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         loop {
             tokio::select! {
                 response = answers.recv() => panic!("denied UDP destination reached the outbound: {response:?}"),
-                record = records.next() => {
+                record = next_bound(&mut records, &binding) => {
                     if record.destination == denied && matches!(record.kind, RecordKind::Closed(_)) { break record; }
                 }
             }
@@ -435,7 +462,7 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
             .count(),
         2
     );
-    let pressure_rejection = records.next().await;
+    let pressure_rejection = next_bound(&mut records, &binding).await;
     assert_eq!(pressure_rejection.reason.as_deref(), Some("domain_blocked"));
     assert_eq!(
         (pressure_rejection.up_total, pressure_rejection.down_total),
@@ -450,7 +477,7 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
     send.send((b"panic".to_vec(), panic_to.clone()))
         .await
         .unwrap();
-    let panicked = tokio::time::timeout(Duration::from_secs(5), records.next())
+    let panicked = tokio::time::timeout(Duration::from_secs(5), next_bound(&mut records, &binding))
         .await
         .unwrap();
     assert_eq!(panicked.destination, panic_to);
@@ -517,7 +544,7 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
     assert_eq!((connections[0].upload, connections[0].download), (173, 173));
     drop(send);
     instance.stop().await.unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(5), records.next())
+    let closed = tokio::time::timeout(Duration::from_secs(5), next_bound(&mut records, &binding))
         .await
         .unwrap();
     assert_eq!(closed.id, id);
@@ -567,9 +594,10 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         ))
         .await
         .unwrap();
-    let new_rejection = tokio::time::timeout(Duration::from_secs(5), records.next())
-        .await
-        .unwrap();
+    let new_rejection =
+        tokio::time::timeout(Duration::from_secs(5), next_bound(&mut records, &binding))
+            .await
+            .unwrap();
     assert_eq!(new_rejection.parent_id, Some(new_id));
     assert_ne!(new_rejection.run, rejected.run);
     assert!(checked.lock().unwrap().contains(&(
@@ -582,9 +610,10 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
     assert_eq!(dials.load(Ordering::SeqCst), 2);
     drop(new_send);
     instance.stop().await.unwrap();
-    let new_closed = tokio::time::timeout(Duration::from_secs(5), records.next())
-        .await
-        .unwrap();
+    let new_closed =
+        tokio::time::timeout(Duration::from_secs(5), next_bound(&mut records, &binding))
+            .await
+            .unwrap();
     assert_eq!(new_closed.id, new_id);
     assert_eq!(new_closed.parent_id, None);
     assert_eq!(new_closed.run, new_rejection.run);

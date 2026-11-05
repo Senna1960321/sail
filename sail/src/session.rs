@@ -72,7 +72,6 @@ impl PartialEq for DatagramSource {
 impl Eq for DatagramSource {}
 impl std::hash::Hash for DatagramSource {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        use std::hash::Hash;
         self.address.hash(state);
         self.stream_id.hash(state);
         self.process_name.hash(state);

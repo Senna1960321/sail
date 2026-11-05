@@ -407,6 +407,11 @@ impl Admission {
 
     /// Called while building the actual authentication row; an old row
     /// and its accepted UserRefs retain their old snapshot after reload.
+    #[cfg(any(
+        feature = "inbound-shadowsocks",
+        feature = "inbound-vless",
+        feature = "inbound-anytls"
+    ))]
     pub(crate) fn bind_credential(
         &self,
         users: &crate::user::UserRegistry,

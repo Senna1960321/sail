@@ -79,7 +79,11 @@ impl ContextPool {
     ) -> Option<RecordContext> {
         self.live
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
-                (live < self.capacity).then(|| live + 1)
+                if live < self.capacity {
+                    Some(live + 1)
+                } else {
+                    None
+                }
             })
             .ok()?;
         let slot = Slot(self.clone());

@@ -489,6 +489,11 @@ impl UserRef {
         self.1.as_ref()
     }
 
+    #[cfg(any(
+        feature = "inbound-shadowsocks",
+        feature = "inbound-vless",
+        feature = "inbound-anytls"
+    ))]
     pub(crate) fn with_credential_context(
         mut self,
         context: crate::control::context::RecordContext,

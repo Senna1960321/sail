@@ -846,8 +846,10 @@ Readers must handle these unbound refusals explicitly. The existing record
 backlog gate runs earlier and refuses without another record, counted in
 `RecordStream::refused`. Source/handshake/authentication failures and the
 host-submission checks before dispatch precede this binding point; they
-retain their existing no-session-record semantics. The protocol does not
-invent an authenticated identity for them.
+retain their existing no-session-record semantics. An inbound connection-place
+refusal also keeps its no-record semantics; capture may already have run,
+and the rejected session releases its binding. The protocol does not
+invent an authenticated identity for a failed authentication.
 
 These capacities are not hard memory limits: the host must bound payload
 size, configured credentials, retained views/clones and pending spool
