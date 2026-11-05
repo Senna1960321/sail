@@ -793,3 +793,7 @@ mod tests {
         assert_eq!(server.lock().unwrap().sessions.len(), MAX_SERVER_SESSIONS);
     }
 }
+
+#[cfg(test)]
+#[path = "udp_lease_tests.rs"]
+mod lease_tests;
