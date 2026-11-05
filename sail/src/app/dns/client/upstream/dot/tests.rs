@@ -405,7 +405,118 @@ async fn a_sequential_reuse_timeout_yields_to_the_outer_retry_budget() {
         assert!(error.to_string().contains("kept connection timed out"));
         assert!(timed_out.load(std::sync::atomic::Ordering::Relaxed));
         assert!(connection.shared.lock().unwrap().pending.is_empty());
+        assert!(
+            pool.state.lock().await.kept.is_none(),
+            "a fresh retry must not reuse the timed-out connection"
+        );
         assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_sequential_retries_share_the_replacement_connection() {
+    scoped(async {
+        let pool = Pool::default();
+        let (old, _silent_peer) = connection(&pool.connections, 1024, Duration::from_secs(1)).await;
+        kept(&pool, &old).await;
+        let (client, upstream) = client();
+        // A dial to port zero fails: these requests must use the replacement
+        // already opened by another waiter, not discard it and dial again.
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let requests: Vec<_> = (0..8).map(|marker| message(42, marker)).collect();
+        let stale = requests.iter().map(|request| async {
+            let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let attempt = super::super::Attempt {
+                reuse: Some(Duration::from_millis(10)),
+                kept_timed_out: timed_out.clone(),
+            };
+            let error = super::super::ATTEMPT
+                .scope(
+                    attempt,
+                    client.exchange_dot(&upstream, &pool, addr, request),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("kept connection timed out"));
+            assert!(timed_out.load(std::sync::atomic::Ordering::Relaxed));
+        });
+        futures::future::join_all(stale).await;
+
+        let (replacement, mut peer) =
+            connection(&pool.connections, 1024, Duration::from_secs(1)).await;
+        kept(&pool, &replacement).await;
+        // This is the fresh attempt made by DnsClient::sequential after
+        // each stale query timed out. Every waiter has its own full budget.
+        let retried = requests.iter().map(|request| {
+            super::super::ATTEMPT.scope(
+                super::super::Attempt {
+                    reuse: None,
+                    kept_timed_out: Default::default(),
+                },
+                client.exchange_dot(&upstream, &pool, addr, request),
+            )
+        });
+        let serve = async {
+            for _ in 0..requests.len() {
+                let frame = read_frame(&mut peer).await;
+                reply(&mut peer, &frame).await;
+            }
+        };
+        let (answers, served) = tokio::join!(
+            futures::future::join_all(retried),
+            timeout(Duration::from_secs(1), serve),
+        );
+        for (answer, request) in answers.into_iter().zip(requests) {
+            assert_eq!(
+                answer.unwrap(),
+                request,
+                "fresh retries must share the replacement"
+            );
+        }
+        served.expect("replacement did not receive every retry");
+        assert!(Arc::ptr_eq(
+            pool.state.lock().await.kept.as_ref().unwrap(),
+            &replacement,
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_late_sequential_timeout_does_not_retire_a_newer_connection() {
+    scoped(async {
+        let pool = Pool::default();
+        let (old, mut old_peer) = connection(&pool.connections, 1024, Duration::from_secs(1)).await;
+        kept(&pool, &old).await;
+        let (replacement, _new_peer) =
+            connection(&pool.connections, 1024, Duration::from_secs(1)).await;
+        let (client, upstream) = client();
+        let request = message(42, 1);
+        let attempt = super::super::Attempt {
+            reuse: Some(Duration::from_millis(20)),
+            kept_timed_out: Default::default(),
+        };
+        let query = super::super::ATTEMPT.scope(
+            attempt,
+            client.exchange_dot(&upstream, &pool, "127.0.0.1:0".parse().unwrap(), &request),
+        );
+        let replace = async {
+            // The old exchange is already waiting when another query replaces
+            // its connection.
+            read_frame(&mut old_peer).await;
+            kept(&pool, &replacement).await;
+        };
+        let (answer, ()) = tokio::join!(query, replace);
+        assert!(answer
+            .unwrap_err()
+            .to_string()
+            .contains("kept connection timed out"));
+        assert!(Arc::ptr_eq(
+            pool.state.lock().await.kept.as_ref().unwrap(),
+            &replacement
+        ));
+        assert!(!replacement.driver.is_finished());
     })
     .await;
 }
@@ -420,7 +531,7 @@ async fn reset_cancels_a_stalled_handshake_before_it_can_repopulate_the_pool() {
         let mut dial = crate::runtime::scope::spawn("stalled DoT handshake", async move {
             let (client, upstream) = client();
             dialing_pool
-                .query(&client, &upstream, addr, &message(42, 1), true, None)
+                .query(&client, &upstream, addr, &message(42, 1), None)
                 .await
                 .map(|_| ())
         });
@@ -470,7 +581,6 @@ async fn reset_is_not_blocked_by_a_query_waiting_for_a_connection_slot() {
             &upstream,
             "127.0.0.1:853".parse().unwrap(),
             &request,
-            true,
             None,
         ));
         // Poll through connection creation to the exhausted semaphore.

@@ -40,6 +40,20 @@ struct PoolState {
     live: Vec<Weak<Connection>>,
 }
 
+impl PoolState {
+    fn retire(&mut self, failed: &Weak<Connection>) {
+        // A concurrent query (or a network reset) may already have replaced
+        // this connection. A late timeout must not retire its replacement.
+        if self
+            .kept
+            .as_ref()
+            .is_some_and(|connection| Weak::ptr_eq(&Arc::downgrade(connection), failed))
+        {
+            self.kept = None;
+        }
+    }
+}
+
 impl Default for Pool {
     fn default() -> Self {
         Self {
@@ -253,13 +267,16 @@ impl Pool {
         self.state.lock().await.kept = None;
     }
 
+    async fn retire(&self, failed: &Weak<Connection>) {
+        self.state.lock().await.retire(failed);
+    }
+
     async fn query(
         &self,
         client: &DnsClient,
         upstream: &Upstream,
         addr: SocketAddr,
         request: &[u8],
-        reuse: bool,
         failed: Option<&Weak<Connection>>,
     ) -> Result<(Query, bool)> {
         let mut generation = self.generation.subscribe();
@@ -270,12 +287,8 @@ impl Pool {
             let _dialing = self.dialing.lock().await;
             {
                 let mut state = self.state.lock().await;
-                if !reuse
-                    || state.kept.as_ref().is_some_and(|c| {
-                        failed.is_some_and(|f| Weak::ptr_eq(&Arc::downgrade(c), f))
-                    })
-                {
-                    state.kept = None;
+                if let Some(failed) = failed {
+                    state.retire(failed);
                 }
                 if let Some(query) = state.kept.as_ref().and_then(|c| c.reserve(request)) {
                     return Ok((query, true));
@@ -345,10 +358,10 @@ impl DnsClient {
     ) -> Result<Vec<u8>> {
         let _slot = pool.queries.acquire().await?;
         let wait = kept_wait(self.reused_connection_timeout());
-        let (query, reused) = pool
-            .query(self, upstream, addr, request, wait.is_some(), None)
-            .await?;
-        if !reused {
+        let (query, reused) = pool.query(self, upstream, addr, request, None).await?;
+        // A sequential fresh attempt has its full outer budget. Another
+        // waiter may already have opened its replacement; share that one.
+        if !reused || wait.is_none() {
             return query.exchange().await;
         }
         let failed = Arc::downgrade(&query.connection);
@@ -363,6 +376,10 @@ impl DnsClient {
             Err(_) => {
                 debug!("{}: kept connection timed out", upstream);
                 if kept_timed_out() {
+                    // Retire this connection before yielding to the outer
+                    // retry. Its siblings must not each discard the fresh
+                    // replacement when their own retry starts.
+                    pool.retire(&failed).await;
                     return Err(anyhow!("{}: kept connection timed out", upstream));
                 }
             }
@@ -370,7 +387,7 @@ impl DnsClient {
         // Another query may already have replaced this failed connection.
         // Its replacement can be used; do not open one retry per waiter.
         let (query, _) = pool
-            .query(self, upstream, addr, request, true, Some(&failed))
+            .query(self, upstream, addr, request, Some(&failed))
             .await?;
         query.exchange().await
     }

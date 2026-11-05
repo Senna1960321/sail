@@ -569,6 +569,17 @@ fn dot_cold_burst_through_anytls_keeps_connections_bounded() -> anyhow::Result<(
 /// its queries fail together and retry concurrently.
 #[tokio::test(flavor = "multi_thread")]
 async fn dot_concurrent_failed_queries_share_one_replacement_connection() {
+    concurrent_dot_retries_share_a_replacement(false).await;
+}
+
+/// A sequential server retries a silent kept connection with a new attempt
+/// budget. All timed-out callers must share the replacement for that attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn dot_sequential_timed_out_queries_share_one_replacement_connection() {
+    concurrent_dot_retries_share_a_replacement(true).await;
+}
+
+async fn concurrent_dot_retries_share_a_replacement(sequential: bool) {
     use btls::pkey::PKey;
     use btls::ssl::{SslAcceptor, SslMethod};
     use btls::x509::X509;
@@ -602,6 +613,7 @@ async fn dot_concurrent_failed_queries_share_one_replacement_connection() {
             tls.write_all(&response).unwrap();
             tls.flush().unwrap();
         };
+        let mut silent = None;
         for attempt in 0..2 {
             let (stream, _) = listener.accept().unwrap();
             stream
@@ -617,8 +629,12 @@ async fn dot_concurrent_failed_queries_share_one_replacement_connection() {
                 for _ in 0..BATCH {
                     receive(&mut tls);
                 }
-                // All callers have an outstanding query when this
-                // connection closes, so they reach the retry together.
+                // All callers have an outstanding query. A normal upstream
+                // retries an EOF; a sequential upstream retries a silent
+                // connection after its shorter reuse deadline.
+                if sequential {
+                    silent = Some(tls);
+                }
             } else {
                 let batch: Vec<_> = (0..BATCH).map(|_| receive(&mut tls)).collect();
                 for query in batch.iter().rev() {
@@ -626,8 +642,31 @@ async fn dot_concurrent_failed_queries_share_one_replacement_connection() {
                 }
             }
         }
+        drop(silent);
     });
-    let client = client(&[self::server("tls", port, None)], Some(&cert));
+    // Sequential needs two members. This local fallback never answers, so
+    // every successful lookup must come from the shared DoT replacement.
+    let fallback = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let client = if sequential {
+        let mut dot = self::server("tls", port, None);
+        dot["tag"] = "dot".into();
+        dot["tls"]["certificate"] = cert.cert_pem.clone().into();
+        let config = config::Config::from_json(
+            &serde_json::json!({ "dns": {
+                "timeout": "30s", "strategy": "ipv4_only", "final": "seq",
+                "servers": [dot,
+                    { "type": "udp", "tag": "unused", "server": "127.0.0.1",
+                        "server_port": fallback.local_addr().unwrap().port() },
+                    { "type": "sequential", "tag": "seq",
+                        "servers": ["dot", "unused"], "attempt_timeout": "4s", "budget": "12s" }]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        DnsClient::new(&config.dns, Default::default(), &Default::default()).unwrap()
+    } else {
+        client(&[self::server("tls", port, None)], Some(&cert))
+    };
     assert_eq!(
         lookup(&client, "prime-retry.example").await.unwrap(),
         vec![IpAddr::V4(ANSWER)]
