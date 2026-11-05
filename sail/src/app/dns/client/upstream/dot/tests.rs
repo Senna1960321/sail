@@ -485,3 +485,80 @@ async fn reset_is_not_blocked_by_a_query_waiting_for_a_connection_slot() {
     })
     .await;
 }
+
+// Quota waiters have not entered Pool::query yet, so its generation
+// subscription alone cannot cancel them.
+#[tokio::test]
+async fn reset_cancels_a_query_waiting_for_the_in_flight_quota() {
+    scoped(async {
+        let pool = Pool::default();
+        let occupied = pool
+            .queries
+            .acquire_many(MAX_IN_FLIGHT as u32)
+            .await
+            .unwrap();
+        let (client, upstream) = client();
+        let request = message(42, 1);
+        let mut waiter = Box::pin(client.exchange_dot(
+            &upstream,
+            &pool,
+            "127.0.0.1:853".parse().unwrap(),
+            &request,
+        ));
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        pool.clear().await;
+        let error = timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("reset must wake the query quota waiter")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "DoT network changed");
+        drop(occupied);
+        assert_eq!(pool.queries.available_permits(), MAX_IN_FLIGHT);
+        assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS);
+        assert!(pool.state.lock().await.kept.is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancelling_an_exchange_releases_its_query_quota_and_pending_id() {
+    scoped(async {
+        let pool = Pool::default();
+        let (connection, mut peer) =
+            connection(&pool.connections, 1024, Duration::from_secs(1)).await;
+        kept(&pool, &connection).await;
+        let (client, upstream) = client();
+        let request = message(42, 1);
+        let mut exchange = Box::pin(client.exchange_dot(
+            &upstream,
+            &pool,
+            "127.0.0.1:853".parse().unwrap(),
+            &request,
+        ));
+        assert!(futures::poll!(exchange.as_mut()).is_pending());
+        let old = read_frame(&mut peer).await;
+        assert_eq!(pool.queries.available_permits(), MAX_IN_FLIGHT - 1);
+        drop(exchange);
+        assert_eq!(pool.queries.available_permits(), MAX_IN_FLIGHT);
+        assert!(connection.shared.lock().unwrap().pending.is_empty());
+        let next_request = message(42, 2);
+        let next = client.exchange_dot(
+            &upstream,
+            &pool,
+            "127.0.0.1:853".parse().unwrap(),
+            &next_request,
+        );
+        let server = async {
+            let current = read_frame(&mut peer).await;
+            assert_ne!(&old[..2], &current[..2]);
+            reply(&mut peer, &old).await;
+            reply(&mut peer, &current).await;
+            // A duplicate response must not be delivered to any later query.
+            reply(&mut peer, &current).await;
+        };
+        let (answer, ()) = tokio::join!(next, server);
+        assert_eq!(answer.unwrap(), next_request);
+        assert_eq!(pool.queries.available_permits(), MAX_IN_FLIGHT);
+    })
+    .await;
+}

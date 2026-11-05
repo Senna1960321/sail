@@ -325,6 +325,24 @@ impl DnsClient {
         if !(12..=u16::MAX as usize).contains(&request.len()) {
             return Err(anyhow!("invalid DNS query length"));
         }
+        // Subscribe before waiting for the query quota. A reset cancels
+        // every pre-reset exchange, including queued queries and retries,
+        // rather than letting them create work on the new network.
+        let mut generation = pool.generation.subscribe();
+        tokio::select! {
+            biased;
+            _ = generation.changed() => Err(anyhow!("DoT network changed")),
+            result = self.exchange_dot_on_network(upstream, pool, addr, request) => result,
+        }
+    }
+
+    async fn exchange_dot_on_network(
+        &self,
+        upstream: &Upstream,
+        pool: &Pool,
+        addr: SocketAddr,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
         let _slot = pool.queries.acquire().await?;
         let wait = kept_wait(self.reused_connection_timeout());
         let (query, reused) = pool

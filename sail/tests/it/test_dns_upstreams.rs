@@ -461,6 +461,110 @@ async fn dot_pipelines_concurrent_queries_on_one_connection() {
     server.join().unwrap();
 }
 
+/// DNS detour connections are internal work: an application's inbound
+/// connection cap does not bound them. A cold 2000-name burst at 400 qps
+/// must finish through a bounded number of real AnyTLS sessions.
+#[cfg(all(
+    feature = "inbound-anytls",
+    feature = "outbound-anytls",
+    feature = "outbound-direct"
+))]
+#[test]
+fn dot_cold_burst_through_anytls_keeps_connections_bounded() -> anyhow::Result<()> {
+    use sail::app::dispatcher::Dispatcher;
+    use sail::app::outbound::manager::OutboundManager;
+    use sail::app::router::Router;
+    use sail::app::stat_manager::StatManager;
+
+    const QUERIES: usize = 2000;
+    let cert = cert();
+    let dir = crate::common::TempDir::new("dot-anytls-burst")?;
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, &cert.cert_pem)?;
+    std::fs::write(&key_path, &cert.key_pem)?;
+    let (dot_port, dns) = start_dot_server(&cert, false);
+    let anytls_port = crate::common::free_port();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let ids = crate::common::run_sail_instances(
+        &rt,
+        vec![serde_json::json!({
+            "inbounds": [{ "type": "anytls", "listen": "127.0.0.1", "listen_port": anytls_port,
+                "users": [{ "name": "dns", "password": "dns-burst-test" }],
+                "tls": { "enabled": true, "certificate_path": cert_path, "key_path": key_path } }],
+            "outbounds": [{ "type": "direct", "tag": "direct" }]
+        })
+        .to_string()],
+    )?;
+    let result = rt.block_on(async {
+        // Count the actual encrypted proxy connections, not only the DoT
+        // sockets at their destination. The proxy itself is unchanged.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let sessions = Arc::new(AtomicUsize::new(0));
+        let counted = sessions.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if let Ok(mut peer) = tokio::net::TcpStream::connect(("127.0.0.1", anytls_port)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut peer).await;
+                    }
+                });
+            }
+        });
+        let dial = Arc::new(DialDefaults::default());
+        let env = Arc::new(sail::runtime::RuntimeEnv::default());
+        let mut upstream = server("tls", dot_port, None);
+        upstream["detour"] = "proxy".into();
+        let client = client_with(&[upstream], Some(&cert), dial.clone()).into_shared();
+        let config = config::Config::from_json(&serde_json::json!({ "outbounds": [{
+            "type": "anytls", "tag": "proxy", "server": "127.0.0.1", "server_port": port,
+            "password": "dns-burst-test", "tls": { "enabled": true,
+                "server_name": "localhost", "certificate": cert.cert_pem }
+        }] }).to_string())?;
+        let outbounds = Arc::new(arc_swap::ArcSwap::from_pointee(
+            OutboundManager::new(&config.outbounds, &dial, &env, client.clone())?));
+        dial.env.outbounds.set(&outbounds);
+        let router = Arc::new(arc_swap::ArcSwap::from_pointee(
+            Router::new(&config::Route::default(), client.clone(), &env)?));
+        let dispatcher = Arc::new(Dispatcher::new(outbounds, router, client.clone(),
+            Arc::new(StatManager::default()), env));
+        client.load().set_dispatcher(Arc::downgrade(&dispatcher));
+        let started = tokio::time::Instant::now();
+        let queries = (0..QUERIES).map(|i| {
+            let client = &client;
+            async move {
+                tokio::time::sleep_until(started + Duration::from_micros(i as u64 * 2500)).await;
+                lookup(&client.load(), &format!("cold-{i}.example")).await
+            }
+        });
+        let results = tokio::time::timeout(Duration::from_secs(30),
+            futures::future::join_all(queries)).await;
+        forwarder.abort();
+        let results = results?;
+        let answered = results.iter().filter(|r| r.as_ref().is_ok_and(|ips|
+            ips == &vec![IpAddr::V4(ANSWER)])).count();
+        let connections = sessions.load(Ordering::SeqCst);
+        eprintln!("DoT cold burst: {answered}/{QUERIES} answers, {connections} AnyTLS sessions, {} DoT connections",
+            dns.connections.load(Ordering::SeqCst));
+        // Functional correctness is stricter than the device acceptance
+        // threshold; no reduced load or relaxed success criterion here.
+        assert_eq!(answered, QUERIES);
+        assert_eq!(dns.queries.load(Ordering::SeqCst), QUERIES);
+        assert!((1..=4).contains(&connections), "unbounded DNS detour sessions: {connections}");
+        assert_eq!(dns.connections.load(Ordering::SeqCst), 1);
+        anyhow::Ok(())
+    });
+    for id in ids {
+        crate::common::stop_instance(id);
+    }
+    result
+}
+
 /// A dropped shared connection causes one new handshake, even when all
 /// its queries fail together and retry concurrently.
 #[tokio::test(flavor = "multi_thread")]
