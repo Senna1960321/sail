@@ -44,7 +44,9 @@ impl Options {
     /// evicted target is checked again, and rejections are not cached.
     /// Later accepted targets keep the association's original outbound,
     /// connection place and counter; only a rejected target has a separate
-    /// zero-byte closed record by its check's attempt id. Record backlog
+    /// zero-byte closed record by its check's attempt id. For a later
+    /// target, `SessionInfo::parent_id` and the record's `parent_id`
+    /// identify the original association within its run. Record backlog
     /// admission runs before the hook (`RecordStream::refused`). A session
     /// it rejects is closed as one of a user that may not connect is,
     /// never routed; its closed record is `Rejected`, ended

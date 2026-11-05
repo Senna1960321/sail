@@ -113,7 +113,8 @@ pub const SAIL_EVENT_SYSTEM: u32 = 14;
 /// "stopped" | "host", "outcome": "ok" | "dial_failed" | "blocked" |
 /// "rejected", "reason" (why the host's check refused it), "network", "user", "inbound", "source", "local", "destination",
 /// "request_destination", "domain", "domain_source", "outbound", "chain",
-/// "up_total", "down_total", "start_ms", "at_ms"}`; a connection's closed
+/// "up_total", "down_total", "start_ms", "at_ms", "parent_id" (the root UDP
+/// association for an additional target attempt, otherwise null)}`; a connection's closed
 /// record has what its user was counted. Built only
 /// while someone follows them. Through stops and starts; `{"lagged":
 /// missed}` as for faults. In the tunnel process only.

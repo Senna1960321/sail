@@ -301,7 +301,7 @@ impl NatManager {
 
     async fn add_session<'a>(
         &self,
-        sess: Session,
+        mut sess: Session,
         raddr: DatagramSource,
         client_ch_tx: Sender<UdpPacket>,
         guard: &mut MutexGuard<'a, SessionMap>,
@@ -343,12 +343,7 @@ impl NatManager {
                 // they are sent before the rest.
                 // Keep only the pre-route identity, never the listed
                 // number or state of the association's counter.
-                let admission_session =
-                    dispatcher.checks_datagram_destinations().then(|| Session {
-                        number: None,
-                        state: Default::default(),
-                        ..sess.clone()
-                    });
+                let admission_session = dispatcher.datagram_admission(&mut sess);
                 let mut sniffer = DatagramSniffer::new(&mut target_ch_rx);
                 let socket = dispatcher
                     .dispatch_datagram(sess, &mut sniffer)

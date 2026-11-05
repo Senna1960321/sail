@@ -244,6 +244,7 @@ impl sail::embed::DatagramSend for AdmissionSend {
     }
 }
 struct AdmissionEcho(Arc<AtomicUsize>);
+struct FrozenAdmissionContext(u64);
 impl sail::embed::HostOutbound for AdmissionEcho {
     fn stream<'a>(
         &'a self,
@@ -282,9 +283,23 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         .unwrap()
         .connection_records_lossless(1)
         .admit(move |session| {
-            seen.lock()
-                .unwrap()
-                .push((session.destination.clone(), session.id));
+            seen.lock().unwrap().push((
+                session.destination.clone(),
+                session.id,
+                session.parent_id,
+                session.run,
+            ));
+            assert_eq!(
+                session
+                    .extensions
+                    .get::<FrozenAdmissionContext>()
+                    .unwrap()
+                    .0,
+                7
+            );
+            if session.destination == Address::Domain("panic.example".into(), 53) {
+                panic!("target admission test panic");
+            }
             if policy.load(Ordering::SeqCst)
                 && session.destination == Address::Domain("blocked.example".into(), 53)
             {
@@ -299,13 +314,14 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         .unwrap();
     let instance = Instance::new(options.threads(Threads::Workers(2, 2 << 20))).unwrap();
     let mut records = instance.connection_records().unwrap();
-    instance.start(Config::Json(serde_json::json!({
+    let config = serde_json::json!({
         "inbounds": [{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": common::free_port(),
             "users": [{"username": "alice", "password": "test-password"}] }],
         "outbounds": [{"type": "admission-echo", "tag": "echo"}],
         "route": {"rules": [{"domain": ["blocked.example"], "action": "reject"}], "final": "echo"},
         "user_limits": {"alice": {"max_connections": 1}}
-    }).to_string())).await.unwrap();
+    }).to_string();
+    instance.start(Config::Json(config.clone())).await.unwrap();
     let (send, recv) = tokio::sync::mpsc::channel(64);
     let (answer, mut answers) = tokio::sync::mpsc::channel(64);
     let open = Address::Domain("open.example".into(), 53);
@@ -313,7 +329,9 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         .sessions("in")
         .unwrap()
         .udp(
-            NewSession::new(open.clone()).user(instance.user("alice").unwrap()),
+            NewSession::new(open.clone())
+                .user(instance.user("alice").unwrap())
+                .extension(FrozenAdmissionContext(7)),
             Datagrams {
                 recv: Box::new(AdmissionPackets(recv)),
                 send: Box::new(AdmissionSend(answer)),
@@ -344,6 +362,9 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
             }
         }
     }).await.unwrap();
+    assert_eq!(rejected.parent_id, Some(id));
+    let json = serde_json::to_value(sail::control::json::ConnectionRecord::of(&rejected)).unwrap();
+    assert_eq!(json["parent_id"], id);
     assert_ne!(
         rejected.id, id,
         "a rejected target cannot close the association's record"
@@ -379,8 +400,12 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
     assert_eq!(live.id, id);
     assert_eq!((live.upload, live.download), (13, 13));
     let calls = checked.lock().unwrap().clone();
-    assert_eq!(calls.iter().filter(|(to, _)| *to == open).count(), 1);
-    assert!(calls.contains(&(denied.clone(), rejected.id)));
+    assert!(
+        calls.contains(&(open.clone(), id, None, Some(rejected.run))),
+        "the callback run is exactly the records' run, not an instance timestamp"
+    );
+    assert_eq!(calls.iter().filter(|(to, _, _, _)| *to == open).count(), 1);
+    assert!(calls.contains(&(denied.clone(), rejected.id, Some(id), Some(rejected.run))));
     // Fill the lossless sink, using an already authorized packet as a
     // FIFO barrier. Backlog refusal precedes host admission and is
     // publicly counted, without creating more rejection records.
@@ -406,7 +431,7 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
             .lock()
             .unwrap()
             .iter()
-            .filter(|(to, _)| *to == denied)
+            .filter(|(to, _, _, _)| *to == denied)
             .count(),
         2
     );
@@ -420,6 +445,24 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         pressure_rejection.kind,
         RecordKind::Closed(End::Closed(ClosedBy::Host))
     );
+    assert_eq!(pressure_rejection.parent_id, Some(id));
+    let panic_to = Address::Domain("panic.example".into(), 53);
+    send.send((b"panic".to_vec(), panic_to.clone()))
+        .await
+        .unwrap();
+    let panicked = tokio::time::timeout(Duration::from_secs(5), records.next())
+        .await
+        .unwrap();
+    assert_eq!(panicked.destination, panic_to);
+    assert_eq!(panicked.parent_id, Some(id));
+    assert_eq!(
+        panicked.kind,
+        RecordKind::Closed(End::Closed(ClosedBy::Host))
+    );
+    assert_eq!(panicked.outcome, Some(Outcome::Rejected));
+    assert_eq!(panicked.reason, None);
+    assert_eq!((panicked.up_total, panicked.down_total), (0, 0));
+    assert!(panicked.chain.is_empty());
     // IP and port are both part of the cache key. Queue concurrently on
     // one source, and require every allowed packet to return correctly.
     for port in 1000u16..1065 {
@@ -452,7 +495,7 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
             .lock()
             .unwrap()
             .iter()
-            .filter(|(to, _)| *to == open)
+            .filter(|(to, _, _, _)| *to == open)
             .count(),
         2
     );
@@ -478,12 +521,74 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
         .await
         .unwrap();
     assert_eq!(closed.id, id);
+    assert_eq!(closed.parent_id, None);
+    assert_eq!(closed.run, rejected.run);
+    let json = serde_json::to_value(sail::control::json::ConnectionRecord::of(&closed)).unwrap();
+    assert!(json["parent_id"].is_null());
     assert_eq!((closed.up_total, closed.down_total), (173, 173));
     assert_ne!(closed.outcome, Some(Outcome::Rejected));
     assert!(
         records.try_next().is_none(),
         "accepted target checks must not invent closed records"
     );
+    // The reader spans runs, but parent metadata and authorization do
+    // not. The same submitted source/user starts a new root in a new run.
+    blocked.store(true, Ordering::SeqCst);
+    instance.start(Config::Json(config)).await.unwrap();
+    let (new_send, new_recv) = tokio::sync::mpsc::channel(8);
+    let (new_back, mut new_answers) = tokio::sync::mpsc::channel(8);
+    let new_id = instance
+        .sessions("in")
+        .unwrap()
+        .udp(
+            NewSession::new(open.clone())
+                .user(instance.user("alice").unwrap())
+                .extension(FrozenAdmissionContext(7)),
+            Datagrams {
+                recv: Box::new(AdmissionPackets(new_recv)),
+                send: Box::new(AdmissionSend(new_back)),
+            },
+        )
+        .await
+        .unwrap();
+    new_send.send((b"new run".to_vec(), open)).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), new_answers.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        b"new run"
+    );
+    new_send
+        .send((
+            b"denied".to_vec(),
+            Address::Domain("blocked.example".into(), 53),
+        ))
+        .await
+        .unwrap();
+    let new_rejection = tokio::time::timeout(Duration::from_secs(5), records.next())
+        .await
+        .unwrap();
+    assert_eq!(new_rejection.parent_id, Some(new_id));
+    assert_ne!(new_rejection.run, rejected.run);
+    assert!(checked.lock().unwrap().contains(&(
+        Address::Domain("blocked.example".into(), 53),
+        new_rejection.id,
+        Some(new_id),
+        Some(new_rejection.run)
+    )));
+    assert_eq!((new_rejection.up_total, new_rejection.down_total), (0, 0));
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    drop(new_send);
+    instance.stop().await.unwrap();
+    let new_closed = tokio::time::timeout(Duration::from_secs(5), records.next())
+        .await
+        .unwrap();
+    assert_eq!(new_closed.id, new_id);
+    assert_eq!(new_closed.parent_id, None);
+    assert_eq!(new_closed.run, new_rejection.run);
+    assert!(records.try_next().is_none());
 }
 
 #[cfg(feature = "inbound-direct")]
@@ -638,8 +743,14 @@ async fn a_slow_udp_target_check_does_not_lock_other_associations() {
         .admit(move |session| {
             if session.destination == Address::Domain("wait.example".into(), 5353) {
                 if blocked.load(Ordering::SeqCst) {
+                    assert_eq!(session.parent_id, None, "a new association is its own root");
                     return Verdict::reject("updated_policy");
                 }
+                assert!(
+                    session.parent_id.is_some(),
+                    "a later target identifies its root"
+                );
+                assert_ne!(session.parent_id, Some(session.id));
                 entered.store(true, Ordering::SeqCst);
                 let (released, changed) = &*hook_gate;
                 let mut released = released.lock().unwrap();
@@ -729,15 +840,17 @@ async fn a_slow_udp_target_check_does_not_lock_other_associations() {
         .send((b"denied".to_vec(), wait.clone()))
         .await
         .unwrap();
+    drop(third);
     let rejected = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             tokio::select! {
-                response = third_answers.recv() => panic!("a fresh association bypassed admission: {response:?}"),
+                Some(response) = third_answers.recv() => panic!("a fresh association bypassed admission: {response:?}"),
                 record = records.next() => if record.reason.as_deref() == Some("updated_policy") { break record; },
             }
         }
     }).await.unwrap();
     assert_eq!(rejected.destination, wait);
+    assert_eq!(rejected.parent_id, None);
     assert_eq!(
         rejected.kind,
         RecordKind::Closed(End::Closed(ClosedBy::Host))
@@ -746,6 +859,6 @@ async fn a_slow_udp_target_check_does_not_lock_other_associations() {
     assert!(rejected.chain.is_empty());
     assert_eq!(dials.load(Ordering::SeqCst), 2);
     assert_eq!(instance.connections().await.unwrap().len(), 2);
-    drop((first, second, third));
+    drop((first, second));
     instance.stop().await.unwrap();
 }
