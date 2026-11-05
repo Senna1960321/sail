@@ -1163,15 +1163,9 @@ async fn credential_binding_survives_auth_capture_reload_and_reader_backpressure
     instance.reload(Some(config(new))).await.unwrap();
     // Revoked after authentication: the early user refusal must already
     // own the old credential binding, without entering the host check.
-    instance
-        .set_user_limits(
-            "alice",
-            sail::embed::UserLimits {
-                expire_at: Some(std::time::UNIX_EPOCH),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let mut limits = sail::embed::UserLimits::default();
+    limits.expire_at = Some(std::time::UNIX_EPOCH);
+    instance.set_user_limits("alice", limits).unwrap();
     {
         let (lock, changed) = &*gate;
         *lock.lock().unwrap() = true;
