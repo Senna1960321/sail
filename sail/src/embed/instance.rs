@@ -145,6 +145,12 @@ impl Instance {
             kinds,
             admission,
         } = options;
+        if admission.bind.is_some() && lossless_records.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "record_context requires connection_records_lossless",
+            ));
+        }
         let profile: crate::runtime::Profile = match &settings.profile {
             Some(p) => p
                 .parse()

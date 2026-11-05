@@ -343,7 +343,14 @@ impl NatManager {
                 // they are sent before the rest.
                 // Keep only the pre-route identity, never the listed
                 // number or state of the association's counter.
-                let admission_session = dispatcher.datagram_admission(&mut sess);
+                let admission_session = match dispatcher.datagram_admission(&mut sess) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        debug!("UDP binding refused: {}", e);
+                        sessions.lock().await.remove(&key);
+                        return;
+                    }
+                };
                 let mut sniffer = DatagramSniffer::new(&mut target_ch_rx);
                 let socket = dispatcher
                     .dispatch_datagram(sess, &mut sniffer)

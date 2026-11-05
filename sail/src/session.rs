@@ -38,7 +38,7 @@ impl std::fmt::Display for StreamId {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct DatagramSource {
     pub address: SocketAddr,
     pub stream_id: Option<StreamId>,
@@ -56,7 +56,40 @@ pub struct DatagramSource {
     pub resource_lease: Option<DatagramResourceLease>,
 }
 
+// Local authentication identity: quota/user equality remains name based.
+// Without credential snapshots this is exactly the previous source key.
+impl PartialEq for DatagramSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.stream_id == other.stream_id
+            && self.process_name == other.process_name
+            && self.user == other.user
+            && self.association == other.association
+            && self.resource_lease == other.resource_lease
+            && self.credential_context() == other.credential_context()
+    }
+}
+impl Eq for DatagramSource {}
+impl std::hash::Hash for DatagramSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use std::hash::Hash;
+        self.address.hash(state);
+        self.stream_id.hash(state);
+        self.process_name.hash(state);
+        self.user.hash(state);
+        self.association.hash(state);
+        self.resource_lease.hash(state);
+        self.credential_context().hash(state);
+    }
+}
+
 impl DatagramSource {
+    fn credential_context(&self) -> Option<&crate::control::context::RecordContext> {
+        self.user
+            .as_ref()
+            .and_then(|user| user.credential_context())
+    }
+
     pub fn new(address: SocketAddr, stream_id: Option<StreamId>) -> Self {
         DatagramSource {
             address,
@@ -444,6 +477,9 @@ pub struct Session {
     /// Internal metadata, not a new connection or accounting identity.
     #[doc(hidden)]
     pub parent_id: Option<u64>,
+    /// Host-private frozen binding, shared with record envelopes.
+    #[doc(hidden)]
+    pub record_context: Option<crate::control::context::RecordContext>,
 }
 
 /// The members groups handed a connection to, the outermost first: each
@@ -725,6 +761,7 @@ impl Clone for Session {
             extensions: self.extensions.clone(),
             number: self.number.clone(),
             parent_id: self.parent_id,
+            record_context: self.record_context.clone(),
         }
     }
 }
@@ -767,6 +804,7 @@ impl Default for Session {
             extensions: Extensions::default(),
             number: None,
             parent_id: None,
+            record_context: None,
         }
     }
 }

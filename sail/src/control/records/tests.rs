@@ -109,3 +109,41 @@ async fn a_waiting_reader_is_woken() {
         .unwrap();
     assert_eq!(got.id, 1);
 }
+
+#[test]
+fn an_envelope_owns_its_binding_until_the_reader_finishes_with_it() {
+    use crate::control::context::ContextPool;
+    let pool = ContextPool::new(1);
+    let context = pool.bind(|| String::from("private binding")).unwrap();
+    let sink = LosslessRecords::new(1);
+    let mut reader = sink.reader().unwrap();
+    let closed = record(1, 4, true);
+    sink.push_envelope(
+        RecordEnvelope {
+            record: closed.clone(),
+            context: Some(context),
+        },
+        false,
+    );
+    assert!(pool.bind(|| ()).is_none(), "queue owns the binding");
+    let envelope = reader.try_next_envelope().unwrap();
+    assert!(Arc::ptr_eq(&envelope.record, &closed));
+    assert_eq!(
+        envelope.context.as_ref().unwrap().get::<String>().unwrap(),
+        "private binding"
+    );
+    assert!(reader.try_next_envelope().is_none());
+    assert!(!sink.refuse(), "queue gate reopens when the record is read");
+    assert!(
+        pool.bind(|| ()).is_none(),
+        "reader batch is still in flight"
+    );
+    let copy = envelope.clone();
+    drop(envelope);
+    assert!(
+        pool.bind(|| ()).is_none(),
+        "failed spool handoff may retain an envelope"
+    );
+    drop(copy);
+    assert!(pool.bind(|| ()).is_some(), "last owner releases the slot");
+}

@@ -474,7 +474,11 @@ impl Counter {
             closed: closed.is_some(),
         };
         // Under the lock: the next of this connection goes after it.
-        events.recorded(closed.is_none() && !asked, || record);
+        events.recorded_with_context(
+            closed.is_none() && !asked,
+            sess.record_context.clone(),
+            || record,
+        );
         true
     }
 

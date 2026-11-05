@@ -62,6 +62,18 @@ const HOST_REASONS: usize = 64;
 pub type HostVerdict = Result<(), Cow<'static, str>>;
 
 /// What checks a session, before it is routed.
+type CredentialContext = dyn Fn(
+        &crate::embed::CredentialInfo<'_>,
+    ) -> Result<crate::control::context::RecordContext, Cow<'static, str>>
+    + Send
+    + Sync;
+
+type BindContext = dyn Fn(
+        &crate::session::Session,
+    ) -> Result<crate::control::context::RecordContext, Cow<'static, str>>
+    + Send
+    + Sync;
+
 type AdmitCheck = dyn Fn(&crate::session::Session) -> HostVerdict + Send + Sync;
 
 /// What checks a connection by its source and the address it came to.
@@ -74,6 +86,8 @@ pub struct HostHooks {
     /// Of each session, once its inbound authenticated it, before it is
     /// routed.
     pub(crate) admit: Option<Box<AdmitCheck>>,
+    pub(crate) bind: Option<Box<BindContext>>,
+    pub(crate) credential: Option<Box<CredentialContext>>,
     /// Of each connection accepted and QUIC handshake, by its source and
     /// the address it came to, before its handshake.
     pub(crate) admit_source: Option<Box<SourceCheck>>,
@@ -81,7 +95,10 @@ pub struct HostHooks {
 
 impl HostHooks {
     pub(crate) fn is_empty(&self) -> bool {
-        self.admit.is_none() && self.admit_source.is_none()
+        self.admit.is_none()
+            && self.admit_source.is_none()
+            && self.bind.is_none()
+            && self.credential.is_none()
     }
 }
 
@@ -383,7 +400,60 @@ impl Admission {
 
     /// Whether the host checks each session before it is routed.
     pub(crate) fn checks_sessions(&self) -> bool {
-        self.hooks.as_ref().is_some_and(|h| h.admit.is_some())
+        self.hooks
+            .as_ref()
+            .is_some_and(|h| h.admit.is_some() || h.bind.is_some())
+    }
+
+    /// Called while building the actual authentication row; an old row
+    /// and its accepted UserRefs retain their old snapshot after reload.
+    pub(crate) fn bind_credential(
+        &self,
+        users: &crate::user::UserRegistry,
+        protocol: &'static str,
+        inbound: &str,
+        name: Option<&str>,
+        credential: &str,
+    ) -> anyhow::Result<Option<crate::user::UserRef>> {
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return Ok(None);
+        };
+        let user = users.bind(name);
+        let Some(bind) = self.hooks.as_ref().and_then(|h| h.credential.as_ref()) else {
+            return Ok(Some(user));
+        };
+        let info = crate::embed::CredentialInfo {
+            protocol,
+            inbound,
+            name,
+            credential,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bind(&info)));
+        match result {
+            Ok(Ok(context)) => Ok(Some(user.with_credential_context(context))),
+            Ok(Err(_)) => anyhow::bail!("credential context capacity exhausted"),
+            Err(_) => anyhow::bail!("credential context callback panicked"),
+        }
+    }
+
+    /// Freeze before user admission. Inherited contexts are never rebound.
+    pub(crate) fn bind_session(
+        &self,
+        sess: &mut crate::session::Session,
+    ) -> Result<(), Option<Cow<'static, str>>> {
+        if sess.record_context.is_some() {
+            return Ok(());
+        }
+        let Some(bind) = self.hooks.as_ref().and_then(|h| h.bind.as_ref()) else {
+            return Ok(());
+        };
+        let mut context = None;
+        self.host_verdict(|| {
+            context = Some(bind(sess)?);
+            Ok(())
+        })?;
+        sess.record_context = context;
+        Ok(())
     }
 
     /// Whether the host takes in a connection from `source` to `local`, as

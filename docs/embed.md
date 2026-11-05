@@ -771,6 +771,96 @@ device itself (Android, iOS) has no entry. A chosen name that another
 program takes before the device opens fails the start ("chosen at start
 as free, was taken before it opened"); starting again chooses another.
 
+### Frozen context in lossless records
+
+A `Closed` record finishes that connection's accounting; it is not a
+parent/child family barrier. A host may keep a cloned admission
+`SessionInfo`, which can delay an unlisted child's record until after its
+root's `Closed`, even across stop/restart. DNS hijack and health checks
+also do not have the ordinary outbound `Accounts` lifetime (a health check
+may have no root record). Do not retain a closed-root identity table until
+an assumed timeout, or infer family drain from an empty queue.
+
+For Rust hosts that need frozen identity, `Options::record_context(capacity,
+bind)` attaches a host-defined, `Send + Sync + 'static` payload to each
+session before the dispatcher's user and host session checks. It requires
+`connection_records_lossless`; `Instance::new` rejects that combination
+without a lossless sink. The same `RecordContext` Arc is readable through
+`SessionInfo::record_context`, kept by the session/number/counter, inherited
+by later UDP targets, and carried in each `RecordEnvelope`. The callback
+runs once per root session, not again for a child. Session extensions
+remain available for host-submitted inbounds. Copying a host Arc from an
+extension or credential snapshot preserves the same host binding for
+routing and recording. Do not copy the root's target or refusal outcome
+into that identity: each record freezes its own destination and outcome.
+
+A username is not an authentication version. For **named SS2022, VLESS
+and AnyTLS credentials**, `Options::credential_context(capacity, bind)`
+provides the missing registration point: the callback runs while the
+actual credential table entry is constructed, before it authenticates a
+session. `CredentialInfo` borrows the protocol, inbound tag, name and
+configured credential; use that exact row/version to select the immutable
+host snapshot. Never log the borrowed secret or resolve current identity
+by name at session capture. That entry's `UserRef` keeps the snapshot,
+independently of the shared name-based quota state. A replacement entry
+gets its own snapshot; sessions authenticated by the old entry still
+expose the old `SessionInfo::credential_context`, even if the replacement
+commits before `record_context` runs. The host can store an `Arc` to its
+own immutable business type there and copy it into `record_context`.
+Sail does not define that business type or history policy.
+
+Credential callbacks may run for candidates that are never committed;
+they must have no external side effects. Exhaustion or a panic fails
+configuration construction and leaves the old configuration usable.
+Reserve headroom for old and new tables and discarded reload candidates.
+Anonymous credentials, legacy SS and other built-in protocols do not have
+this registration snapshot; their `credential_context` is `None`. A host
+must explicitly handle that state, restrict its supported inbounds, or
+supply a binding through its own authenticated inbound extensions.
+Changing a named credential snapshot also distinguishes its UDP source
+identity: same source/name with a different snapshot creates a different
+NAT association. This does not change the rule that multiple targets of
+one association share one connection place and counter. Global user quota
+identity/equality remains name based.
+
+Use `RecordStream::next_envelope` / `try_next_envelope` to read the record
+and its optional context together. A late child owns the frozen binding
+it needs; it does not depend on a root lookup. Keep the envelope (or an
+owned clone of its context) until the existing Collector/spool has
+successfully accepted it; retain/retry it if persistence fails. Then drop
+it. Root byte cursors and binding ownership have separate lifetimes.
+Legacy `next` / `try_next` return only the unchanged record DTO and release
+the envelope's context reference; they are unsuitable for this contract.
+The context is never included in JSON, C callbacks, broadcast records or
+`Debug` output. The JSON/FFI layout and record equality stay unchanged.
+
+Both capacities count **distinct bindings**, including outstanding
+configuration entries, live sessions, retained callback views, pending
+records and reader batches, across runs. A slot is reserved atomically
+before a provider is called and is returned at the last reference's drop,
+including unwind. Session binding exhaustion does not invoke the provider:
+it refuses with counted host reason `record_context_capacity` and an
+explicit zero-byte, **unbound** Host rejection record. A provider panic
+is counted in `host_panics`, with the usual no-reason Host rejection.
+Readers must handle these unbound refusals explicitly. The existing record
+backlog gate runs earlier and refuses without another record, counted in
+`RecordStream::refused`. Source/handshake/authentication failures and the
+host-submission checks before dispatch precede this binding point; they
+retain their existing no-session-record semantics. The protocol does not
+invent an authenticated identity for them.
+
+These capacities are not hard memory limits: the host must bound payload
+size, configured credentials, retained views/clones and pending spool
+batches, and keep providers fast. A retained view can consume a binding
+slot for its entire lifetime; new bindings are then refused rather than
+creating a second pool or evicting a live binding. The lossless record cap
+is still a soft admission threshold: already active work may close past
+it. A binding must not retain an Instance, Session, Number, record or other
+back-reference to its owners, nor may its provider form such a cycle.
+Use immutable host snapshots; interior mutability is the host's explicit
+synchronization and versioning responsibility. No TTL, tombstone or new
+per-destination meter is introduced.
+
 ## Dialling
 
 `dial_tcp` and `dial_udp` go through the outbound named, whatever the

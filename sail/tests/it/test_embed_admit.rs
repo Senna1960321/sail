@@ -862,3 +862,390 @@ async fn a_slow_udp_target_check_does_not_lock_other_associations() {
     drop((first, second));
     instance.stop().await.unwrap();
 }
+
+/// Negative control for root-index consumers: a legal metadata clone can
+/// keep a rejected target alive beyond its root's accounting close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retained_udp_attempt_can_close_after_its_root() {
+    use sail::embed::{Address, Datagrams, NewSession};
+    let drops = Arc::new(AtomicUsize::new(0));
+    let captured_drops = drops.clone();
+    struct Frozen {
+        version: usize,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let current = Arc::new(AtomicUsize::new(7));
+    let capture = current.clone();
+    let held = Arc::new(std::sync::Mutex::new(None));
+    let slot = held.clone();
+    let checked = Arc::new(tokio::sync::Notify::new());
+    let signal = checked.clone();
+    let instance = Instance::new(
+        Options::new()
+            .connection_records_lossless(4)
+            .record_context(2, move |_| Frozen {
+                version: capture.load(Ordering::SeqCst),
+                drops: captured_drops.clone(),
+            })
+            .unwrap()
+            .admit(move |info| {
+                if info.parent_id.is_some() {
+                    assert_eq!(
+                        info.record_context
+                            .as_ref()
+                            .unwrap()
+                            .get::<Frozen>()
+                            .unwrap()
+                            .version,
+                        7
+                    );
+                    *slot.lock().unwrap() = Some(info.clone());
+                    signal.notify_one();
+                    Verdict::reject("late-target")
+                } else {
+                    Verdict::Accept
+                }
+            })
+            .outbound_kind("admission-echo", |_| {
+                Ok(Arc::new(AdmissionEcho(Arc::default())))
+            })
+            .unwrap()
+            .threads(Threads::Workers(2, 2 << 20)),
+    )
+    .unwrap();
+    let mut records = instance.connection_records().unwrap();
+    let config = serde_json::json!({
+        "inbounds": [{"type":"socks", "tag":"in", "listen":"127.0.0.1", "listen_port":0}],
+        "outbounds": [{"type":"admission-echo", "tag":"echo"}]
+    })
+    .to_string();
+    instance.start(Config::Json(config.clone())).await.unwrap();
+    let (send, recv) = tokio::sync::mpsc::channel(1);
+    let (answer, mut answers) = tokio::sync::mpsc::channel(1);
+    let open = Address::Domain("open.example".into(), 53);
+    let id = instance
+        .sessions("in")
+        .unwrap()
+        .udp(
+            NewSession::new(open.clone()),
+            Datagrams {
+                recv: Box::new(AdmissionPackets(recv)),
+                send: Box::new(AdmissionSend(answer)),
+            },
+        )
+        .await
+        .unwrap();
+    send.send((b"first".to_vec(), open)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), answers.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    current.store(99, Ordering::SeqCst);
+    send.send((
+        b"denied".to_vec(),
+        Address::Domain("blocked.example".into(), 53),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), checked.notified())
+        .await
+        .unwrap();
+    instance.stop().await.unwrap();
+    let root_envelope = records.try_next_envelope().expect("root closed on stop");
+    let root = root_envelope.record.clone();
+    assert_eq!(
+        root_envelope
+            .context
+            .as_ref()
+            .unwrap()
+            .get::<Frozen>()
+            .unwrap()
+            .version,
+        7
+    );
+    drop(root_envelope); // root cursor/context may be retired independently
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(root.id, id);
+    assert_eq!(root.parent_id, None);
+    assert!(matches!(root.kind, RecordKind::Closed(_)));
+    assert!(
+        records.try_next().is_none(),
+        "child is retained by metadata"
+    );
+    // Restart while the old attempt is still held. IDs may repeat, but
+    // its captured run and binding are independent of the new run.
+    instance.start(Config::Json(config)).await.unwrap();
+    let (new_send, new_recv) = tokio::sync::mpsc::channel(1);
+    let (new_answer, mut new_answers) = tokio::sync::mpsc::channel(1);
+    let new_open = Address::Domain("open.example".into(), 53);
+    let new_id = instance
+        .sessions("in")
+        .unwrap()
+        .udp(
+            NewSession::new(new_open.clone()),
+            Datagrams {
+                recv: Box::new(AdmissionPackets(new_recv)),
+                send: Box::new(AdmissionSend(new_answer)),
+            },
+        )
+        .await
+        .unwrap();
+    new_send.send((b"new".to_vec(), new_open)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), new_answers.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    instance.stop().await.unwrap();
+    let new_root = records.try_next_envelope().unwrap();
+    assert_eq!(new_id, root.id, "run-local numbering restarts");
+    assert_eq!(new_root.record.id, root.id);
+    assert_ne!(new_root.record.run, root.run);
+    assert_eq!(
+        new_root
+            .context
+            .as_ref()
+            .unwrap()
+            .get::<Frozen>()
+            .unwrap()
+            .version,
+        99
+    );
+    drop(new_root);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let info = held.lock().unwrap().take().unwrap();
+    let child_key = (info.run.unwrap(), info.id);
+    drop(info);
+    let envelope = records
+        .try_next_envelope()
+        .expect("releasing metadata publishes late child");
+    let child = &envelope.record;
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .unwrap()
+            .get::<Frozen>()
+            .unwrap()
+            .version,
+        7
+    );
+    assert_ne!(child.destination, root.destination);
+    assert_eq!((child.run, child.id), child_key);
+    assert_eq!(child.parent_id, Some(root.id));
+    assert_eq!(child.run, root.run);
+    assert_eq!((child.up_total, child.down_total), (0, 0));
+    assert!(records.try_next().is_none());
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "pending spool owns the old binding"
+    );
+    drop(envelope); // simulate successful durable spool handoff
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        2,
+        "no root tombstone or hidden lease"
+    );
+}
+
+/// Reload after authentication but before binding capture: a same-name
+/// replacement cannot change the authenticated row's immutable snapshot.
+#[cfg(feature = "inbound-vless")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credential_binding_survives_auth_capture_reload_and_reader_backpressure() {
+    #[derive(Debug)]
+    struct Credential {
+        generation: usize,
+        key: String,
+    }
+    let generation = Arc::new(AtomicUsize::new(1));
+    let build_generation = generation.clone();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let signal = entered.clone();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let blocked = gate.clone();
+    let captured = Arc::new(AtomicUsize::new(0));
+    let captures = captured.clone();
+    let port = common::free_port();
+    let old = "00112233-4455-6677-8899-aabbccddeeff";
+    let new = "10112233-4455-6677-8899-aabbccddeeff";
+    let config =
+        |uuid: &str| {
+            Config::Json(serde_json::json!({
+        "inbounds": [{"type":"vless", "tag":"v", "listen":"127.0.0.1", "listen_port":port,
+            "users":[{"name":"alice", "uuid":uuid}]}],
+        "outbounds": [{"type":"direct", "tag":"direct"}]
+    }).to_string())
+        };
+    let instance = Instance::new(
+        Options::new()
+            .connection_records_lossless(16)
+            .credential_context(8, move |row| {
+                assert_eq!(
+                    (row.protocol, row.inbound, row.name),
+                    ("vless", "v", "alice")
+                );
+                Credential {
+                    generation: build_generation.load(Ordering::SeqCst),
+                    key: row.credential.into(),
+                }
+            })
+            .unwrap()
+            .record_context(1, move |info| {
+                if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                    signal.notify_one();
+                    let (lock, changed) = &*blocked;
+                    let _guard = changed
+                        .wait_while(lock.lock().unwrap(), |open| !*open)
+                        .unwrap();
+                }
+                // Deliberately read AFTER the reload: this is the reference
+                // captured in the authenticated row, not the current username.
+                info.credential_context
+                    .clone()
+                    .expect("named VLESS credential snapshot")
+            })
+            .unwrap()
+            .admit(|_| Verdict::reject("policy"))
+            .threads(Threads::Workers(2, 2 << 20)),
+    )
+    .unwrap();
+    let _release_on_failure = ReleaseAdmissionGate(gate.clone());
+    let mut records = instance.connection_records().unwrap();
+    instance.start(config(old)).await.unwrap();
+    async fn request(port: u16, uuid: &str) -> TcpStream {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut wire = vec![0];
+        wire.extend_from_slice(uuid::Uuid::parse_str(uuid).unwrap().as_bytes());
+        wire.extend_from_slice(&[0, 1, 0, 80, 1, 127, 0, 0, 1]);
+        client.write_all(&wire).await.unwrap();
+        client
+    }
+    let _old_client = request(port, old).await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    generation.store(2, Ordering::SeqCst);
+    instance.reload(Some(config(new))).await.unwrap();
+    // Revoked after authentication: the early user refusal must already
+    // own the old credential binding, without entering the host check.
+    instance
+        .set_user_limits(
+            "alice",
+            sail::embed::UserLimits {
+                expire_at: Some(std::time::UNIX_EPOCH),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    {
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_one();
+    }
+    let first = tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+        .await
+        .unwrap();
+    let identity = first
+        .context
+        .as_ref()
+        .unwrap()
+        .get::<sail::embed::RecordContext>()
+        .unwrap()
+        .get::<Credential>()
+        .unwrap();
+    assert_eq!((identity.generation, identity.key.as_str()), (1, old));
+    assert_eq!(
+        first.record.kind,
+        RecordKind::Closed(End::Closed(ClosedBy::User))
+    );
+    assert_eq!(first.record.outcome, Some(Outcome::Rejected));
+    assert_eq!(first.record.reason, None);
+    instance
+        .set_user_limits("alice", Default::default())
+        .unwrap();
+    let _capacity_client = request(port, new).await;
+    let full = tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+        .await
+        .unwrap();
+    assert!(
+        full.context.is_none(),
+        "exhaustion does not fabricate an identity"
+    );
+    assert_eq!(
+        full.record.reason.as_deref(),
+        Some("record_context_capacity")
+    );
+    assert_eq!(
+        captured.load(Ordering::SeqCst),
+        1,
+        "full pool never calls provider"
+    );
+    assert_eq!(
+        instance
+            .admission()
+            .unwrap()
+            .unwrap()
+            .host_refused
+            .get("record_context_capacity"),
+        Some(&1)
+    );
+    drop(first); // reader completed durable handoff; one session slot is free
+    let _new_client = request(port, new).await;
+    let next = tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+        .await
+        .unwrap();
+    let identity = next
+        .context
+        .as_ref()
+        .unwrap()
+        .get::<sail::embed::RecordContext>()
+        .unwrap()
+        .get::<Credential>()
+        .unwrap();
+    assert_eq!((identity.generation, identity.key.as_str()), (2, new));
+    assert_eq!(captured.load(Ordering::SeqCst), 2);
+    let json =
+        serde_json::to_string(&sail::control::json::ConnectionRecord::of(&next.record)).unwrap();
+    assert!(
+        !json.contains(new),
+        "private credentials are never record JSON"
+    );
+    drop(next);
+    // More credential rows than the snapshot pool can hold: the reload
+    // must fail atomically and release all candidate snapshots.
+    let too_many = (1..=9_u128)
+        .map(|id| {
+            serde_json::json!({
+                "name":"alice", "uuid":uuid::Uuid::from_u128(id).to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    let rejected_config = Config::Json(serde_json::json!({
+        "inbounds":[{"type":"vless","tag":"v","listen":"127.0.0.1","listen_port":port,"users":too_many}],
+        "outbounds":[{"type":"direct","tag":"direct"}]
+    }).to_string());
+    assert!(instance.reload(Some(rejected_config)).await.is_err());
+    let _still_old_row = request(port, new).await;
+    let kept = tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+        .await
+        .unwrap();
+    let identity = kept
+        .context
+        .as_ref()
+        .unwrap()
+        .get::<sail::embed::RecordContext>()
+        .unwrap()
+        .get::<Credential>()
+        .unwrap();
+    assert_eq!((identity.generation, identity.key.as_str()), (2, new));
+    drop(kept);
+    // Candidate rollback returned its slots: another legitimate replacement fits.
+    instance.reload(Some(config(old))).await.unwrap();
+    instance.stop().await.unwrap();
+}

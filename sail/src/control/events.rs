@@ -783,13 +783,25 @@ impl EventHub {
     /// someone listens. A lossless sink keeps it, unless it is an interim
     /// record of a timed pass and the sink is full (`droppable`).
     pub fn recorded(&self, droppable: bool, build: impl FnOnce() -> ConnectionRecord) {
+        self.recorded_with_context(droppable, None, build);
+    }
+
+    pub(crate) fn recorded_with_context(
+        &self,
+        droppable: bool,
+        context: Option<super::context::RecordContext>,
+        build: impl FnOnce() -> ConnectionRecord,
+    ) {
         let Some(lossless) = &self.lossless else {
             self.record.emit(|| Arc::new(build()));
             return;
         };
         let record = Arc::new(build());
         self.record.emit(|| record.clone());
-        lossless.push(record, droppable);
+        lossless.push_envelope(
+            super::records::RecordEnvelope { record, context },
+            droppable,
+        );
     }
 
     /// Whether a new connection is to be refused, its closed record having

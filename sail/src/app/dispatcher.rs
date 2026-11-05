@@ -716,6 +716,7 @@ impl Dispatcher {
         // sessions, or is refused one.
         let handshake = sess.handshake.take();
         if self.env.events.records_refuse()
+            || !self.bind_record_context(&mut sess)
             || !self.admitted(&mut sess)
             || !self.host_admits(&mut sess)
         {
@@ -1169,6 +1170,12 @@ impl Dispatcher {
         if self.env.events.records_refuse() {
             return Err(io::Error::other(
                 "refused: the host has not taken its connection records",
+            ));
+        }
+        if !self.bind_record_context(&mut sess) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "record context refused",
             ));
         }
         // Its place, held by the datagram as long as the session lives.
@@ -1723,6 +1730,23 @@ impl Dispatcher {
 }
 
 impl Dispatcher {
+    /// Capture once after authentication, before any user/host refusal.
+    fn bind_record_context(&self, sess: &mut Session) -> bool {
+        let Some(admission) = &self.env.admission else {
+            return true;
+        };
+        if self.env.events.records_wanted() {
+            self.stat_manager.numbering().number(sess);
+        }
+        if let Err(reason) = admission.bind_session(sess) {
+            if let Some(number) = &sess.number {
+                number.refused_by_host(sess, reason.map(std::borrow::Cow::into_owned));
+            }
+            return false;
+        }
+        true
+    }
+
     /// Whether the user of `sess`, if any, may have another connection:
     /// not shut out by `user_limits`, nor at its most. Checked before
     /// routing and dialing; the statistics decide once the connection is
@@ -1793,23 +1817,29 @@ impl Dispatcher {
 
     /// Prepare a root id before dispatch, also for unlisted DNS/health
     /// associations. Numbering alone neither admits nor records a session.
-    pub(crate) fn datagram_admission(&self, sess: &mut Session) -> Option<Session> {
+    pub(crate) fn datagram_admission(&self, sess: &mut Session) -> io::Result<Option<Session>> {
         if !self
             .env
             .admission
             .as_ref()
             .is_some_and(|a| a.checks_sessions())
         {
-            return None;
+            return Ok(None);
+        }
+        if self.env.events.records_refuse() || !self.bind_record_context(sess) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "record context refused",
+            ));
         }
         sess.parent_id = None;
         self.stat_manager.numbering().number(sess);
-        Some(Session {
+        Ok(Some(Session {
             parent_id: sess.number.as_ref().map(|number| number.id()),
             number: None,
             state: Default::default(),
             ..sess.clone()
-        })
+        }))
     }
 
     /// Whether the host's own check takes the session in, after sail's.

@@ -1034,6 +1034,11 @@ pub struct SessionInfo {
     /// Root UDP association for an additional target admission attempt;
     /// none for an ordinary session. Interpreted within the same run.
     pub parent_id: Option<u64>,
+    /// Snapshot of the actual named built-in credential row that
+    /// authenticated it; not a lookup of the user's current credentials.
+    pub credential_context: Option<crate::control::context::RecordContext>,
+    /// Frozen host binding; present before user and host session checks.
+    pub record_context: Option<crate::control::context::RecordContext>,
     pub network: Network,
     /// The client.
     pub source: SocketAddr,
@@ -1077,6 +1082,12 @@ impl SessionInfo {
             id,
             run: sess.number.as_ref().and_then(|number| number.run()),
             parent_id: sess.parent_id,
+            record_context: sess.record_context.clone(),
+            credential_context: sess
+                .user
+                .as_ref()
+                .and_then(|u| u.credential_context())
+                .cloned(),
             network: sess.network,
             source: sess.source,
             local: sess.local_addr,
@@ -1112,8 +1123,12 @@ impl SessionInfo {
     /// carrying `extensions`.
     fn next_hop(&self, network: Network) -> Session {
         let mut sess = self.sess.clone();
-        // A Via dial is a next hop, not an additional-target admission
-        // attempt. It keeps the accounting identity, not probe metadata.
+        // An admission probe is not an accounting identity for a Via
+        // dial. In particular a retained rejected view must not reuse
+        // its pending terminal record's number or mutate that verdict.
+        if sess.parent_id.is_some() {
+            sess.number = None;
+        }
         sess.parent_id = None;
         sess.network = network;
         if sess.destination != self.destination {
@@ -1345,7 +1360,10 @@ mod parent_tests {
         for network in [Network::Tcp, Network::Udp] {
             let next = info.next_hop(network);
             assert_eq!(next.parent_id, None);
-            assert_eq!(next.number.as_ref().unwrap().id(), info.id);
+            assert!(
+                next.number.is_none(),
+                "a probe cannot reactivate its attempt id"
+            );
         }
         assert_eq!(info.parent_id, Some(41), "the original view is unchanged");
     }
