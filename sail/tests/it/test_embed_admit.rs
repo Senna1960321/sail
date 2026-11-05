@@ -204,3 +204,171 @@ async fn a_sources_check_runs_before_the_handshake() {
     assert_eq!(sessions.load(Ordering::Relaxed), 1);
     instance.stop().await.unwrap();
 }
+
+// A real host-submitted UDP association and memory-only outbound. No
+// external resolver, port, or backend policy implementation is involved.
+struct AdmissionPackets(tokio::sync::mpsc::Receiver<(Vec<u8>, sail::embed::Address)>);
+struct AdmissionSend(tokio::sync::mpsc::Sender<(Vec<u8>, sail::embed::Address)>);
+
+impl sail::embed::DatagramRecv for AdmissionPackets {
+    fn recv_from<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> futures::future::BoxFuture<'a, std::io::Result<(usize, sail::embed::Address)>> {
+        Box::pin(async move {
+            let (data, address) = self
+                .0
+                .recv()
+                .await
+                .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+            buf[..data.len()].copy_from_slice(&data);
+            Ok((data.len(), address))
+        })
+    }
+}
+impl sail::embed::DatagramSend for AdmissionSend {
+    fn send_to<'a>(
+        &'a mut self,
+        data: &'a [u8],
+        address: &'a sail::embed::Address,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            self.0
+                .send((data.to_vec(), address.clone()))
+                .await
+                .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
+        })
+    }
+}
+struct AdmissionEcho(Arc<AtomicUsize>);
+impl sail::embed::HostOutbound for AdmissionEcho {
+    fn datagrams<'a>(
+        &'a self,
+        _: &'a sail::embed::SessionInfo,
+        _: &'a sail::embed::Via,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<sail::embed::Datagrams>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            let (send, recv) = tokio::sync::mpsc::channel(64);
+            Ok(sail::embed::Datagrams {
+                recv: Box::new(AdmissionPackets(recv)),
+                send: Box::new(AdmissionSend(send)),
+            })
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_rechecks_a_new_destination_without_spending_another_session_place() {
+    use sail::embed::{Address, Datagrams, NewSession};
+    let blocked = Arc::new(AtomicBool::new(false));
+    let policy = blocked.clone();
+    let checked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = checked.clone();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let echo = dials.clone();
+    let options = Options::new()
+        .connection_records_lossless(64)
+        .admit(move |session| {
+            seen.lock()
+                .unwrap()
+                .push((session.destination.clone(), session.id));
+            if policy.load(Ordering::SeqCst)
+                && session.destination == Address::Domain("blocked.example".into(), 53)
+            {
+                Verdict::reject("domain_blocked")
+            } else {
+                Verdict::Accept
+            }
+        })
+        .outbound_kind("admission-echo", move |_| {
+            Ok(Arc::new(AdmissionEcho(echo.clone())))
+        })
+        .unwrap();
+    let instance = Instance::new(options.threads(Threads::Workers(2, 2 << 20))).unwrap();
+    let mut records = instance.connection_records().unwrap();
+    instance.start(Config::Json(serde_json::json!({
+        "inbounds": [{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": common::free_port(),
+            "users": [{"username": "alice", "password": "test-password"}] }],
+        "outbounds": [{"type": "admission-echo", "tag": "echo"}],
+        "route": {"final": "echo"}, "user_limits": {"alice": {"max_connections": 1}}
+    }).to_string())).await.unwrap();
+    let (send, recv) = tokio::sync::mpsc::channel(64);
+    let (answer, mut answers) = tokio::sync::mpsc::channel(64);
+    let open = Address::Domain("open.example".into(), 53);
+    let id = instance
+        .sessions("in")
+        .unwrap()
+        .udp(
+            NewSession::new(open.clone()).user(instance.user("alice").unwrap()),
+            Datagrams {
+                recv: Box::new(AdmissionPackets(recv)),
+                send: Box::new(AdmissionSend(answer)),
+            },
+        )
+        .await
+        .unwrap();
+    send.send((b"first".to_vec(), open.clone())).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), answers.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        (b"first".to_vec(), open.clone())
+    );
+    blocked.store(true, Ordering::SeqCst);
+    let denied = Address::Domain("blocked.example".into(), 53);
+    send.send((b"blocked".to_vec(), denied.clone()))
+        .await
+        .unwrap();
+    let rejected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                response = answers.recv() => panic!("denied UDP destination reached the outbound: {response:?}"),
+                record = records.next() => {
+                    let record = record.expect("record stream ended");
+                    if record.destination == denied && matches!(record.kind, RecordKind::Closed(_)) { break record; }
+                }
+            }
+        }
+    }).await.unwrap();
+    assert_ne!(
+        rejected.id, id,
+        "a rejected target cannot close the association's record"
+    );
+    assert_eq!(
+        rejected.kind,
+        RecordKind::Closed(End::Closed(ClosedBy::Host))
+    );
+    assert_eq!(rejected.outcome, Some(Outcome::Rejected));
+    assert_eq!(rejected.reason.as_deref(), Some("domain_blocked"));
+    assert_eq!((rejected.up_total, rejected.down_total), (0, 0));
+    assert!(rejected.chain.is_empty());
+    // A different port is a new target. It uses the association's one
+    // user/session place, even while max_connections is already full.
+    for to in [Address::Domain("blocked.example".into(), 54), open.clone()] {
+        send.send((b"next".to_vec(), to.clone())).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), answers.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            (b"next".to_vec(), to)
+        );
+    }
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        1,
+        "reuse the original outbound"
+    );
+    let connections = instance.connections().await.unwrap();
+    assert_eq!(connections.len(), 1);
+    let live = &connections[0];
+    assert_eq!(live.id, id);
+    assert_eq!((live.upload, live.download), (13, 13));
+    let calls = checked.lock().unwrap().clone();
+    assert_eq!(calls.iter().filter(|(to, _)| *to == open).count(), 1);
+    assert!(calls.contains(&(denied, rejected.id)));
+    drop(send);
+    instance.stop().await.unwrap();
+}
