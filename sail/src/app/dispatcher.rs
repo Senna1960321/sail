@@ -1732,17 +1732,19 @@ impl Dispatcher {
 impl Dispatcher {
     /// Capture once after authentication, before any user/host refusal.
     fn bind_record_context(&self, sess: &mut Session) -> bool {
-        let Some(admission) = &self.env.admission else {
-            return true;
-        };
-        if self.env.events.records_wanted() {
-            self.stat_manager.numbering().number(sess);
-        }
-        if let Err(reason) = admission.bind_session(sess) {
-            if let Some(number) = &sess.number {
-                number.refused_by_host(sess, reason.map(std::borrow::Cow::into_owned));
+        if let Some(admission) = &self.env.admission {
+            if self.env.events.records_wanted() {
+                self.stat_manager.numbering().number(sess);
             }
-            return false;
+            if let Err(reason) = admission.bind_session(sess) {
+                if let Some(number) = &sess.number {
+                    number.refused_by_host(sess, reason.map(std::borrow::Cow::into_owned));
+                }
+                return false;
+            }
+        }
+        if let Some(number) = &sess.number {
+            number.record_context_bound(sess);
         }
         true
     }

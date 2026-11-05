@@ -1272,3 +1272,62 @@ async fn credential_binding_survives_auth_capture_reload_and_reader_backpressure
     instance.reload(Some(config(old))).await.unwrap();
     instance.stop().await.unwrap();
 }
+
+/// Host submission tells a number before dispatcher binding. Even a
+/// successful unlisted health association must record the bound snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlisted_submitted_healthcheck_keeps_its_binding() {
+    use sail::embed::{Address, Datagrams, NewSession};
+    let instance = Instance::new(
+        Options::new()
+            .connection_records_lossless(4)
+            .record_context(1, |_| 77_u64)
+            .unwrap()
+            .threads(Threads::Workers(2, 2 << 20)),
+    )
+    .unwrap();
+    let mut records = instance.connection_records().unwrap();
+    instance
+        .start(Config::Json(
+            serde_json::json!({
+                "inbounds":[{"type":"socks","tag":"in","listen":"127.0.0.1","listen_port":0}],
+                "outbounds":[{"type":"direct","tag":"direct"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let (send, recv) = tokio::sync::mpsc::channel(1);
+    let (answer, mut answers) = tokio::sync::mpsc::channel(1);
+    let health = Address::Domain("healthcheck.sail".into(), 53);
+    let id = instance
+        .sessions("in")
+        .unwrap()
+        .udp(
+            NewSession::new(health.clone()),
+            Datagrams {
+                recv: Box::new(AdmissionPackets(recv)),
+                send: Box::new(AdmissionSend(answer)),
+            },
+        )
+        .await
+        .unwrap();
+    send.send((b"probe".to_vec(), health)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), answers.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(send);
+    instance.stop().await.unwrap();
+    let envelope = records
+        .try_next_envelope()
+        .expect("a submitted, told number closes once");
+    assert_eq!(envelope.record.id, id);
+    assert!(matches!(envelope.record.kind, RecordKind::Closed(_)));
+    assert_eq!(
+        envelope.context.as_ref().and_then(|c| c.get::<u64>()),
+        Some(&77),
+        "binding must update the earlier told snapshot"
+    );
+    assert!(records.try_next_envelope().is_none());
+}

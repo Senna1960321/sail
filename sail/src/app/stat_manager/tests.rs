@@ -883,3 +883,67 @@ async fn a_number_told_has_one_closed_record() {
     assert_eq!(record.outbound, None);
     assert!(futures::FutureExt::now_or_never(records.recv()).is_none());
 }
+
+#[test]
+fn recent_statistics_must_not_hold_binding_slots() {
+    let pool = crate::control::context::ContextPool::new(1);
+    let events = EventHub::with_records(16, Some(16));
+    let mut reader = events.lossless_records().unwrap().reader().unwrap();
+    let sm = StatManager::new(256, UserRegistry::default()).recording(events);
+    let mut sess = Session {
+        record_context: pool.bind(|| 7_u64),
+        ..Default::default()
+    };
+    sm.numbering().number(&mut sess);
+    sess.number.as_ref().unwrap().told(&sess);
+    let accounts = sm.register(sess);
+    let id = accounts.counter.id;
+    accounts.sent(3);
+    accounts.recvd(5);
+    drop(accounts);
+    let recent = sm.recent();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].id, id);
+    assert_eq!((recent[0].bytes_sent(), recent[0].bytes_recvd()), (3, 5));
+    let envelope = reader.try_next_envelope().unwrap();
+    assert_eq!(envelope.context.as_ref().unwrap().get::<u64>(), Some(&7));
+    assert!(pool.bind(|| 8_u64).is_none(), "reader still owns the slot");
+    drop(envelope);
+    assert!(
+        pool.bind(|| 8_u64).is_some(),
+        "finished UI statistics must not block new admission"
+    );
+    assert!(recent[0].sess.record_context.is_none());
+    assert!(recent[0].sess.number.is_none());
+}
+
+#[cfg(any(
+    feature = "inbound-shadowsocks",
+    feature = "inbound-vless",
+    feature = "inbound-anytls"
+))]
+#[test]
+fn recent_statistics_must_not_hold_authentication_rows() {
+    let rows = crate::control::context::ContextPool::new(1);
+    let user = UserRef::unbound("alice").with_credential_context(rows.bind(|| 7_u64).unwrap());
+    let sm = StatManager::new(256, UserRegistry::default());
+    let accounts = sm.register(Session {
+        user: Some(user),
+        ..Default::default()
+    });
+    drop(accounts);
+    let recent = sm.recent();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].sess.user.as_ref().unwrap().name(), "alice");
+    assert!(
+        rows.bind(|| 8_u64).is_some(),
+        "UI history must not own a retired credential row"
+    );
+    assert!(recent[0]
+        .sess
+        .user
+        .as_ref()
+        .unwrap()
+        .credential_context()
+        .is_none());
+}

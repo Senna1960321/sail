@@ -502,6 +502,12 @@ impl UserRef {
         self
     }
 
+    /// Bookkeeping history needs the quota identity, not ownership of a
+    /// retired authentication row's private metadata.
+    pub(crate) fn without_credential_context(&self) -> Self {
+        UserRef(self.0.clone(), None)
+    }
+
     /// Keeps `close`, which closes a connection that carries others of
     /// this user through the inbound `tag`, until the guard is dropped:
     /// called when the user is shut out, or taken out of the inbound.

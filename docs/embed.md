@@ -792,7 +792,10 @@ runs once per root session, not again for a child. Session extensions
 remain available for host-submitted inbounds. Copying a host Arc from an
 extension or credential snapshot preserves the same host binding for
 routing and recording. Do not copy the root's target or refusal outcome
-into that identity: each record freezes its own destination and outcome.
+into that identity: each record freezes its own destination and outcome. When a host submission told its number
+before dispatcher binding, binding updates that existing unlisted snapshot;
+a successful unlisted submission therefore carries its binding too. Listing
+the number discards the superseded unlisted copy.
 
 A username is not an authentication version. For **named SS2022, VLESS
 and AnyTLS credentials**, `Options::credential_context(capacity, bind)`
@@ -841,6 +844,11 @@ successfully accepted it; retain/retry it if persistence fails. Then drop
 it. Root byte cursors and binding ownership have separate lifetimes.
 Legacy `next` / `try_next` return only the unchanged record DTO and release
 the envelope's context reference; they are unsuitable for this contract.
+Recent statistics are data-only projections: they retain IDs, timestamps,
+counts and status, but not Numbers, record bindings or credential snapshots.
+Thus an enabled recent-connections UI cannot exhaust binding slots after
+records were consumed. Retaining a live Counter/SessionInfo in host code
+still retains its binding and must fit the host's retained-view budget.
 The context is never included in JSON, C callbacks, broadcast records or
 `Debug` output. The JSON/FFI layout and record equality stay unchanged.
 
