@@ -207,8 +207,11 @@ async fn a_sources_check_runs_before_the_handshake() {
 
 // A real host-submitted UDP association and memory-only outbound. No
 // external resolver, port, or backend policy implementation is involved.
-struct AdmissionPackets(tokio::sync::mpsc::Receiver<(Vec<u8>, sail::embed::Address)>);
-struct AdmissionSend(tokio::sync::mpsc::Sender<(Vec<u8>, sail::embed::Address)>);
+type AdmissionPacket = (Vec<u8>, sail::embed::Address);
+type AdmissionSender = tokio::sync::mpsc::Sender<AdmissionPacket>;
+type AdmissionReceiver = tokio::sync::mpsc::Receiver<AdmissionPacket>;
+struct AdmissionPackets(AdmissionReceiver);
+struct AdmissionSend(AdmissionSender);
 
 impl sail::embed::DatagramRecv for AdmissionPackets {
     fn recv_from<'a>(
@@ -606,5 +609,143 @@ async fn udp_checks_the_restored_fake_ip_domain_of_each_target() {
             .0,
         b"still open"
     );
+    instance.stop().await.unwrap();
+}
+
+// Always unblock a deliberately stalled hook, including when an assertion
+// fails: the instance's worker must not be left waiting during teardown.
+struct ReleaseAdmissionGate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl Drop for ReleaseAdmissionGate {
+    fn drop(&mut self) {
+        let (released, changed) = &*self.0;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_udp_target_check_does_not_lock_other_associations() {
+    use sail::embed::{Address, Datagrams, NewSession};
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let waiting = Arc::new(AtomicBool::new(false));
+    let refused = Arc::new(AtomicBool::new(false));
+    let (hook_gate, entered, blocked) = (gate.clone(), waiting.clone(), refused.clone());
+    let dials = Arc::new(AtomicUsize::new(0));
+    let echo = dials.clone();
+    let options = Options::new()
+        .threads(Threads::Workers(2, 2 << 20))
+        .connection_records_lossless(64)
+        .admit(move |session| {
+            if session.destination == Address::Domain("wait.example".into(), 5353) {
+                if blocked.load(Ordering::SeqCst) {
+                    return Verdict::reject("updated_policy");
+                }
+                entered.store(true, Ordering::SeqCst);
+                let (released, changed) = &*hook_gate;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+            Verdict::Accept
+        })
+        .outbound_kind("admission-echo", move |_| {
+            Ok(Arc::new(AdmissionEcho(echo.clone())))
+        })
+        .unwrap();
+    let instance = Instance::new(options).unwrap();
+    let release = ReleaseAdmissionGate(gate);
+    let mut records = instance.connection_records().unwrap();
+    instance.start(Config::Json(serde_json::json!({
+        "inbounds": [{"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": common::free_port()}],
+        "outbounds": [{"type": "admission-echo", "tag": "echo"}], "route": {"final": "echo"}
+    }).to_string())).await.unwrap();
+    async fn submit(instance: &Instance, to: Address) -> (AdmissionSender, AdmissionReceiver) {
+        let (send, recv) = tokio::sync::mpsc::channel(8);
+        let (back, answers) = tokio::sync::mpsc::channel(8);
+        instance
+            .sessions("in")
+            .unwrap()
+            .udp(
+                NewSession::new(to),
+                Datagrams {
+                    recv: Box::new(AdmissionPackets(recv)),
+                    send: Box::new(AdmissionSend(back)),
+                },
+            )
+            .await
+            .unwrap();
+        (send, answers)
+    }
+    let open = Address::Domain("open.example".into(), 5353);
+    let wait = Address::Domain("wait.example".into(), 5353);
+    let (first, mut first_answers) = submit(&instance, open.clone()).await;
+    first.send((b"open".to_vec(), open.clone())).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), first_answers.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        b"open"
+    );
+    first
+        .send((b"waiting".to_vec(), wait.clone()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !waiting.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the new target reached its hook");
+    // The first source's callback is still blocked. A different source
+    // must be able to create a NAT and complete its own echo meanwhile.
+    let (second, mut second_answers) = submit(&instance, open.clone()).await;
+    second.send((b"independent".to_vec(), open)).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), second_answers.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        b"independent"
+    );
+    drop(release);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), first_answers.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        (b"waiting".to_vec(), wait.clone())
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    // A fresh association does not inherit an earlier association's
+    // accepted-target cache, even with the same submitted source address.
+    refused.store(true, Ordering::SeqCst);
+    let (third, mut third_answers) = submit(&instance, wait.clone()).await;
+    third
+        .send((b"denied".to_vec(), wait.clone()))
+        .await
+        .unwrap();
+    let rejected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                response = third_answers.recv() => panic!("a fresh association bypassed admission: {response:?}"),
+                record = records.next() => if record.reason.as_deref() == Some("updated_policy") { break record; },
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(rejected.destination, wait);
+    assert_eq!(
+        rejected.kind,
+        RecordKind::Closed(End::Closed(ClosedBy::Host))
+    );
+    assert_eq!((rejected.up_total, rejected.down_total), (0, 0));
+    assert!(rejected.chain.is_empty());
+    assert_eq!(dials.load(Ordering::SeqCst), 2);
+    assert_eq!(instance.connections().await.unwrap().len(), 2);
+    drop((first, second, third));
     instance.stop().await.unwrap();
 }
