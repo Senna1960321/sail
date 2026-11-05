@@ -64,6 +64,8 @@ A Clash/Mihomo or Surge configuration is passed the same way with `-c`; the exte
 
 ## Documentation
 
+- [Local commit checks](docs/contributing.md)
+
 - [Documentation site](https://peakpassvpn.github.io/sail/): getting started, configuration, protocols, routing, the CLI, platform integration and a field-by-field reference.
 - [Compatibility with sing-box, Clash and Surge](docs/compat/)
 - [FFI contract](docs/ffi.md) for apps

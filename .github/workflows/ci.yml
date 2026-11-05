@@ -241,6 +241,9 @@ jobs:
       - name: sensitive (tracked files)
         run: tools/sensitive-check.sh tree
 
+      - name: commit guard regressions
+        run: python3 tools/test-sensitive-check.py
+
       - name: sensitive (added lines and messages)
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
