@@ -46,6 +46,7 @@
     "end": "error",
     "error": "connection reset",
     "id": 7,
+    "parent_id": null,
     "inbound": "in",
     "kind": "closed",
     "local": "203.0.113.1:443",

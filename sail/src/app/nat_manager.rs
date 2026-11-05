@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::{abortable, BoxFuture};
+use lru::LruCache;
 use tokio::sync::{
     mpsc::{self, Sender},
     oneshot, Mutex, MutexGuard,
@@ -299,7 +301,7 @@ impl NatManager {
 
     async fn add_session<'a>(
         &self,
-        sess: Session,
+        mut sess: Session,
         raddr: DatagramSource,
         client_ch_tx: Sender<UdpPacket>,
         guard: &mut MutexGuard<'a, SessionMap>,
@@ -339,6 +341,9 @@ impl NatManager {
                 // new socket to communicate with the target. A sniff rule
                 // reads the first datagrams off the uplink while routing;
                 // they are sent before the rest.
+                // Keep only the pre-route identity, never the listed
+                // number or state of the association's counter.
+                let admission_session = dispatcher.datagram_admission(&mut sess);
                 let mut sniffer = DatagramSniffer::new(&mut target_ch_rx);
                 let socket = dispatcher
                     .dispatch_datagram(sess, &mut sniffer)
@@ -438,6 +443,15 @@ impl NatManager {
                 crate::runtime::scope::spawn(
                     "nat uplink",
                     async move {
+                        // Authorization is bounded independently of the
+                        // association's lifetime/number of destinations.
+                        // Evicted targets must be checked again. Rejected
+                        // targets are never cached.
+                        let mut admitted = admission_session.as_ref().map(|base| {
+                            let mut targets = LruCache::new(NonZeroUsize::new(64).unwrap());
+                            targets.put(base.destination.clone(), ());
+                            targets
+                        });
                         let mut sniffed = sniffed.into_iter();
                         loop {
                             let pkt = match sniffed.next() {
@@ -447,6 +461,26 @@ impl NatManager {
                                     None => break,
                                 },
                             };
+                            if let (Some(base), Some(targets)) = (&admission_session, &mut admitted)
+                            {
+                                if targets.get(&pkt.dst_addr).is_none() {
+                                    // Do not authorize a new target after
+                                    // the entry ended, or commit a callback
+                                    // result onto an ended/replaced NAT.
+                                    // Existing authorized packets retain
+                                    // their previous drain semantics.
+                                    if target_ch_rx.is_closed() {
+                                        break;
+                                    }
+                                    if !dispatcher.admit_datagram_destination(base, &pkt.dst_addr) {
+                                        continue;
+                                    }
+                                    if target_ch_rx.is_closed() {
+                                        break;
+                                    }
+                                    targets.put(pkt.dst_addr.clone(), ());
+                                }
+                            }
                             trace!(
                                 "outbound send udp packet dst={} len={}",
                                 &pkt.dst_addr,

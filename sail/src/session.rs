@@ -440,6 +440,10 @@ pub struct Session {
     /// shared by its copies. Public only as `handshake` is.
     #[doc(hidden)]
     pub number: Option<std::sync::Arc<crate::app::stat_manager::Number>>,
+    /// The root association of an additional UDP target admission attempt.
+    /// Internal metadata, not a new connection or accounting identity.
+    #[doc(hidden)]
+    pub parent_id: Option<u64>,
 }
 
 /// The members groups handed a connection to, the outermost first: each
@@ -720,6 +724,7 @@ impl Clone for Session {
             handshake: None,
             extensions: self.extensions.clone(),
             number: self.number.clone(),
+            parent_id: self.parent_id,
         }
     }
 }
@@ -761,6 +766,7 @@ impl Default for Session {
             handshake: None,
             extensions: Extensions::default(),
             number: None,
+            parent_id: None,
         }
     }
 }
@@ -846,7 +852,7 @@ pub enum SocksAddrWireType {
     PortLast,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub enum SocksAddr {
     Ip(SocketAddr),
     Domain(String, u16),

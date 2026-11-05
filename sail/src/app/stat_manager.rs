@@ -438,6 +438,7 @@ impl Counter {
         };
         let record = ConnectionRecord {
             id: self.id,
+            parent_id: sess.parent_id,
             run,
             seq: reported.seq,
             kind: match closed {
@@ -617,9 +618,10 @@ impl Numbering {
 
     /// The number of a session about to be routed or dialled, unless it
     /// has one not listed yet: the one it is listed by once it is counted.
-    /// A UDP session of an inbound is a template, each destination's NAT
-    /// session dispatched from a copy: the first listed takes its number,
-    /// and each after a number of its own.
+    /// A UDP session of an inbound is a template: each NAT association
+    /// dispatched from a copy takes a number. Destinations sharing that
+    /// association share its counter; independent target rejections use
+    /// an unlisted probe number instead.
     pub fn number(&self, sess: &mut Session) {
         let listed = |number: &Arc<Number>| number.listed.load(Ordering::Relaxed);
         if sess.number.as_ref().is_none_or(listed) {
@@ -676,6 +678,12 @@ impl std::fmt::Debug for Number {
 impl Number {
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The same run that this number's records carry, when recording is
+    /// attached. Never inferred from the instance's state timestamps.
+    pub(crate) fn run(&self) -> Option<SystemTime> {
+        self.recorder.as_ref().map(|recorder| recorder.run)
     }
 
     /// Takes the number for the session `sess` is the copy counted of;

@@ -676,12 +676,58 @@ yet, a source of its own list):
   it is no session yet, as one `inbound.max_connections` refuses.
 - `admit(|session: &SessionInfo| ...)` sees each session once its
   inbound authenticated it, before it is routed: a TCP connection, a
-  stream of a multiplexed one, a UDP session to each destination, a
-  session a host submitted. One it rejects is closed as a session of a
-  user that may not connect is, never routed. Its one closed record is
+  stream of a multiplexed one, the first target of a UDP association,
+  and each uncached later target (domain or IP, including its port),
+  including sessions a host submitted. One it rejects is closed as a
+  session of a user that may not connect is, never routed. Its one closed record is
   `Rejected`, ended `Closed(Host)`, with no bytes and the check's
   `reason` (none where the check panicked): a host that counts only what
   it took in leaves out those `Closed(Host)`.
+
+UDP keeps one NAT association, outbound, connection place and byte counter
+per inbound/source identity, not one per target. The first target selects
+the route; later targets use that outbound. The host's target check runs
+in the association's uplink task before a new target's bytes reach it,
+without holding the global NAT lock. Fake IPs have already become their
+domains. The most recent 64 accepted targets are remembered; a remembered
+target continues without another check, while an evicted one must be
+checked again. Rejections are not cached. Ending the NAT drops this cache.
+
+A later target does not reserve another inbound or user connection place:
+its user must still be active and present in the inbound, but an association
+already filling `max_connections=1` may send to another accepted target.
+Record backlog admission still runs first. When the lossless record sink
+is full, a new target is refused before the host hook runs and counted by
+`RecordStream::refused()`, as new connections are, without adding another
+record to the backlog. Already cached targets may continue.
+
+Each later target check has an independent attempt id and
+`SessionInfo::parent_id = Some(root_id)`. `SessionInfo::run` is the exact
+run captured by its number, identical to `ConnectionRecord::run`, not an
+approximation from instance status or the wall clock; it is optional for
+views not numbered yet. Its refusal record carries the same `parent_id`
+within that `run`; ordinary association records have
+`parent_id = None`. This also identifies a target rejected by the user's
+state before the host hook, or by a host hook that panicked. Hosts can
+bind the root id to authentication metadata frozen at entry, without
+looking up current credentials by username or guessing from addresses.
+The metadata itself remains the host's; `Extensions` is still passed
+unchanged to the hook, and is not serialized as an identity table.
+
+If the host rejects it, that id has the zero-byte `Closed(Host)`/`Rejected` record described
+above, with an empty chain; it cannot close the association's record. If
+accepted, it has no separate successful connection record: its bytes belong
+to the association's original id. An inbound's and a user's connection cap
+can therefore refuse a new association before the host sees it, while a
+new target of an existing association can reach the host check at the cap.
+These refusal reasons are deliberately not interchangeable.
+
+The optional read-only `parent_id` is an additive public field, not a new
+configuration or Cargo feature. It is nullable `parent_id` in record JSON
+and optional `parentId` in Swift/Kotlin; the C callback layout is unchanged.
+Older JSON readers ignore it. Internal Rust users constructing the public
+`control::json::ConnectionRecord` DTO with a complete struct literal must
+supply the new field; this is not a claim of universal source compatibility.
 
 Each returns `Verdict::Accept` or `Verdict::reject(reason)`. sail's own
 admission and its users' checks run first: the host sees only what sail
@@ -877,8 +923,10 @@ let options = Options::new()
     outbound gets for it. Each number submitted has one closed record,
     however the session ends: one the rules or an outbound refuse, or
     whose dial fails, has one with nothing sent or received. A UDP
-    session that sends to more than one destination is a NAT session,
-    and a record, for each: the first has its number.
+    association may send to more than one destination: it keeps one
+    successful record and counter, by the returned number. Later target
+    admission refusals have independent zero-byte records, as described
+    under admission; accepted targets do not create another connection.
   - **Refusals.** A session whose user may not connect through the inbound
     is `Refused::User`, saying why: shut out, taken out of the inbound, at
     its `max_connections`, or a user of another instance or run.

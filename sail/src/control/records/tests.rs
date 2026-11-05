@@ -7,6 +7,7 @@ fn record(id: u64, up: u64, closed: bool) -> Arc<ConnectionRecord> {
     let at = std::time::UNIX_EPOCH + Duration::from_secs(1000 + id);
     Arc::new(ConnectionRecord {
         id,
+        parent_id: None,
         run: std::time::UNIX_EPOCH,
         seq: 0,
         kind: match closed {
