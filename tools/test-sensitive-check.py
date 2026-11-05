@@ -53,7 +53,7 @@ class Commits(unittest.TestCase):
         return self.command([GIT, *args], **kwargs)
 
     def scan(self, *args, **kwargs):
-        return self.command(["sh", "tools/sensitive-check.sh", *args], **kwargs)
+        return self.command(["sh", str(self.repo / "tools/sensitive-check.sh"), *args], **kwargs)
 
     def stage(self, text="ordinary content", name="sample.txt"):
         path = self.repo / name
@@ -83,6 +83,22 @@ class Commits(unittest.TestCase):
         self.git("commit", "--only", "-qm", "Partial snapshot", "--", "included.txt")
         self.git("cat-file", "-e", "HEAD:held.txt", expected=False)
         self.assertIn(b"held.txt", self.git("diff", "--cached", "--name-only").stdout)
+
+    def test_subdirectory_invocations_inspect_the_whole_index(self):
+        directory = self.repo / "nested"
+        directory.mkdir()
+        self.stage(TOKEN)
+        (directory / "rules").write_text(TOKEN + "\n")
+        result = self.scan("index", cwd=directory, expected=False,
+                           extra={"SAIL_SENSITIVE_PATTERNS": "rules"})
+        self.assertIn(b"sample.txt", result.stdout)
+
+    def test_relative_message_path_is_resolved_before_changing_directory(self):
+        directory = self.repo / "nested"
+        directory.mkdir()
+        (directory / "draft").write_text(SECRET)
+        result = self.scan("message", "draft", cwd=directory, expected=False)
+        self.assertIn(b"proposed commit message", result.stdout)
 
     def test_messages_include_verbatim_comments_and_allow_markers(self):
         self.stage()

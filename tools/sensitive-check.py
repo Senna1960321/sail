@@ -168,7 +168,13 @@ class Guard:
 
 
 def main(args):
+    if len(args) == 2 and args[0] == "message":
+        args = ["message", str(Path(args[1]).absolute())]
     guard = Guard()
+    # Direct invocations from a subdirectory must inspect the whole
+    # repository too. Relative message and local-rule paths refer to the
+    # caller's directory and were resolved/read before changing it.
+    os.chdir(os.fsdecode(git("rev-parse", "--show-toplevel").rstrip(b"\n")))
     if args == ["index"]:
         guard.snapshot(True)
     elif args == ["tree"]:
