@@ -270,3 +270,108 @@ fn anonymous_sessions_are_also_pinned_for_every_cipher() {
         assert!(new_rx.decode(&mut reply).is_ok());
     }
 }
+
+/// Combined A-plan regression: immutable authenticated row snapshots
+/// survive reload, while a different same-name row cannot steal its peer.
+#[tokio::test]
+async fn authenticated_row_context_stays_with_the_cipher_peer_across_reload() {
+    let pool = crate::control::context::ContextPool::new(2);
+    let a =
+        crate::user::UserRef::unbound("alice").with_credential_context(pool.bind(|| "A").unwrap());
+    let b =
+        crate::user::UserRef::unbound("alice").with_credential_context(pool.bind(|| "B").unwrap());
+    assert_eq!(a, b); // Global name/quota equality remains unchanged.
+    let identity = vec![0x11; 16];
+    let old_key = vec![0x22; 16];
+    let new_key = vec![0x33; 16];
+    let server = Server::new(
+        Method::Aes128Gcm,
+        identity.clone(),
+        Some(
+            Users::new(vec![User {
+                name: Some(a),
+                psk: old_key.clone(),
+            }])
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = SocksAddr::Domain("echo.example".into(), 80);
+    let (mut old, mut old_rx) = client(Method::Aes128Gcm, &[identity.clone(), old_key]).unwrap();
+    let (mut new, mut new_rx) = client(Method::Aes128Gcm, &[identity, new_key.clone()]).unwrap();
+    let mut wire = [0; 2048];
+    peer.send_to(
+        &old.encode(&target, b"A").unwrap(),
+        socket.local_addr().unwrap(),
+    )
+    .await
+    .unwrap();
+    let (n, source) = socket.recv_from(&mut wire).await.unwrap();
+    let held = server.decode(source, &mut wire[..n]).unwrap();
+    assert_eq!(
+        held.user
+            .as_ref()
+            .unwrap()
+            .credential_context()
+            .unwrap()
+            .get::<&str>(),
+        Some(&"A")
+    );
+    let reloaded = server.with_users(Some(
+        Users::new(vec![User {
+            name: Some(b),
+            psk: new_key,
+        }])
+        .unwrap(),
+    ));
+    peer.send_to(
+        &new.encode(&target, b"B").unwrap(),
+        socket.local_addr().unwrap(),
+    )
+    .await
+    .unwrap();
+    let (n, same_source) = socket.recv_from(&mut wire).await.unwrap();
+    assert_eq!(source, same_source);
+    assert_eq!(
+        reloaded
+            .decode(source, &mut wire[..n])
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    // Existing authenticated session still uses A despite row removal.
+    let next = reloaded
+        .decode(source, &mut old.encode(&target, b"A again").unwrap())
+        .unwrap();
+    assert_eq!(
+        next.user
+            .as_ref()
+            .unwrap()
+            .credential_context()
+            .unwrap()
+            .get::<&str>(),
+        Some(&"A")
+    );
+    let mut reply = reloaded.encode(source, &target, b"late A").unwrap();
+    assert!(old_rx.decode(&mut reply).is_ok());
+    drop(held);
+    drop(next);
+    let received = reloaded
+        .decode(source, &mut new.encode(&target, b"B retry").unwrap())
+        .unwrap();
+    assert_eq!(
+        received
+            .user
+            .as_ref()
+            .unwrap()
+            .credential_context()
+            .unwrap()
+            .get::<&str>(),
+        Some(&"B")
+    );
+    let mut reply = reloaded.encode(source, &target, b"B reply").unwrap();
+    assert!(new_rx.decode(&mut reply).is_ok());
+}
