@@ -242,6 +242,13 @@ impl sail::embed::DatagramSend for AdmissionSend {
 }
 struct AdmissionEcho(Arc<AtomicUsize>);
 impl sail::embed::HostOutbound for AdmissionEcho {
+    fn stream<'a>(
+        &'a self,
+        _: &'a sail::embed::SessionInfo,
+        _: &'a sail::embed::Via,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<sail::embed::HostStream>> {
+        Box::pin(async { Err(std::io::ErrorKind::Unsupported.into()) })
+    }
     fn datagrams<'a>(
         &'a self,
         _: &'a sail::embed::SessionInfo,
