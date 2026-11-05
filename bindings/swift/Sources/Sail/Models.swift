@@ -149,6 +149,8 @@ public struct Routed: Decodable, Equatable, Sendable {
 /// at an interim pass: its closed record's totals are what it was counted.
 public struct ConnectionRecord: Decodable, Equatable, Sendable {
     public let id: UInt64
+    /// Root association within runMs for an additional UDP target.
+    public let parentId: UInt64?
     /// When the instance's run started, Unix ms: with `id`, it names the
     /// connection.
     public let runMs: UInt64

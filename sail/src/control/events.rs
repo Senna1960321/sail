@@ -243,6 +243,9 @@ pub enum Outcome {
 pub struct ConnectionRecord {
     /// As `RoutedConnection::id` and the instance's connections number it.
     pub id: u64,
+    /// The root UDP association for an additional target attempt, in
+    /// this record's run. None for an ordinary connection.
+    pub parent_id: Option<u64>,
     /// When the instance's run started: numbers start again with a run,
     /// so `(run, id)` names a connection across restarts.
     pub run: SystemTime,

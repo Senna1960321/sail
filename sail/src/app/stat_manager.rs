@@ -438,6 +438,7 @@ impl Counter {
         };
         let record = ConnectionRecord {
             id: self.id,
+            parent_id: sess.parent_id,
             run,
             seq: reported.seq,
             kind: match closed {
@@ -677,6 +678,12 @@ impl std::fmt::Debug for Number {
 impl Number {
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The same run that this number's records carry, when recording is
+    /// attached. Never inferred from the instance's state timestamps.
+    pub(crate) fn run(&self) -> Option<SystemTime> {
+        self.recorder.as_ref().map(|recorder| recorder.run)
     }
 
     /// Takes the number for the session `sess` is the copy counted of;
