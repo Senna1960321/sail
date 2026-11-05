@@ -286,6 +286,14 @@ pub type DispatchedDatagram = (
     Option<std::sync::Arc<super::stat_manager::Counter>>,
 );
 
+/// The NAT also needs to know when a hijacked DNS answer has finished.
+pub(crate) type TrackedDatagram = (
+    Box<dyn OutboundDatagram>,
+    Option<std::time::Duration>,
+    Option<std::sync::Arc<super::stat_manager::Counter>>,
+    Option<super::router::hijack_dns::PendingAnswers>,
+);
+
 /// A connection handed over to its outbound: what its relay keeps.
 struct Established {
     lhs: AnyStream,
@@ -1161,9 +1169,18 @@ impl Dispatcher {
     /// long the session lasts idle when a rule says.
     pub async fn dispatch_datagram(
         &self,
-        mut sess: Session,
+        sess: Session,
         sniffer: &mut dyn Sniffer,
     ) -> io::Result<DispatchedDatagram> {
+        let (datagram, idle, listed, _) = self.dispatch_datagram_tracked(sess, sniffer).await?;
+        Ok((datagram, idle, listed))
+    }
+
+    pub(crate) async fn dispatch_datagram_tracked(
+        &self,
+        mut sess: Session,
+        sniffer: &mut dyn Sniffer,
+    ) -> io::Result<TrackedDatagram> {
         // As a stream's: held until the session has its place, or none.
         let handshake = sess.handshake.take();
         if self.env.events.records_refuse() {
@@ -1176,19 +1193,19 @@ impl Dispatcher {
         drop(handshake);
         let place = entered
             .map_err(|()| io::Error::other("refused: inbound.max_connections sessions live"))?;
-        let (datagram, idle, listed) = self.dispatch_datagram_inner(sess, sniffer).await?;
+        let (datagram, idle, listed, pending) = self.dispatch_datagram_inner(sess, sniffer).await?;
         let datagram = match place {
             Some(place) => super::sessions::Held::wrap(datagram, place),
             None => datagram,
         };
-        Ok((datagram, idle, listed))
+        Ok((datagram, idle, listed, pending))
     }
 
     async fn dispatch_datagram_inner(
         &self,
         mut sess: Session,
         sniffer: &mut dyn Sniffer,
-    ) -> io::Result<DispatchedDatagram> {
+    ) -> io::Result<TrackedDatagram> {
         debug!(
             "dispatch proto={} in={} src={} dst={}",
             &sess.network, &sess.inbound_tag, &sess.source, &sess.destination
@@ -1217,7 +1234,7 @@ impl Dispatcher {
                     send: HealthcheckUdpSendHalf,
                 };
                 let d: Box<dyn OutboundDatagram> = Box::new(d);
-                return Ok((d, None, None));
+                return Ok((d, None, None, None));
             }
         }
 
@@ -1243,7 +1260,8 @@ impl Dispatcher {
                 self.unrouted(&sess, matched, RouteAction::HijackDns);
                 let udp_timeout = sess.route.udp_timeout;
                 let d = super::router::hijack_dns::Datagram::new(self.dns_client.clone(), sess);
-                return Ok((Box::new(d), udp_timeout, None));
+                let pending = d.pending();
+                return Ok((Box::new(d), udp_timeout, None, Some(pending)));
             }
             Routed::Drop => {
                 self.unrouted(&sess, matched, RouteAction::Drop);
@@ -1359,7 +1377,7 @@ impl Dispatcher {
                     );
                 }
 
-                Ok((d, sess.route.udp_timeout, Some(listed)))
+                Ok((d, sess.route.udp_timeout, Some(listed), None))
             }
             Err(e) => {
                 debug!(
