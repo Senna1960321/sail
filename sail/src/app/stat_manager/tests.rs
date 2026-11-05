@@ -934,7 +934,10 @@ fn recent_statistics_must_not_hold_authentication_rows() {
     drop(accounts);
     let recent = sm.recent();
     assert_eq!(recent.len(), 1);
-    assert_eq!(recent[0].sess.user.as_ref().unwrap().name(), "alice");
+    assert_eq!(
+        recent[0].sess.user.as_ref().unwrap().name().as_ref(),
+        "alice"
+    );
     assert!(
         rows.bind(|| 8_u64).is_some(),
         "UI history must not own a retired credential row"
