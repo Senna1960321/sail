@@ -1,6 +1,168 @@
 #[allow(unused_imports)] // Unused where features leave out every test.
 use crate::common;
 
+#[cfg(all(
+    feature = "outbound-direct",
+    feature = "outbound-socks",
+    feature = "outbound-select",
+    feature = "outbound-provider"
+))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_provider_urls_are_fetched_on_restart_and_reload() -> anyhow::Result<()> {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use sail::embed::{Config, Instance, Options, Threads};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut head = Vec::new();
+            let mut byte = [0];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                head.push(byte[0]);
+                assert!(head.len() < 8192);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let path = head.split_whitespace().nth(1).unwrap().to_string();
+            let etag = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("If-None-Match")
+                    .then(|| value.trim().to_string())
+            });
+            observed.lock().unwrap().push((path.clone(), etag.clone()));
+            let version = format!("\"{}\"", path);
+            let response = if etag.as_deref() == Some(version.as_str()) {
+                "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n".to_string()
+            } else {
+                let names: &[&str] = if path == "/old.yaml" {
+                    &["old-node"]
+                } else {
+                    &["new-node-a", "new-node-b"]
+                };
+                let mut body = "proxies:\n".to_string();
+                for name in names {
+                    body.push_str(&format!(
+                        "  - {{name: {}, type: socks5, server: 127.0.0.1, port: 12345}}\n",
+                        name
+                    ));
+                }
+                let userinfo = if path == "/old.yaml" {
+                    "Subscription-Userinfo: upload=1; download=2; total=100\r\n"
+                } else {
+                    ""
+                };
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: {}\r\n{}Content-Length: {}\r\n\r\n{}",
+                    version,
+                    userinfo,
+                    body.len(),
+                    body
+                )
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let config = |path: &str| {
+        Config::Json(
+            serde_json::json!({
+                "outbounds": [
+                    { "type": "direct", "tag": "direct" },
+                    { "type": "selector", "tag": "pick", "providers": "subscription" }
+                ],
+                "outbound_providers": [{
+                    "type": "remote", "tag": "subscription",
+                    "url": format!("http://{}{}", addr, path), "update_interval": "24h"
+                }]
+            })
+            .to_string(),
+        )
+    };
+
+    for reload in [false, true] {
+        let dir = common::TempDir::new("provider-url")?;
+        let options = || Options::new().threads(Threads::One).cache_dir(dir.path());
+        let instance = Instance::new(options())?;
+        requests.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(5), instance.start(config("/old.yaml"))).await??;
+        assert_eq!(instance.providers().await?[0].members, 1);
+        assert!(instance.providers().await?[0].subscription.is_some());
+        let instance = if reload {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                instance.reload(Some(config("/new.yaml"))),
+            )
+            .await??;
+            instance
+        } else {
+            instance.stop().await?;
+            let instance = Instance::new(options())?;
+            tokio::time::timeout(Duration::from_secs(5), instance.start(config("/new.yaml")))
+                .await??;
+            instance
+        };
+        // At a live reload, providers with no copy are fetched by the
+        // updater, which waits at least a second between runs. They may
+        // be empty meanwhile, but must never serve the previous source.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let members = instance
+                    .outbound("pick")
+                    .await?
+                    .unwrap()
+                    .group
+                    .unwrap()
+                    .members;
+                if members == ["new-node-a", "new-node-b"] {
+                    break anyhow::Ok(());
+                }
+                assert!(
+                    members.is_empty(),
+                    "reload={reload}: kept old nodes: {members:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        assert!(instance.providers().await?[0].subscription.is_none());
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                ("/old.yaml".to_string(), None),
+                ("/new.yaml".to_string(), None),
+            ]
+        );
+        instance.stop().await?;
+
+        // A valid same-source cache still avoids a fetch at startup and
+        // supplies its ETag for a later conditional update.
+        let cached = Instance::new(options())?;
+        tokio::time::timeout(Duration::from_secs(5), cached.start(config("/new.yaml"))).await??;
+        assert_eq!(cached.providers().await?[0].members, 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            cached.update_provider("subscription"),
+        )
+        .await??;
+        assert_eq!(
+            requests.lock().unwrap().last().unwrap(),
+            &("/new.yaml".to_string(), Some("\"/new.yaml\"".to_string()))
+        );
+        assert_eq!(cached.providers().await?[0].members, 2);
+        cached.stop().await?;
+    }
+    server.abort();
+    Ok(())
+}
+
 // A selector over the members of a local provider: traffic passes through
 // the one selected; one gone from the file leaves the selection to the
 // default until it is back; a reload keeps the members and the selection.

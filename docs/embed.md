@@ -366,6 +366,18 @@ asked of the new server, and the old server is asked nothing more. Also
 which close once their connections end. A TUN staying
 up across such a reload needs root and is not among sail's tests.
 
+Remote outbound provider caches belong to the full provider tag and the
+effective subscription URL, including the host's Sub-Store rewrite. A
+changed URL cannot reuse another source's nodes, ETag, update time or
+subscription usage information. Unchanged sources retain their caches
+and conditional requests. Source keys are hashed into bounded filenames.
+At reload, a new source with no cached copy starts empty while the
+provider updater fetches it.
+Legacy tag-only cache files are left in place but ignored because they
+cannot identify their source. The first start after upgrading downloads
+the subscription again; if the download fails, that provider stays empty
+until an update succeeds.
+
 ## A snapshot, then what follows
 
 To read a state and then follow it without a gap, **subscribe first, then

@@ -172,7 +172,10 @@ impl Providers {
         if let Some(previous) = previous {
             // What is gone is retired, and what was retired stays so.
             for gone in &previous.providers {
-                if !configs.contains(gone.config()) {
+                if !providers
+                    .iter()
+                    .any(|kept| Arc::ptr_eq(&kept.members(), &gone.members()))
+                {
                     gone.retire_all(&retired);
                 }
             }

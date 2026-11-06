@@ -115,7 +115,7 @@ http-client = ["url", "httparse"]
 rule-set = ["http-client", "regex", "miniz_oxide", "url", "ruzstd"]
 # Outbound providers, a sail extension: group members downloaded as remote
 # rule-sets are, and read as Mihomo reads a proxy-provider's.
-outbound-provider = ["config-clash", "rule-set"]
+outbound-provider = ["config-clash", "rule-set", "sha2"]
 
 # Outbounds
 outbound-direct = []
