@@ -273,8 +273,16 @@ A full reload:
 | group selections, pins | kept, for groups of the same tag |
 | delays measured | kept |
 | DNS client | rebuilt from the new `dns`. **Its cache starts empty** |
-| routing, rule-sets | rebuilt; rule-sets the configuration still names, and already downloaded, are not downloaded again |
+| routing, rule-sets | rebuilt; unchanged remote rule-sets keep their rules and refresh schedule. A changed source URL uses only its own cache or its explicit `initial_path`; without either, it is downloaded before the reload completes |
 | traffic counters | kept. Counters of inbounds and outbounds that are gone are dropped once nothing counts to them |
+
+Remote rule-set caches are keyed by a SHA-256 digest of the format,
+full tag and effective download URL, after tag substitution and the
+host's Sub-Store rewrite. Bodies, ETags and update times are kept apart for
+different sources. Legacy tag-only cache files have no source identity
+and are ignored; the first start after upgrading downloads them again
+(or uses an explicitly configured `initial_path`). The legacy files are
+left in place.
 
 **The inbounds.** `reload` returns a `ReloadReport`: each inbound of the
 configuration, in its order, then those it no longer has, with what

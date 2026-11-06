@@ -112,7 +112,7 @@ rule-process-name = ["regex"]
 # sing-box rule-sets: `route.rule_set`, source and binary.
 # The GET that remote rule-sets, outbound providers and fetch download with.
 http-client = ["url", "httparse"]
-rule-set = ["http-client", "regex", "miniz_oxide", "url", "ruzstd"]
+rule-set = ["http-client", "regex", "miniz_oxide", "url", "ruzstd", "sha2"]
 # Outbound providers, a sail extension: group members downloaded as remote
 # rule-sets are, and read as Mihomo reads a proxy-provider's.
 outbound-provider = ["config-clash", "rule-set"]

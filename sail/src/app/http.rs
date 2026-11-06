@@ -467,6 +467,7 @@ pub(crate) fn write_atomically(path: &std::path::Path, data: &[u8]) -> Result<()
 
 /// A tag as a file name: what could leave the directory, or trouble a
 /// file system, becomes `_`.
+#[cfg(any(feature = "outbound-provider", test))]
 pub(crate) fn file_name(tag: &str) -> String {
     let name: String = tag
         .chars()
