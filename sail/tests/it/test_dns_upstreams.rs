@@ -569,17 +569,24 @@ fn dot_cold_burst_through_anytls_keeps_connections_bounded() -> anyhow::Result<(
 /// its queries fail together and retry concurrently.
 #[tokio::test(flavor = "multi_thread")]
 async fn dot_concurrent_failed_queries_share_one_replacement_connection() {
-    concurrent_dot_retries_share_a_replacement(false).await;
+    concurrent_dot_retries_share_a_replacement(false, Duration::ZERO).await;
 }
 
 /// A sequential server retries a silent kept connection with a new attempt
 /// budget. All timed-out callers must share the replacement for that attempt.
 #[tokio::test(flavor = "multi_thread")]
 async fn dot_sequential_timed_out_queries_share_one_replacement_connection() {
-    concurrent_dot_retries_share_a_replacement(true).await;
+    concurrent_dot_retries_share_a_replacement(true, Duration::ZERO).await;
 }
 
-async fn concurrent_dot_retries_share_a_replacement(sequential: bool) {
+/// The default inner retry count must not spend the replacement's attempt
+/// inside the stale connection's remaining half-budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn dot_sequential_replacement_keeps_its_full_attempt_budget() {
+    concurrent_dot_retries_share_a_replacement(true, Duration::from_millis(2500)).await;
+}
+
+async fn concurrent_dot_retries_share_a_replacement(sequential: bool, delay: Duration) {
     use btls::pkey::PKey;
     use btls::ssl::{SslAcceptor, SslMethod};
     use btls::x509::X509;
@@ -637,6 +644,7 @@ async fn concurrent_dot_retries_share_a_replacement(sequential: bool) {
                 }
             } else {
                 let batch: Vec<_> = (0..BATCH).map(|_| receive(&mut tls)).collect();
+                std::thread::sleep(delay);
                 for query in batch.iter().rev() {
                     send(&mut tls, query);
                 }
@@ -1544,4 +1552,97 @@ mod doh {
             );
         }
     }
+}
+
+// A newly opened pipeline is healthy: all replies arrive within dns.timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn dot_live_pipeline_keeps_the_normal_dns_deadline() {
+    use btls::pkey::PKey;
+    use btls::ssl::{SslAcceptor, SslMethod};
+    use btls::x509::X509;
+    let cert = cert();
+    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    acceptor
+        .set_certificate(&X509::from_pem(cert.cert_pem.as_bytes()).unwrap())
+        .unwrap();
+    acceptor
+        .set_private_key(&PKey::private_key_from_pem(cert.key_pem.as_bytes()).unwrap())
+        .unwrap();
+    let acceptor = Arc::new(acceptor.build());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let quit = stop.clone();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        while !quit.load(Ordering::SeqCst) {
+            let (stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            workers.push(std::thread::spawn(move || {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+                let Ok(mut tls) = acceptor.accept(stream) else {
+                    return;
+                };
+                let mut answers = Vec::new();
+                loop {
+                    let mut len = [0; 2];
+                    if tls.read_exact(&mut len).is_err() {
+                        break;
+                    }
+                    let mut query = vec![0; u16::from_be_bytes(len) as usize];
+                    if tls.read_exact(&mut query).is_err() {
+                        break;
+                    }
+                    answers.push(answer(&query).unwrap());
+                }
+                std::thread::sleep(Duration::from_millis(1200));
+                for answer in answers {
+                    if tls.write_all(&(answer.len() as u16).to_be_bytes()).is_err() {
+                        break;
+                    }
+                    if tls.write_all(&answer).is_err() {
+                        break;
+                    }
+                }
+                let _ = tls.flush();
+                std::thread::sleep(Duration::from_millis(50));
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    let mut upstream = self::server("tls", port, None);
+    upstream["tag"] = "slow".into();
+    upstream["tls"]["certificate"] = cert.cert_pem.into();
+    let config = config::Config::from_json(
+        &serde_json::json!({"dns": {
+            "servers": [upstream], "timeout": "2s", "strategy": "ipv4_only"
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let client = DnsClient::new(&config.dns, Default::default(), &Default::default()).unwrap();
+    let hosts: Vec<_> = (0..8)
+        .map(|i| format!("slow-pipeline-{i}.example"))
+        .collect();
+    let answers = futures::future::join_all(hosts.iter().map(|host| lookup(&client, host))).await;
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    let passed = answers.iter().filter(|a| a.is_ok()).count();
+    assert_eq!(
+        passed,
+        hosts.len(),
+        "live DoT queries must retain the configured normal DNS deadline"
+    );
 }

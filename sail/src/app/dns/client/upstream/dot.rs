@@ -75,6 +75,9 @@ struct Pending {
 
 struct Shared {
     pending: HashMap<u16, Pending>,
+    // All queries in a batch share its origin: a fresh pipeline must not
+    // become an idle-connection probe merely because a sibling joined it.
+    probing: bool,
     // IDs are never reused on a connection. A late reply to a cancelled
     // query therefore cannot be mistaken for a new query with that ID.
     next_id: u32,
@@ -115,6 +118,7 @@ impl Connection {
     fn new(stream: AnyStream, permit: OwnedSemaphorePermit, write_timeout: Duration) -> Arc<Self> {
         let shared = Arc::new(Mutex::new(Shared {
             pending: HashMap::new(),
+            probing: false,
             next_id: 0,
             closed: false,
             used: Instant::now(),
@@ -184,7 +188,7 @@ impl Connection {
         })
     }
 
-    fn reserve(self: &Arc<Self>, request: &[u8]) -> Option<Query> {
+    fn reserve(self: &Arc<Self>, request: &[u8], kept: bool) -> Option<Query> {
         let mut state = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed
             || self.driver.is_finished()
@@ -192,6 +196,9 @@ impl Connection {
             || (state.pending.is_empty() && state.used.elapsed() >= IDLE_TIMEOUT)
         {
             return None;
+        }
+        if state.pending.is_empty() {
+            state.probing = kept;
         }
         let id = state.next_id as u16;
         state.next_id += 1;
@@ -209,6 +216,7 @@ impl Connection {
         framed.extend_from_slice(&request[2..]);
         Some(Query {
             connection: self.clone(),
+            probing: state.probing,
             id,
             request: Some(framed),
             response,
@@ -218,6 +226,7 @@ impl Connection {
 
 struct Query {
     connection: Arc<Connection>,
+    probing: bool,
     id: u16,
     request: Option<Vec<u8>>,
     response: oneshot::Receiver<Answer>,
@@ -290,8 +299,9 @@ impl Pool {
                 if let Some(failed) = failed {
                     state.retire(failed);
                 }
-                if let Some(query) = state.kept.as_ref().and_then(|c| c.reserve(request)) {
-                    return Ok((query, true));
+                if let Some(query) = state.kept.as_ref().and_then(|c| c.reserve(request, true)) {
+                    let probing = query.probing;
+                    return Ok((query, probing));
                 }
                 state.kept = None;
                 state.live.retain(|c| c.strong_count() != 0);
@@ -313,7 +323,7 @@ impl Pool {
             }
             let connection = Connection::new(stream, permit, client.timeout);
             let query = connection
-                .reserve(request)
+                .reserve(request, false)
                 .ok_or_else(|| anyhow!("DoT connection closed"))?;
             state.live.push(Arc::downgrade(&connection));
             state.kept = Some(connection);
@@ -358,10 +368,11 @@ impl DnsClient {
     ) -> Result<Vec<u8>> {
         let _slot = pool.queries.acquire().await?;
         let wait = kept_wait(self.reused_connection_timeout());
-        let (query, reused) = pool.query(self, upstream, addr, request, None).await?;
+        let (query, probing) = pool.query(self, upstream, addr, request, None).await?;
         // A sequential fresh attempt has its full outer budget. Another
         // waiter may already have opened its replacement; share that one.
-        if !reused || wait.is_none() {
+        // Every query joining a fresh pipeline keeps its normal deadline.
+        if !probing || wait.is_none() {
             return query.exchange().await;
         }
         let failed = Arc::downgrade(&query.connection);
