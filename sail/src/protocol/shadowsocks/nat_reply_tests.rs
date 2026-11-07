@@ -125,6 +125,14 @@ async fn queued_reply(finish: Finish, with_context: bool) {
                 .unwrap()
         })
         .await;
+    env.users.set_limit(
+        &env.users.bind("alice"),
+        crate::user::Limits {
+            max_connections: Some(1),
+            ..Default::default()
+        },
+    );
+    assert_eq!(env.users.bind("alice").limits().max_connections, Some(1));
     let bind_user = |key: &[u8]| match &env.admission {
         Some(admission) => admission
             .bind_credential(
@@ -206,6 +214,8 @@ async fn queued_reply(finish: Finish, with_context: bool) {
     // bounded channel. No Received/source token is saved for the assertion.
     let packet = bounded(queue.recv()).await.unwrap();
     assert_eq!(packet.data, b"old reply");
+    assert_eq!(env.users.bind("alice").live(), 1);
+    assert!(!env.users.bind("alice").admits_on("in", false));
     // Observe ownership without retaining a strong source/peer token.
     let peer = Arc::downgrade(&source.resource_lease.as_ref().unwrap().0);
     assert!(core.nat_manager.end_source("in", &source).await);
@@ -248,6 +258,7 @@ async fn queued_reply(finish: Finish, with_context: bool) {
     };
     assert!(core.stat_manager.connections().is_empty());
     assert_eq!(env.users.bind("alice").live(), 0);
+    assert!(env.users.bind("alice").admits_on("in", false));
     // Use a fresh packet for every rejection/retry: replay checks remain active.
     let mut replacement = new_tx.encode(&target, b"replacement").unwrap();
     assert!(
@@ -350,6 +361,7 @@ async fn queued_reply(finish: Finish, with_context: bool) {
         1,
         "the one-place cap was released by A and acquired once by B"
     );
+    assert!(!env.users.bind("alice").admits_on("in", false));
     let (entered, waiting) = oneshot::channel();
     let (release, resumed) = oneshot::channel();
     release.send(()).unwrap();
@@ -391,6 +403,15 @@ async fn queued_reply(finish: Finish, with_context: bool) {
             break envelope;
         }
     };
+    // A must remain frozen even after B's session hook and root record.
+    assert_eq!(
+        root_a
+            .context
+            .as_ref()
+            .and_then(|c| c.get::<&str>())
+            .copied(),
+        with_context.then_some("A")
+    );
     assert_ne!(root_a.record.id, root_b.record.id);
     assert_eq!(root_a.record.run, root_b.record.run);
     assert_eq!((root_a.record.up_total, root_a.record.down_total), (9, 9));
@@ -399,6 +420,7 @@ async fn queued_reply(finish: Finish, with_context: bool) {
     assert!(scope.is_empty());
     assert!(core.stat_manager.connections().is_empty());
     assert_eq!(env.users.bind("alice").live(), 0);
+    assert!(env.users.bind("alice").admits_on("in", false));
     assert!(
         records.try_next_envelope().is_none(),
         "no duplicate root close"
