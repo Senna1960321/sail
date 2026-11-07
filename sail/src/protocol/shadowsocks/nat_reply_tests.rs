@@ -63,7 +63,7 @@ async fn bounded<F: std::future::Future>(future: F) -> F::Output {
         .expect("event handshake timed out")
 }
 
-async fn queued_reply(finish: Finish) {
+async fn queued_reply(finish: Finish, with_context: bool) {
     let method = Method::Aes128Gcm;
     let identity = vec![0x11; 16];
     let old_key = vec![0x22; 16];
@@ -80,10 +80,44 @@ async fn queued_reply(finish: Finish) {
         .to_string(),
     )
     .unwrap();
+    let events = EventHub::with_records(16, Some(16));
+    let admission = if with_context {
+        use crate::app::inbound::admission::{Admission, HostHooks, HostHooksRef};
+        let rows = crate::control::context::ContextPool::new(8);
+        let sessions = crate::control::context::ContextPool::new(8);
+        let old_credential = encode_key(&old_key);
+        let hooks = HostHooks {
+            credential: Some(Box::new(move |row| {
+                let marker = if row.credential == old_credential {
+                    "A"
+                } else {
+                    "B"
+                };
+                rows.bind(|| marker).ok_or("rows full".into())
+            })),
+            bind: Some(Box::new(move |session| {
+                let row = session.user.as_ref().unwrap().credential_context().unwrap();
+                let marker = *row.get::<&'static str>().unwrap();
+                sessions
+                    .bind_with_credential(Some(row.clone()), || marker)
+                    .ok_or("sessions full".into())
+            })),
+            ..Default::default()
+        };
+        Admission::new(
+            &Default::default(),
+            events.clone(),
+            Some(&HostHooksRef(Arc::new(hooks))),
+        )
+    } else {
+        None
+    };
     let env = Arc::new(RuntimeEnv {
-        events: EventHub::with_records(16, Some(16)),
+        events,
+        admission,
         ..Default::default()
     });
+    let mut records = env.events.lossless_records().unwrap().reader().unwrap();
     let scope = env.scope.clone();
     let core = scope
         .enter(async {
@@ -91,7 +125,18 @@ async fn queued_reply(finish: Finish) {
                 .unwrap()
         })
         .await;
-    let alice = env.users.bind("alice");
+    let bind_user = |key: &[u8]| match &env.admission {
+        Some(admission) => admission
+            .bind_credential(
+                &env.users,
+                "shadowsocks",
+                "in",
+                Some("alice"),
+                &encode_key(key),
+            )
+            .unwrap(),
+        None => Some(env.users.bind("alice")),
+    };
     let server = Arc::new(
         udp::Server::new(
             method,
@@ -99,11 +144,11 @@ async fn queued_reply(finish: Finish) {
             Some(
                 Users::new(vec![
                     User {
-                        name: Some(alice.clone()),
+                        name: bind_user(&old_key),
                         psk: old_key.clone(),
                     },
                     User {
-                        name: Some(alice),
+                        name: bind_user(&new_key),
                         psk: new_key.clone(),
                     },
                 ])
@@ -133,6 +178,16 @@ async fn queued_reply(finish: Finish) {
     let mut wire = [0_u8; 4096];
     let (n, address) = bounded(inbound.recv_from(&mut wire)).await.unwrap();
     let received = server.decode(address, &mut wire[..n]).unwrap();
+    assert_eq!(
+        received
+            .user
+            .as_ref()
+            .unwrap()
+            .credential_context()
+            .and_then(|c| c.get::<&str>())
+            .copied(),
+        with_context.then_some("A")
+    );
     let data = wire[received.payload.clone()].to_vec();
     let destination = received.destination;
     let mut source = DatagramSource::new(address, None).with_user(received.user);
@@ -161,6 +216,28 @@ async fn queued_reply(finish: Finish) {
         "all NAT task copies of the source must be gone"
     );
     bounded(echo_task).await.unwrap();
+    let mut roots = 0;
+    while let Some(envelope) = records.try_next_envelope() {
+        if matches!(
+            envelope.record.kind,
+            crate::control::events::RecordKind::Closed(_)
+        ) {
+            assert_eq!(envelope.record.parent_id, None);
+            assert_eq!(
+                envelope
+                    .context
+                    .as_ref()
+                    .and_then(|c| c.get::<&str>())
+                    .copied(),
+                with_context.then_some("A")
+            );
+            roots += 1;
+        }
+    }
+    assert_eq!(
+        roots, 1,
+        "one NAT accounting root closes before the held reply is delivered"
+    );
     // Use a fresh packet for every rejection/retry: replay checks remain active.
     let mut replacement = new_tx.encode(&target, b"replacement").unwrap();
     assert!(
@@ -216,6 +293,16 @@ async fn queued_reply(finish: Finish) {
         .decode(address, &mut retry)
         .expect("replacement works after queue/delivery owner releases");
     assert_eq!(&retry[accepted.payload], b"retry after release");
+    assert_eq!(
+        accepted
+            .user
+            .as_ref()
+            .unwrap()
+            .credential_context()
+            .and_then(|c| c.get::<&str>())
+            .copied(),
+        with_context.then_some("B")
+    );
     let mut response = server.encode(address, &target, b"new reply").unwrap();
     let (_, body) = new_rx.decode(&mut response).unwrap();
     assert_eq!(&response[body], b"new reply");
@@ -223,17 +310,34 @@ async fn queued_reply(finish: Finish) {
 
 #[tokio::test]
 async fn a_nat_reply_pins_credentials_through_successful_delivery() {
-    queued_reply(Finish::Sent).await;
+    queued_reply(Finish::Sent, false).await;
 }
 #[tokio::test]
 async fn a_nat_reply_releases_credentials_after_send_error() {
-    queued_reply(Finish::Failed).await;
+    queued_reply(Finish::Failed, false).await;
 }
 #[tokio::test]
 async fn a_nat_reply_releases_credentials_after_cancelled_delivery() {
-    queued_reply(Finish::Cancelled).await;
+    queued_reply(Finish::Cancelled, false).await;
 }
 #[tokio::test]
 async fn a_nat_reply_releases_credentials_when_its_queue_is_dropped() {
-    queued_reply(Finish::QueueDropped).await;
+    queued_reply(Finish::QueueDropped, false).await;
+}
+
+#[tokio::test]
+async fn a_context_bound_nat_reply_pins_credentials_through_successful_delivery() {
+    queued_reply(Finish::Sent, true).await;
+}
+#[tokio::test]
+async fn a_context_bound_nat_reply_releases_credentials_after_send_error() {
+    queued_reply(Finish::Failed, true).await;
+}
+#[tokio::test]
+async fn a_context_bound_nat_reply_releases_credentials_after_cancelled_delivery() {
+    queued_reply(Finish::Cancelled, true).await;
+}
+#[tokio::test]
+async fn a_context_bound_nat_reply_releases_credentials_when_its_queue_is_dropped() {
+    queued_reply(Finish::QueueDropped, true).await;
 }
