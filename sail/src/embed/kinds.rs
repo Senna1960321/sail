@@ -996,7 +996,10 @@ pub trait HostOutbound: Send + Sync + 'static {
     ) -> BoxFuture<'a, io::Result<HostStream>>;
 
     /// Datagrams for the UDP session `session`; none unless the kind has
-    /// them.
+    /// them. The returned halves may retain `via.clone()` and
+    /// `session.clone()` to choose a next hop when sending a later target.
+    /// Keep routing policy in the session's frozen host context: `Via`
+    /// looks up the current outbound by tag, including after reload.
     fn datagrams<'a>(
         &'a self,
         session: &'a SessionInfo,
@@ -1148,6 +1151,14 @@ impl SessionInfo {
 /// used. What goes through them is the session's, counted once, as the
 /// session it carries: the tag is added to the session's chain, as a
 /// group adds its member.
+///
+/// Clones share the live, weak outbound lookup and DNS client; they do not
+/// freeze a handler table or keep the running outbound manager alive.
+/// Retain a cloned `SessionInfo` for the host's frozen policy/context and
+/// use `SessionInfo::with_destination` for each next-hop target. Cloning
+/// this handle creates no session, connection place or accounting record;
+/// it does not replace the inbound association's target admission checks.
+#[derive(Clone)]
 pub struct Via {
     outbounds: crate::net::dial::Outbounds,
     dns: SyncDnsClient,

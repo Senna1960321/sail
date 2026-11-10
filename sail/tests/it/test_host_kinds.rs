@@ -1035,3 +1035,346 @@ async fn a_host_knows_its_sessions_by_their_numbers_and_domains() {
     drop(mux);
     instance.stop().await.unwrap();
 }
+
+/// A UDP host retains the callback's handles, but does not dial until
+/// send_to. Policy stays frozen; Via's handler lookup stays live.
+mod retained_via {
+    use super::*;
+    use sail::embed::RecordContext;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type Packet = (Vec<u8>, Address);
+    struct Packets(mpsc::Receiver<Packet>);
+    struct Answers(mpsc::Sender<Packet>, Vec<u8>);
+
+    impl DatagramRecv for Packets {
+        fn recv_from<'a>(
+            &'a mut self,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, io::Result<(usize, Address)>> {
+            Box::pin(async move {
+                let (data, from) = self.0.recv().await.ok_or(io::ErrorKind::UnexpectedEof)?;
+                buf[..data.len()].copy_from_slice(&data);
+                Ok((data.len(), from))
+            })
+        }
+    }
+    impl DatagramSend for Answers {
+        fn send_to<'a>(
+            &'a mut self,
+            data: &'a [u8],
+            to: &'a Address,
+        ) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(async move {
+                let mut reply = self.1.clone();
+                reply.extend_from_slice(data);
+                self.0
+                    .send((reply, to.clone()))
+                    .await
+                    .map_err(|_| io::ErrorKind::BrokenPipe.into())
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Policy {
+        version: u64,
+        routes: HashMap<Address, String>,
+    }
+    struct Seen {
+        tag: String,
+        generation: u64,
+        session: SessionInfo,
+    }
+    #[derive(Default)]
+    struct State {
+        seen: Mutex<Vec<Seen>>,
+        // Retained independently of both returned halves, even through stop.
+        retained: Mutex<Option<(Via, SessionInfo)>>,
+        halves: AtomicUsize,
+    }
+    struct Half(Arc<State>);
+    impl Drop for Half {
+        fn drop(&mut self) {
+            self.0.halves.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    struct Deferred(Arc<State>);
+    struct DeferredRecv(Packets, Half);
+    struct DeferredSend {
+        via: Via,
+        session: SessionInfo,
+        answers: Answers,
+        half: Half,
+    }
+    impl DatagramRecv for DeferredRecv {
+        fn recv_from<'a>(
+            &'a mut self,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, io::Result<(usize, Address)>> {
+            let _ = &self.1;
+            self.0.recv_from(buf)
+        }
+    }
+    impl DatagramSend for DeferredSend {
+        fn send_to<'a>(
+            &'a mut self,
+            data: &'a [u8],
+            to: &'a Address,
+        ) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(async move {
+                let _ = &self.half;
+                let policy = self
+                    .session
+                    .record_context
+                    .as_ref()
+                    .unwrap()
+                    .get::<Policy>()
+                    .unwrap();
+                let tag = policy
+                    .routes
+                    .get(to)
+                    .expect("frozen route for accepted target");
+                let next = self.session.clone().with_destination(to.clone());
+                let mut hop = self.via.datagrams(tag, &next).await?;
+                hop.send.send_to(data, to).await?;
+                let mut buf = [0; 512];
+                let (n, from) = hop.recv.recv_from(&mut buf).await?;
+                self.answers.send_to(&buf[..n], &from).await
+            })
+        }
+    }
+    impl HostOutbound for Deferred {
+        fn stream<'a>(
+            &'a self,
+            _: &'a SessionInfo,
+            _: &'a Via,
+        ) -> BoxFuture<'a, io::Result<HostStream>> {
+            Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+        }
+        fn datagrams<'a>(
+            &'a self,
+            session: &'a SessionInfo,
+            via: &'a Via,
+        ) -> BoxFuture<'a, io::Result<Datagrams>> {
+            let via = via.clone();
+            let session = session.clone();
+            let state = self.0.clone();
+            Box::pin(async move {
+                *state.retained.lock().unwrap() = Some((via.clone(), session.clone()));
+                state.halves.fetch_add(2, Ordering::SeqCst);
+                let (tx, rx) = mpsc::channel(4);
+                Ok(Datagrams {
+                    recv: Box::new(DeferredRecv(Packets(rx), Half(state.clone()))),
+                    send: Box::new(DeferredSend {
+                        via,
+                        session,
+                        answers: Answers(tx, Vec::new()),
+                        half: Half(state),
+                    }),
+                })
+            })
+        }
+    }
+    struct Leaf(Arc<State>, String, u64);
+    impl HostOutbound for Leaf {
+        fn stream<'a>(
+            &'a self,
+            _: &'a SessionInfo,
+            _: &'a Via,
+        ) -> BoxFuture<'a, io::Result<HostStream>> {
+            Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+        }
+        fn datagrams<'a>(
+            &'a self,
+            session: &'a SessionInfo,
+            _: &'a Via,
+        ) -> BoxFuture<'a, io::Result<Datagrams>> {
+            self.0.seen.lock().unwrap().push(Seen {
+                tag: self.1.clone(),
+                generation: self.2,
+                session: session.clone(),
+            });
+            let marker = format!("{}:{}:", self.1, self.2).into_bytes();
+            Box::pin(async move {
+                let (tx, rx) = mpsc::channel(1);
+                Ok(Datagrams {
+                    recv: Box::new(Packets(rx)),
+                    send: Box::new(Answers(tx, marker)),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloned_via_defers_udp_dials_with_frozen_policy_and_live_lookup() {
+        let state = Arc::new(State::default());
+        let a = Address::Domain("one.example".into(), 53);
+        let b = Address::Domain("two.example".into(), 54);
+        let policy = Arc::new(Mutex::new(Policy {
+            version: 7,
+            routes: HashMap::from([(a.clone(), "a".into()), (b.clone(), "b".into())]),
+        }));
+        let capture = policy.clone();
+        let deferred = state.clone();
+        let leaf = state.clone();
+        let instance = Instance::new(
+            Options::new()
+                .threads(Threads::Workers(2, 2 << 20))
+                .settings_json(r#"{"set":["inbound.max_connections=1"]}"#)
+                .unwrap()
+                .connection_records_lossless(8)
+                .record_context(2, move |_| capture.lock().unwrap().clone())
+                .unwrap()
+                .outbound_kind("deferred-test", move |_| {
+                    Ok(Arc::new(Deferred(deferred.clone())))
+                })
+                .unwrap()
+                .outbound_kind("leaf-test", move |cx| {
+                    Ok(Arc::new(Leaf(
+                        leaf.clone(),
+                        cx.tag.into(),
+                        cx.options["generation"].as_u64().unwrap(),
+                    )))
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let port = common::free_port();
+        let config = |generation| {
+            Config::Json(serde_json::json!({
+            "inbounds":[{"type":"socks", "tag":"in", "listen":"127.0.0.1", "listen_port":port,
+                "users":[{"username":"alice", "password":"test-password"}]}],
+            "outbounds":[{"type":"deferred-test","tag":"deferred"},
+                {"type":"leaf-test","tag":"a","generation":generation},
+                {"type":"leaf-test","tag":"b","generation":generation}],
+            "route":{"final":"deferred"},
+            "user_limits":{"alice":{"max_connections":1}}
+        }).to_string())
+        };
+        let mut records = instance.connection_records().unwrap();
+        instance.start(config(1)).await.unwrap();
+        let submit = || {
+            let (tx, rx) = mpsc::channel(4);
+            let (back, answers) = mpsc::channel(4);
+            (
+                tx,
+                answers,
+                Datagrams {
+                    recv: Box::new(Packets(rx)),
+                    send: Box::new(Answers(back, Vec::new())),
+                },
+            )
+        };
+        let (send, mut answers, datagrams) = submit();
+        let root = instance
+            .sessions("in")
+            .unwrap()
+            .udp(
+                NewSession::new(a.clone()).user(instance.user("alice").unwrap()),
+                datagrams,
+            )
+            .await
+            .unwrap();
+        async fn exchange(
+            send: &mpsc::Sender<Packet>,
+            answers: &mut mpsc::Receiver<Packet>,
+            to: &Address,
+            expected: &[u8],
+        ) {
+            send.send((b"ping".to_vec(), to.clone())).await.unwrap();
+            let (reply, from) = tokio::time::timeout(Duration::from_secs(5), answers.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply, expected);
+            assert_eq!(&from, to);
+        }
+        exchange(&send, &mut answers, &a, b"a:1:ping").await;
+        let (run, binding): (_, RecordContext) = {
+            let seen = state.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            (
+                seen[0].session.run.unwrap(),
+                seen[0].session.record_context.clone().unwrap(),
+            )
+        };
+        // Change the host's current policy, then replace handlers. The
+        // old association must keep version7/tags a,b but use generation2.
+        *policy.lock().unwrap() = Policy {
+            version: 99,
+            routes: HashMap::new(),
+        };
+        instance.reload(Some(config(2))).await.unwrap();
+        exchange(&send, &mut answers, &b, b"b:2:ping").await;
+        {
+            let seen = state.seen.lock().unwrap();
+            assert_eq!(
+                seen.iter()
+                    .map(|s| (s.tag.as_str(), s.generation))
+                    .collect::<Vec<_>>(),
+                [("a", 1), ("b", 2)]
+            );
+            for s in seen.iter() {
+                assert_eq!(s.session.id, root);
+                assert_eq!(s.session.run, Some(run));
+                assert_eq!(s.session.parent_id, None);
+                assert_eq!(s.session.record_context.as_ref(), Some(&binding));
+                assert_eq!(
+                    s.session
+                        .record_context
+                        .as_ref()
+                        .unwrap()
+                        .get::<Policy>()
+                        .unwrap()
+                        .version,
+                    7
+                );
+            }
+        }
+        let live = instance.connections().await.unwrap();
+        assert_eq!(live.len(), 1, "Via dials add no counted connection/place");
+        assert_eq!(live[0].id, root);
+        assert_eq!((live[0].upload, live[0].download), (8, 16));
+        drop(send);
+        wait_until("both deferred halves dropped", || {
+            state.halves.load(Ordering::SeqCst) == 0
+        })
+        .await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+            .await
+            .unwrap();
+        assert_eq!((closed.record.id, closed.record.run), (root, run));
+        assert_eq!(closed.record.parent_id, None);
+        assert_eq!((closed.record.up_total, closed.record.down_total), (8, 16));
+        assert!(
+            records.try_next().is_none(),
+            "no duplicate records from Via"
+        );
+        // Both core/user permits are reusable, despite retained Via/views.
+        *policy.lock().unwrap() = binding.get::<Policy>().unwrap().clone();
+        let (next_send, mut next_answers, next_datagrams) = submit();
+        instance
+            .sessions("in")
+            .unwrap()
+            .udp(
+                NewSession::new(a.clone()).user(instance.user("alice").unwrap()),
+                next_datagrams,
+            )
+            .await
+            .unwrap();
+        exchange(&next_send, &mut next_answers, &a, b"a:2:ping").await;
+        tokio::time::timeout(Duration::from_secs(5), instance.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.halves.load(Ordering::SeqCst), 0);
+        let (via, info) = state.retained.lock().unwrap().take().unwrap();
+        drop(instance);
+        assert_eq!(
+            via.datagrams("a", &info).await.err().unwrap().kind(),
+            io::ErrorKind::NotFound,
+            "retained clone does not own the running outbound manager"
+        );
+    }
+}
