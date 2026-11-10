@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use tokio::time::Instant;
 
 use crate::{
@@ -23,14 +23,12 @@ pub async fn tcp(
     let mut stream = handler.stream()?.handle(&sess, None, stream).await?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     stream.write_all(b"PING").await?;
-    let mut buf = Vec::with_capacity(4);
-    let n = stream.read_buf(&mut buf).await?;
-    if n == 0 {
-        Err(anyhow!(
-            "EOF during TCP health check for [{}]",
-            handler.tag()
-        ))
-    } else if buf == b"PONG" {
+    let mut buf = [0u8; 4];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .with_context(|| format!("reading TCP health check response from [{}]", handler.tag()))?;
+    if &buf == b"PONG" {
         Ok(Instant::now().duration_since(start))
     } else {
         Err(anyhow!(
@@ -486,6 +484,124 @@ fn body_length(head: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The public health-check utility uses the normal redirect outbound
+    /// against a loopback server. TCP replies are deliberately fragmented;
+    /// UDP stays healthy so that only the TCP outcome is under test.
+    #[cfg(feature = "outbound-redirect")]
+    async fn tcp_reply(chunks: Vec<Vec<u8>>) -> anyhow::Result<Duration> {
+        tcp_reply_with_stall(chunks, false).await
+    }
+
+    #[cfg(feature = "outbound-redirect")]
+    #[allow(clippy::disallowed_methods)] // The test owns its loopback servers.
+    async fn tcp_reply_with_stall(chunks: Vec<Vec<u8>>, stall: bool) -> anyhow::Result<Duration> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let udp = tokio::net::UdpSocket::bind(("127.0.0.1", port)).await?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"PING");
+            for (i, chunk) in chunks.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if stream.write_all(chunk).await.is_err() {
+                    return;
+                }
+            }
+            if stall {
+                std::future::pending::<()>().await;
+            }
+        });
+        let udp_server = tokio::spawn(async move {
+            let mut request = [0; 4];
+            let (n, from) = udp.recv_from(&mut request).await.unwrap();
+            assert_eq!(&request[..n], b"PING");
+            udp.send_to(b"PONG", from).await.unwrap();
+        });
+        let config = crate::config::Config::from_json(&format!(
+            r#"{{ "outbounds": [{{ "type": "redirect", "tag": "probe", "server": "127.0.0.1", "server_port": {port} }}] }}"#,
+        ))?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::util::health_check_outbound(
+                "probe",
+                &config,
+                Some(Duration::from_millis(500)),
+                &Default::default(),
+            ),
+        )
+        .await;
+        if stall {
+            server.abort();
+        } else {
+            tokio::time::timeout(Duration::from_secs(1), server).await??;
+        }
+        tokio::time::timeout(Duration::from_secs(1), udp_server).await??;
+        let (tcp, udp) = result??;
+        assert!(udp.is_ok(), "the UDP control failed: {udp:?}");
+        tcp
+    }
+
+    #[cfg(feature = "outbound-redirect")]
+    #[tokio::test]
+    async fn tcp_healthcheck_accepts_a_whole_reply() {
+        tcp_reply(vec![b"PONG".to_vec()]).await.unwrap();
+    }
+
+    #[cfg(feature = "outbound-redirect")]
+    #[tokio::test]
+    async fn tcp_healthcheck_accepts_every_fragment_boundary() {
+        for split in 1..4 {
+            let reply = b"PONG";
+            let result = tcp_reply(vec![reply[..split].to_vec(), reply[split..].to_vec()]).await;
+            assert!(result.is_ok(), "split at {split}: {result:?}");
+        }
+    }
+
+    #[cfg(feature = "outbound-redirect")]
+    #[tokio::test]
+    async fn tcp_healthcheck_accepts_a_byte_at_a_time() {
+        tcp_reply(b"PONG".iter().map(|b| vec![*b]).collect())
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "outbound-redirect")]
+    #[tokio::test]
+    async fn tcp_healthcheck_rejects_eof_before_a_complete_reply() {
+        for prefix in [b"".as_slice(), b"P", b"PO", b"PON"] {
+            assert!(tcp_reply(vec![prefix.to_vec()]).await.is_err());
+        }
+    }
+
+    #[cfg(feature = "outbound-redirect")]
+    #[tokio::test]
+    async fn tcp_healthcheck_obeys_the_caller_timeout_after_a_partial_reply() {
+        let start = Instant::now();
+        let result = tcp_reply_with_stall(vec![b"P".to_vec()], true).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some());
+        assert!(start.elapsed() >= Duration::from_millis(450));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "outbound-redirect")]
+    #[tokio::test]
+    async fn tcp_healthcheck_rejects_wrong_replies() {
+        assert!(tcp_reply(vec![b"PING".to_vec()]).await.is_err());
+        assert!(tcp_reply(vec![b"PO".to_vec(), b"NO".to_vec()])
+            .await
+            .is_err());
+    }
 
     #[test]
     fn a_body_s_length_is_read_where_the_connection_can_go_on() {
