@@ -1092,6 +1092,7 @@ mod retained_via {
         // Retained independently of both returned halves, even through stop.
         retained: Mutex<Option<(Via, SessionInfo)>>,
         halves: AtomicUsize,
+        end: tokio::sync::Notify,
     }
     struct Half(Arc<State>);
     impl Drop for Half {
@@ -1112,8 +1113,13 @@ mod retained_via {
             &'a mut self,
             buf: &'a mut [u8],
         ) -> BoxFuture<'a, io::Result<(usize, Address)>> {
-            let _ = &self.1;
-            self.0.recv_from(buf)
+            let state = self.1 .0.clone();
+            Box::pin(async move {
+                tokio::select! {
+                    result = self.0.recv_from(buf) => result,
+                    _ = state.end.notified() => Err(io::ErrorKind::UnexpectedEof.into()),
+                }
+            })
         }
     }
     impl DatagramSend for DeferredSend {
@@ -1337,6 +1343,10 @@ mod retained_via {
         assert_eq!(live[0].id, root);
         assert_eq!((live[0].upload, live[0].download), (8, 16));
         drop(send);
+        // Inbound EOF alone leaves an ordinary UDP NAT until its idle
+        // cleanup. End the host outbound explicitly, without waiting on
+        // that timer, while the cloned Via and views remain retained.
+        state.end.notify_one();
         wait_until("both deferred halves dropped", || {
             state.halves.load(Ordering::SeqCst) == 0
         })
