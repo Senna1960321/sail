@@ -1025,6 +1025,20 @@ impl DnsClient {
                         }
                         Err(e) => {
                             debug!("{} failed: {}", server, e);
+                            // A stale-connection probe ends this sequential
+                            // attempt. Let its caller give the replacement a
+                            // full budget instead of retrying inside the time
+                            // the probe left over.
+                            if upstream::ATTEMPT
+                                .try_with(|attempt| {
+                                    attempt
+                                        .kept_timed_out
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                })
+                                .unwrap_or(false)
+                            {
+                                return Err(e);
+                            }
                             last_err = Some(e);
                         }
                     }

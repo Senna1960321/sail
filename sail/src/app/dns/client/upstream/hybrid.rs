@@ -124,21 +124,31 @@ impl DnsClient {
         addr: SocketAddr,
         request: &[u8],
     ) -> Result<Vec<u8>> {
+        // A sequential retry follows a failed kept-protocol probe. Give
+        // HTTP/2 the complete new attempt without probing HTTP/3 again.
+        let Some(wait) = super::kept_wait(self.reused_connection_timeout()) else {
+            return self.exchange_doh(upstream, &hybrid.h2, addr, request).await;
+        };
         match hybrid.choice() {
             Choice::H2(_) => self.exchange_doh(upstream, &hybrid.h2, addr, request).await,
             Choice::H3 => {
                 let generation = hybrid.generation();
-                // Half the query's time, the rest left for HTTP/2.
-                let h3 = timeout(
-                    self.reused_connection_timeout(),
+                // Half this member's attempt, or half the normal query's
+                // time outside a sequential server, left for HTTP/2.
+                let probed = timeout(
+                    wait,
                     self.exchange_quic(upstream, &hybrid.h3, addr, request),
                 )
-                .await
-                .unwrap_or_else(|_| Err(anyhow!("timed out")));
+                .await;
+                let timed_out = probed.is_err();
+                let h3 = probed.unwrap_or_else(|_| Err(anyhow!("timed out")));
                 if h3.is_ok() {
                     return h3;
                 }
                 hybrid.settle(upstream.as_ref(), &h3, generation);
+                if timed_out && super::kept_timed_out() {
+                    return h3;
+                }
                 self.exchange_doh(upstream, &hybrid.h2, addr, request).await
             }
             Choice::Unknown => self.exchange_both(upstream, hybrid, addr, request).await,
@@ -179,7 +189,12 @@ impl DnsClient {
                     Ok(response) => return Ok(response),
                     Err(e) => {
                         debug!("{}: over HTTP/2: {:#}", upstream, e);
-                        if h3_done {
+                        // DoH can ask for a fresh sequential attempt while
+                        // the background H3 probe is still pending.
+                        let retry = super::ATTEMPT
+                            .try_with(|attempt| attempt.kept_timed_out.load(Ordering::Relaxed))
+                            .unwrap_or(false);
+                        if h3_done || retry {
                             return Err(e);
                         }
                         h2_done = Some(e);
