@@ -16,7 +16,7 @@
 use portable_atomic::AtomicU64;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -44,16 +44,23 @@ pub(super) enum Cached {
 }
 
 pub(super) struct Answers {
-    entries: Mutex<LruCache<AnswerKey, Kept>>,
+    state: Mutex<State>,
     disable_expire: bool,
     optimistic: Option<Duration>,
     /// The cache file, when it keeps DNS answers.
     file: Option<Arc<CacheFile>>,
-    /// Questions being asked again in the background: one at a time each.
-    refreshing: Mutex<HashSet<AnswerKey>>,
     hits: AtomicU64,
     stale_hits: AtomicU64,
     misses: AtomicU64,
+}
+
+/// The generation, writes and refresh ownership change together on a flush.
+struct State {
+    entries: LruCache<AnswerKey, Kept>,
+    generation: u64,
+    refreshing: HashSet<AnswerKey>,
+    /// A queued disk clear must commit before old disk answers can be read.
+    file_cleared: Option<Arc<AtomicBool>>,
 }
 
 /// What the cache holds and how it served, since the DNS client was built.
@@ -81,11 +88,15 @@ impl Answers {
             file.prune_dns(optimistic.unwrap_or_default());
         }
         Answers {
-            entries: Mutex::new(LruCache::new(capacity)),
+            state: Mutex::new(State {
+                entries: LruCache::new(capacity),
+                generation: 0,
+                refreshing: HashSet::new(),
+                file_cleared: None,
+            }),
             disable_expire,
             optimistic,
             file,
-            refreshing: Default::default(),
             hits: Default::default(),
             stale_hits: Default::default(),
             misses: Default::default(),
@@ -95,13 +106,19 @@ impl Answers {
     /// The answer kept for `key`, with `id`: in memory, or else in the
     /// cache file.
     pub(super) fn get(&self, key: &AnswerKey, id: u16) -> Cached {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if !entries.contains(key) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.entries.contains(key)
+            && state
+                .file_cleared
+                .as_ref()
+                .is_none_or(|done| done.load(Ordering::Acquire))
+        {
             if let Some(kept) = self.load(key) {
-                entries.put(key.clone(), kept);
+                state.entries.put(key.clone(), kept);
             }
         }
-        let Some((bytes, expires)) = entries.get(key) else {
+        let generation = state.generation;
+        let Some((bytes, expires)) = state.entries.get(key) else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return Cached::Missing;
         };
@@ -116,19 +133,24 @@ impl Answers {
         {
             (Some(1), true)
         } else {
-            entries.pop(key);
+            state.entries.pop(key);
             self.misses.fetch_add(1, Ordering::Relaxed);
             return Cached::Missing;
         };
         let bytes = bytes.clone();
-        drop(entries);
+        drop(state);
         // Kept only once it was written: one that does not read again is
         // forgotten, and missed.
         let Ok(mut message) = Message::from_vec(&bytes) else {
-            self.entries
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pop(key);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation == generation
+                && state
+                    .entries
+                    .peek(key)
+                    .is_some_and(|(kept, _)| Arc::ptr_eq(kept, &bytes))
+            {
+                state.entries.pop(key);
+            }
             self.misses.fetch_add(1, Ordering::Relaxed);
             return Cached::Missing;
         };
@@ -160,66 +182,73 @@ impl Answers {
         Some((bytes.into(), expires))
     }
 
-    /// Keeps `message` for `ttl` seconds; not at all for none.
-    pub(super) fn put(&self, key: AnswerKey, message: &Message, ttl: u32) {
+    /// Captured before looking up or asking for an answer. A flush revokes it.
+    pub(super) fn generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    }
+
+    /// Keeps `message` for `ttl` seconds, only if no flush followed its lookup.
+    pub(super) fn put(&self, key: AnswerKey, message: &Message, ttl: u32, generation: u64) {
         if ttl == 0 {
             return;
         }
         let Ok(bytes) = message.to_vec() else {
             return;
         };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.generation != generation {
+            return;
+        }
         let life = Duration::from_secs(ttl.into());
+        // The queue order and in-memory write are serialized with clear().
         if let Some(file) = &self.file {
             file.store_dns(file_key(&key), bytes.clone(), SystemTime::now() + life);
         }
         let expires = Instant::now() + life;
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .put(key, (bytes.into(), expires));
+        state.entries.put(key, (bytes.into(), expires));
     }
 
     /// Whether `key` may be asked again in the background now: not while
     /// it already is. [`Answers::refreshed`] ends it.
-    pub(super) fn start_refresh(&self, key: &AnswerKey) -> bool {
-        self.refreshing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone())
+    pub(super) fn start_refresh(&self, key: &AnswerKey, generation: u64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.generation == generation && state.refreshing.insert(key.clone())
     }
 
     /// How many questions are being asked again in the background now.
     #[cfg(test)]
     pub(super) fn refreshing(&self) -> usize {
-        self.refreshing
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .refreshing
             .len()
     }
 
-    pub(super) fn refreshed(&self, key: &AnswerKey) {
-        self.refreshing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+    pub(super) fn refreshed(&self, key: &AnswerKey, generation: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.generation == generation {
+            state.refreshing.remove(key);
+        }
     }
 
     /// Forgets every answer, in the cache file too.
     pub(super) fn clear(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        if let Some(file) = &self.file {
-            file.clear_dns();
-        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        state.entries.clear();
+        state.refreshing.clear();
+        state.file_cleared = self.file.as_ref().map(|file| file.clear_dns());
     }
 
     pub(super) fn stats(&self) -> CacheStats {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         CacheStats {
-            entries: entries.len(),
-            capacity: entries.cap().get(),
+            entries: state.entries.len(),
+            capacity: state.entries.cap().get(),
             hits: self.hits.load(Ordering::Relaxed),
             stale_hits: self.stale_hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -331,8 +360,8 @@ mod tests {
     }
 
     fn age(answers: &Answers, key: &AnswerKey, by: Duration) {
-        let mut entries = answers.entries.lock().unwrap();
-        let (_, expires) = entries.get_mut(key).unwrap();
+        let mut entries = answers.state.lock().unwrap();
+        let (_, expires) = entries.entries.get_mut(key).unwrap();
         *expires -= by;
     }
 
@@ -340,7 +369,7 @@ mod tests {
     fn an_answer_is_given_until_it_expires_with_what_is_left_of_its_ttl() {
         let answers = cache(false, None);
         let k = key("a");
-        answers.put(k.clone(), &answer(&[60]), 60);
+        answers.put(k.clone(), &answer(&[60]), 60, answers.generation());
         age(&answers, &k, Duration::from_secs(20));
         let Cached::Fresh(m) = answers.get(&k, 9) else {
             panic!("fresh")
@@ -351,7 +380,7 @@ mod tests {
         assert!(matches!(answers.get(&k, 9), Cached::Missing));
         // Gone for good.
         assert!(matches!(answers.get(&k, 9), Cached::Missing));
-        answers.put(k.clone(), &answer(&[]), 0);
+        answers.put(k.clone(), &answer(&[]), 0, answers.generation());
         assert!(matches!(answers.get(&k, 9), Cached::Missing));
         assert_eq!(
             answers.stats(),
@@ -371,10 +400,10 @@ mod tests {
         let answers = cache(false, None);
         let k = key("a");
         let sent = answer(&[60, 300]);
-        answers.put(k.clone(), &sent, 60);
+        answers.put(k.clone(), &sent, 60, answers.generation());
         {
-            let entries = answers.entries.lock().unwrap();
-            let (bytes, _) = entries.peek(&k).unwrap();
+            let entries = answers.state.lock().unwrap();
+            let (bytes, _) = entries.entries.peek(&k).unwrap();
             assert_eq!(&bytes[..], &sent.to_vec().unwrap()[..]);
         }
         // Each hit has its own id and TTL; the bytes kept stay as sent.
@@ -390,9 +419,9 @@ mod tests {
         assert_eq!(second.id(), 5);
         assert!(second.answers().iter().all(|r| (29..=30).contains(&r.ttl)));
         assert_eq!(second.answers().len(), 2);
-        let entries = answers.entries.lock().unwrap();
+        let entries = answers.state.lock().unwrap();
         assert_eq!(
-            &entries.peek(&k).unwrap().0[..],
+            &entries.entries.peek(&k).unwrap().0[..],
             &sent.to_vec().unwrap()[..]
         );
     }
@@ -401,7 +430,7 @@ mod tests {
     fn bytes_that_do_not_read_are_missed_and_forgotten() {
         let answers = cache(false, None);
         let k = key("a");
-        answers.entries.lock().unwrap().put(
+        answers.state.lock().unwrap().entries.put(
             k.clone(),
             (
                 Arc::from(&[1u8, 2, 3][..]),
@@ -409,7 +438,7 @@ mod tests {
             ),
         );
         assert!(matches!(answers.get(&k, 1), Cached::Missing));
-        assert!(!answers.entries.lock().unwrap().contains(&k));
+        assert!(!answers.state.lock().unwrap().entries.contains(&k));
         assert_eq!(answers.stats().misses, 1);
         assert_eq!(answers.stats().hits, 0);
     }
@@ -418,16 +447,16 @@ mod tests {
     fn optimistic_gives_an_expired_answer_within_its_timeout() {
         let answers = cache(false, Some(Duration::from_secs(3600)));
         let k = key("a");
-        answers.put(k.clone(), &answer(&[60]), 60);
+        answers.put(k.clone(), &answer(&[60]), 60, answers.generation());
         age(&answers, &k, Duration::from_secs(120));
         let Cached::Stale(m) = answers.get(&k, 1) else {
             panic!("stale")
         };
         assert_eq!(m.answers()[0].ttl, 1);
-        assert!(answers.start_refresh(&k));
-        assert!(!answers.start_refresh(&k));
-        answers.refreshed(&k);
-        assert!(answers.start_refresh(&k));
+        assert!(answers.start_refresh(&k, answers.generation()));
+        assert!(!answers.start_refresh(&k, answers.generation()));
+        answers.refreshed(&k, answers.generation());
+        assert!(answers.start_refresh(&k, answers.generation()));
         age(&answers, &k, Duration::from_secs(3600));
         assert!(matches!(answers.get(&k, 1), Cached::Missing));
     }
@@ -436,10 +465,226 @@ mod tests {
     fn without_expiry_an_answer_stays_until_cleared() {
         let answers = cache(true, None);
         let k = key("a");
-        answers.put(k.clone(), &answer(&[60]), 60);
+        answers.put(k.clone(), &answer(&[60]), 60, answers.generation());
         age(&answers, &k, Duration::from_secs(3600));
         assert!(matches!(answers.get(&k, 1), Cached::Fresh(_)));
         answers.clear();
         assert!(matches!(answers.get(&k, 1), Cached::Missing));
+    }
+
+    #[test]
+    fn a_flush_revokes_old_writes_without_replacing_new_answers() {
+        let answers = cache(false, None);
+        let k = key("a");
+        let old = answers.generation();
+        answers.clear();
+        answers.put(k.clone(), &answer(&[60]), 60, old);
+        assert!(matches!(answers.get(&k, 1), Cached::Missing));
+        answers.put(k.clone(), &answer(&[60, 60]), 60, answers.generation());
+        answers.put(k.clone(), &answer(&[60]), 60, old);
+        let Cached::Fresh(kept) = answers.get(&k, 1) else {
+            panic!("new answer")
+        };
+        assert_eq!(kept.answers().len(), 2);
+    }
+
+    #[test]
+    fn an_old_refresh_cannot_claim_or_release_a_new_generations_slot() {
+        let answers = cache(false, Some(Duration::from_secs(60)));
+        let k = key("a");
+        let old = answers.generation();
+        assert!(answers.start_refresh(&k, old));
+        answers.clear();
+        assert_eq!(answers.refreshing(), 0);
+        assert!(!answers.start_refresh(&k, old));
+        let new = answers.generation();
+        assert!(answers.start_refresh(&k, new));
+        answers.refreshed(&k, old);
+        assert_eq!(answers.refreshing(), 1);
+        assert!(!answers.start_refresh(&k, new));
+        answers.refreshed(&k, new);
+        assert_eq!(answers.refreshing(), 0);
+        assert!(answers.start_refresh(&k, new));
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let limit = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(Instant::now() < limit, "cache writer did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_pending_disk_clear_blocks_old_loads_then_restores_new_disk_hits() {
+        use crate::runtime::cache_file::tests::{enabled, env, with_writes_paused};
+        let dir = std::env::temp_dir().join(format!(
+            "sail-dns-cache-generation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let env = env(&dir);
+        let mut options = enabled();
+        options.store_dns = true;
+        env.cache_file.replace(Some(&options), &env).unwrap().keep();
+        let file = env.cache_file.get().unwrap();
+        let answers = Answers::new(
+            NonZeroUsize::new(4).unwrap(),
+            false,
+            None,
+            Some(file.clone()),
+        );
+        let k = key("a");
+        let disk_key = file_key(&k);
+        answers.put(k.clone(), &answer(&[60]), 60, answers.generation());
+        wait_until(|| file.load_dns(&disk_key).unwrap().is_some());
+        for _ in 0..2 {
+            let old = answers.generation();
+            with_writes_paused(&file, || {
+                answers.clear();
+                // The real database still has the old answer. clear/get must
+                // neither wait on this transaction nor load that old answer.
+                assert!(file.load_dns(&disk_key).unwrap().is_some());
+                assert!(matches!(answers.get(&k, 1), Cached::Missing));
+                answers.put(k.clone(), &answer(&[60]), 60, old);
+                assert!(matches!(answers.get(&k, 1), Cached::Missing));
+                answers.put(k.clone(), &answer(&[60, 60]), 60, answers.generation());
+                assert!(matches!(answers.get(&k, 1), Cached::Fresh(_)));
+            });
+            wait_until(|| {
+                let done = answers.state.lock().unwrap().file_cleared.clone().unwrap();
+                done.load(Ordering::Acquire)
+                    && file.load_dns(&disk_key).unwrap().is_some_and(|(bytes, _)| {
+                        Message::from_vec(&bytes).unwrap().answers().len() == 2
+                    })
+            });
+            // Force an LRU miss without another flush: disk loads resume.
+            answers.state.lock().unwrap().entries.clear();
+            let Cached::Fresh(kept) = answers.get(&k, 7) else {
+                panic!("fresh from disk")
+            };
+            assert_eq!(kept.answers().len(), 2);
+        }
+        drop(answers);
+        drop(file);
+        env.cache_file.replace(None, &env).unwrap().keep();
+        // Closing drains the queue, so a late old write cannot reappear on restart.
+        env.cache_file.replace(Some(&options), &env).unwrap().keep();
+        let file = env.cache_file.get().unwrap();
+        let (bytes, _) = file.load_dns(&disk_key).unwrap().unwrap();
+        assert_eq!(Message::from_vec(&bytes).unwrap().answers().len(), 2);
+        drop(file);
+        env.cache_file.replace(None, &env).unwrap().keep();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    async fn delayed_answer_after_flush(network_change: bool, optimistic: bool) {
+        use super::super::DnsClient;
+        use crate::control::events::DnsSource;
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::sync::atomic::AtomicUsize;
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let held = if optimistic { 2 } else { 1 };
+        let server = tokio::spawn(async move {
+            let mut seen = Some(seen_tx);
+            let mut release = Some(release_rx);
+            let mut data = [0u8; 4096];
+            loop {
+                let (n, peer) = socket.recv_from(&mut data).await.unwrap();
+                let count = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                let request = Message::from_vec(&data[..n]).unwrap();
+                let ip = if count > held { 8 } else { 7 };
+                let mut response = Message::new(request.id(), MessageType::Response, OpCode::Query);
+                for q in request.queries() {
+                    response.add_query(q.clone());
+                    response.add_answer(Record::from_rdata(
+                        q.name().clone(),
+                        60,
+                        RData::A(A::new(10, 0, 0, ip)),
+                    ));
+                }
+                if count == held {
+                    seen.take().unwrap().send(()).unwrap();
+                    release.take().unwrap().await.unwrap();
+                }
+                socket
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = crate::config::Config::from_json(&serde_json::json!({
+            "dns": { "strategy": "ipv4_only", "timeout": "3s", "optimistic": { "enabled": optimistic, "timeout": "1h" }, "servers": [
+                { "type": "udp", "tag": "s", "server": "127.0.0.1", "server_port": port }
+            ] }
+        }).to_string()).unwrap();
+        let env = crate::runtime::RuntimeEnv::default();
+        let client = DnsClient::new(&config.dns, Default::default(), &env)
+            .unwrap()
+            .into_arc();
+        let host = "a.example";
+        if optimistic {
+            assert_eq!(
+                client.lookup(host).await.unwrap(),
+                vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))]
+            );
+            age(&client.answers, &key(host), Duration::from_secs(120));
+        }
+        let mut events = env.events.dns_exchanges();
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move { pending_client.lookup(host).await });
+        tokio::time::timeout(Duration::from_secs(5), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        if network_change {
+            client.network_changed().await;
+        } else {
+            client.clear_cache();
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            pending.await.unwrap().unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))]
+        );
+        if optimistic {
+            // Exchanged is emitted after the background answer attempted its
+            // cache write, so the next assertion is not a timing guess.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while events.recv().await.unwrap().source != DnsSource::Exchanged {}
+            })
+            .await
+            .unwrap();
+        }
+        let fresh = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8))];
+        assert_eq!(client.lookup(host).await.unwrap(), fresh);
+        assert_eq!(calls.load(Ordering::SeqCst), held + 1);
+        assert_eq!(client.lookup(host).await.unwrap(), fresh);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            held + 1,
+            "new result should be cached"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cache_clear_rejects_late_udp_answers() {
+        delayed_answer_after_flush(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_network_change_rejects_late_udp_answers() {
+        delayed_answer_after_flush(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cache_clear_rejects_late_optimistic_refresh_answers() {
+        delayed_answer_after_flush(false, true).await;
     }
 }

@@ -22,6 +22,7 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -606,11 +607,15 @@ impl CacheFile {
         });
     }
 
-    /// Forgets every DNS answer kept.
-    pub(crate) fn clear_dns(&self) {
+    /// Forgets every DNS answer kept. Readers must ignore the old disk
+    /// contents until the returned flag says this clear committed.
+    pub(crate) fn clear_dns(&self) -> Arc<AtomicBool> {
+        let done = Arc::new(AtomicBool::new(false));
         self.queue(Write::DnsClear {
             table: self.table(DNS),
+            done: done.clone(),
         });
+        done
     }
 
     /// How many DNS answers are kept.
@@ -696,6 +701,7 @@ enum Write {
     },
     DnsClear {
         table: String,
+        done: Arc<AtomicBool>,
     },
     DnsPrune {
         table: String,
@@ -759,6 +765,12 @@ fn write(
         }
         if let Err(e) = with(db, |db| commit(db, &writes)) {
             warn!("cache_file: not written: {}", e);
+        } else {
+            for write in &writes {
+                if let Write::DnsClear { done, .. } = write {
+                    done.store(true, Ordering::Release);
+                }
+            }
         }
     }
 }
@@ -777,7 +789,7 @@ fn commit(db: &Database, writes: &[Write]) -> Result<()> {
                 tx.open_table(TableDefinition::<&str, (&[u8], u64)>::new(table))?
                     .insert(key.as_str(), (message.as_slice(), *expires))?;
             }
-            Write::DnsClear { table } => {
+            Write::DnsClear { table, .. } => {
                 tx.delete_table(TableDefinition::<&str, (&[u8], u64)>::new(table))?;
             }
             Write::DnsPrune { table, window } => {
@@ -834,6 +846,17 @@ pub(crate) mod tests {
             },
             ..Default::default()
         }
+    }
+
+    pub(crate) fn with_writes_paused(cache: &CacheFile, f: impl FnOnce()) {
+        cache
+            .shared
+            .with(|db| {
+                let _transaction = db.begin_write()?;
+                f();
+                Ok(())
+            })
+            .unwrap();
     }
 
     pub(crate) fn enabled() -> CacheFileOptions {
@@ -1070,5 +1093,35 @@ pub(crate) mod tests {
         assert_eq!(slot.get().unwrap().dns_entries().unwrap(), 0);
         slot.replace(None, &env).unwrap().keep();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dns_clear_reports_only_a_committed_clear_and_stays_pending_when_closed() {
+        let dir = temp_dir("dns-clear-completion");
+        let env = env(&dir);
+        let slot = CacheFileSlot::default();
+        slot.replace(Some(&enabled()), &env).unwrap().keep();
+        let cache = slot.get().unwrap();
+        let done = with(&cache.shared.db, |db| {
+            let _transaction = db.begin_write()?;
+            cache.store_dns(
+                "old".into(),
+                vec![1],
+                SystemTime::now() + Duration::from_secs(60),
+            );
+            let done = cache.clear_dns();
+            assert!(!done.load(Ordering::Acquire));
+            Ok(done)
+        })
+        .unwrap();
+        // close drains the writer; a queued put before clear must be gone.
+        slot.replace(None, &env).unwrap().keep();
+        assert!(done.load(Ordering::Acquire));
+        assert!(!cache.clear_dns().load(Ordering::Acquire));
+        drop(cache);
+        slot.replace(Some(&enabled()), &env).unwrap().keep();
+        assert_eq!(slot.get().unwrap().dns_entries().unwrap(), 0);
+        slot.replace(None, &env).unwrap().keep();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
