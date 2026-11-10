@@ -821,7 +821,8 @@ impl DnsClient {
                 client_subnet(&request),
             )
         });
-        if let Some(key) = &key {
+        let key = key.map(|key| (key, self.answers.generation()));
+        if let Some((key, generation)) = &key {
             match self.answers.get(key, request.id()) {
                 Cached::Fresh(answer) => {
                     log_answer("cached", tag, &answer, None);
@@ -847,7 +848,7 @@ impl DnsClient {
                             options.for_instance,
                         )
                     });
-                    self.refresh(tag, &request, options, key.clone());
+                    self.refresh(tag, &request, options, key.clone(), *generation);
                     return Ok(for_request(answer, &request));
                 }
                 Cached::Stale(_) | Cached::Missing => {}
@@ -864,7 +865,7 @@ impl DnsClient {
         server: &Server,
         request: &Message,
         options: &QueryOptions,
-        key: Option<AnswerKey>,
+        key: Option<(AnswerKey, u64)>,
     ) -> Result<Message> {
         let timeout = options.timeout.unwrap_or(self.timeout);
         let started = tokio::time::Instant::now();
@@ -911,8 +912,8 @@ impl DnsClient {
             response.response_code(),
             ResponseCode::NoError | ResponseCode::NXDomain
         );
-        if let (true, Some(key)) = (keeps, key) {
-            self.answers.put(key, &response, ttl);
+        if let (true, Some((key, generation))) = (keeps, key) {
+            self.answers.put(key, &response, ttl, generation);
         }
         log_answer("exchanged", &server.tag, &response, Some(ms));
         self.events.dns_exchanged(|| DnsExchange {
@@ -932,11 +933,18 @@ impl DnsClient {
 
     /// Asks the server tagged `tag` `request` again in the background, for
     /// the answer kept under `key`, which has expired: once at a time.
-    fn refresh(&self, tag: &str, request: &Message, options: &QueryOptions, key: AnswerKey) {
+    fn refresh(
+        &self,
+        tag: &str,
+        request: &Message,
+        options: &QueryOptions,
+        key: AnswerKey,
+        generation: u64,
+    ) {
         let Some(me) = self.me.upgrade() else {
             return;
         };
-        if !self.answers.start_refresh(&key) {
+        if !self.answers.start_refresh(&key, generation) {
             return;
         }
         let (tag, request, options) = (tag.to_owned(), request.clone(), options.clone());
@@ -944,7 +952,7 @@ impl DnsClient {
             let asked = match me.server(&tag) {
                 Ok(server) => {
                     let server = server.clone();
-                    me.ask_and_keep(&server, &request, &options, Some(key.clone()))
+                    me.ask_and_keep(&server, &request, &options, Some((key.clone(), generation)))
                         .await
                         .map(drop)
                 }
@@ -957,7 +965,7 @@ impl DnsClient {
                     e
                 );
             }
-            me.answers.refreshed(&key);
+            me.answers.refreshed(&key, generation);
         });
     }
 }
