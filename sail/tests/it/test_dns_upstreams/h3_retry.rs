@@ -9,7 +9,7 @@ enum H3Reply {
     HttpError,
 }
 
-fn delayed_h2(cert: &Cert, listener: TcpListener) -> Arc<Counters> {
+fn controlled_h2(cert: &Cert, listener: TcpListener, delay_ms: Arc<AtomicUsize>) -> Arc<Counters> {
     use sail::adapter::{InboundStreamHandler, InboundTransport};
     use sail::session::Session;
     use sail::transport::tls::inbound::stream::Handler;
@@ -32,6 +32,7 @@ fn delayed_h2(cert: &Cert, listener: TcpListener) -> Arc<Counters> {
         while let Ok((tcp, _)) = listener.accept().await {
             let handler = handler.clone();
             let c = c.clone();
+            let delay_ms = delay_ms.clone();
             connections.spawn(async move {
                 let Ok(InboundTransport::Stream(stream, _)) =
                     handler.handle(Session::default(), Box::new(tcp)).await
@@ -45,6 +46,7 @@ fn delayed_h2(cert: &Cert, listener: TcpListener) -> Arc<Counters> {
                 let mut requests = tokio::task::JoinSet::new();
                 while let Some(Ok((request, mut respond))) = connection.accept().await {
                     let c = c.clone();
+                    let delay_ms = delay_ms.clone();
                     requests.spawn(async move {
                         let mut body = request.into_body();
                         let mut query = Vec::new();
@@ -53,7 +55,10 @@ fn delayed_h2(cert: &Cert, listener: TcpListener) -> Arc<Counters> {
                             query.extend_from_slice(&chunk);
                         }
                         c.count(&query);
-                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        tokio::time::sleep(Duration::from_millis(
+                            delay_ms.load(Ordering::SeqCst) as u64
+                        ))
+                        .await;
                         let Some(response) = answer(&query) else {
                             return;
                         };
@@ -148,7 +153,8 @@ async fn selected_h3_case(reply: H3Reply, batch: usize, sequential: bool) {
         })
         .expect("shared TCP/UDP port");
     let port = listener.local_addr().unwrap().port();
-    let h2 = delayed_h2(&cert, listener);
+    let h2_delay = Arc::new(AtomicUsize::new(1200));
+    let h2 = controlled_h2(&cert, listener, h2_delay.clone());
     // Let both TLS handshakes finish before checking connection sharing.
     let mode = Arc::new(AtomicUsize::new(H3Reply::Slow as usize));
     let endpoint = quic_endpoint_on(quic_server_config(&cert, b"h3", None), socket);
@@ -188,8 +194,15 @@ async fn selected_h3_case(reply: H3Reply, batch: usize, sequential: bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(h3_only, 2, "must establish that the client chose H3");
+    assert!(h2.queries.load(Ordering::SeqCst) > 0, "H2 must be primed");
+    if reply == H3Reply::HttpError {
+        // This control checks HTTP-error fallback, not a second timeout of
+        // the retained H2 connection when that path has a short probe.
+        h2_delay.store(50, Ordering::SeqCst);
+    }
     mode.store(reply as usize, Ordering::SeqCst);
     let before = h2.queries.load(Ordering::SeqCst);
+    let before_connections = h2.connections.load(Ordering::SeqCst);
     let hosts: Vec<_> = (0..batch)
         .map(|n| format!("after-h3-change-{n}.example"))
         .collect();
@@ -211,7 +224,7 @@ async fn selected_h3_case(reply: H3Reply, batch: usize, sequential: bool) {
             0
         }
     );
-    assert_eq!(h2.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(h2.connections.load(Ordering::SeqCst), before_connections);
     assert!(h3.queries.load(Ordering::SeqCst) >= batch + 2);
     let mut packet = [0; 512];
     assert!(
