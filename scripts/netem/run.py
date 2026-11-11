@@ -32,6 +32,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NETNS = os.path.join(HERE, "netns.sh")
+NS_EXEC = os.path.join(HERE, "ns_exec.py")
 # Which pair of namespaces, as netns.sh takes them: NETEM_NS (default 5)
 # and NETEM_NET (default 95), so that two runs side by side do not meet.
 NETEM_NS = os.environ.get("NETEM_NS", "5")
@@ -120,13 +121,13 @@ def fmt_cpus(cpus):
 def in_ns_netgen(ns, cmd):
     cpus = NETGEN_CPUS.get(ns) or CPUS.get(ns)
     pin = f"taskset -c {cpus} " if cpus else ""
-    return f"ip netns exec {ns} {pin}{cmd}"
+    return shlex.join([sys.executable, NS_EXEC, ns, "--"]) + f" {pin}{cmd}"
 
 
 def in_ns(ns, cmd):
     cpus = CPUS.get(ns)
     pin = f"taskset -c {cpus} " if cpus else ""
-    return f"ip netns exec {ns} {pin}{cmd}"
+    return shlex.join([sys.executable, NS_EXEC, ns, "--"]) + f" {pin}{cmd}"
 
 
 def netns(*args):

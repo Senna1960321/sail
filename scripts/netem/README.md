@@ -9,6 +9,7 @@ netgen 客户端 --SOCKS--> 被测客户端 ==veth, netem==> sing-box 服务端 
 
 - `netns.sh`：建立、整形、断开这对命名空间。所有操作都只在这两个命名空间里进行，不动宿主机自己的路由和防火墙。在用目录锁登记共享资源的主机上，设 `NETEM_LOCK_DIR`：`up` 先用 `mkdir` 原子地占用 `$NETEM_LOCK_DIR/netns-nc$NS` 和 `netns-ns$NS`（owner 文件写 `NETEM_LOCK_OWNER`，默认 `netem`），任一已被占用就失败、不建任何东西；`up` 中途失败或 `down` 时归还自己占用的锁。整形：带 `rate` 又带 `limit N` 的规格是一个瓶颈，netem 只管延迟、丢包等，队列交给后面的 tbf，按字节限为 N×1500 字节（也可直接用 `bottleneck RATE BYTES SPEC`）。netem 自己的 `limit` 按内核交给它的包计数，而 TCP 交下来的是多段的 GSO 包，与网卡卸载开关无关（2026-10-25 实测平均约 17 KB 一个，`limit 330` 攒了 3.6 MB）。只带 `rate`、不带 `limit` 的规格只为让带抖动的包保持顺序；这个速率要有限，又要远高于格子本身的速率（`run.py` 用 4gbit）：100gbit 时延迟提前结束的包会和排在它后面的包一起放出，成千个包一下子涌进接收端 CPU 的 backlog，超过 `netdev_max_backlog` 的被丢掉；netem 按前一个包（连同它的延迟）排下一个包的时间，所以速率离格子太近就成了上限，1gbit 时 rtt50 的 QUIC 只到 550–600 Mbit/s。
 - `netgen/`：流量工具（Go）。双方发送的每个字节都来自带种子的生成器，由对端校验，所以数据损坏、截断、错序都会被计数，不会漏掉。模式包括大块上下行、回显往返、建连延迟、大量并发、按固定速率建立并保持大量连接（`hold`，给出建连延迟到 p999，可经多个 SOCKS 代理轮流建连）、短连接高频开关（`churn`，轮流连同一接收端的 16 个端口：都连同一个地址和端口时，先关闭的一方每条连接留下一个 TIME-WAIT，每秒数百条时内核在其中找空闲源端口，每次 connect() 要几毫秒，测到的就成了内核而不是代理）、两个方向的半关闭，以及断网期间的连通性探测。`-cc NAME` 给客户端模式拨出的连接设拥塞控制，`serve -listen` 的地址后加 `/NAME` 给该端口接受的连接设（仅 Linux，共存格的参照流用）。
+- `ns_exec.py`：保留 `ip netns exec` 的命名空间 DNS/hosts 覆盖和网络 sysfs，同时把调用者原有的 cgroup 挂载树带入新的私有挂载命名空间。进程仍属于调用者设置的 cgroup；脚本不创建或放宽内存限制。需要恢复 cgroup 时使用 Linux 5.2 起的 `open_tree` / `move_mount`，优先调用 libc 的同名接口；旧 libc 在 64 位 x86_64、aarch64 上使用已知的 Linux syscall ABI，其他架构需要 libc 提供接口。缺少接口、权限或内核支持时明确失败，避免静默使用宿主机内存测量。没有 cgroup 挂载时沿用原来的启动方式。
 - `run.py`：编排。每组（协议 × 客户端）按场景依次整形、跑负载、采样，结果写到 `<work>/results/<时间>/summary.json`（`{"schema": 1, "congestion": {...}, "runs": [...]}`，每次运行一项）；只有出现失败的组才保留压缩后的原始记录。`congestion` 是宿主机和两个命名空间的系统拥塞控制（`net.ipv4.tcp_congestion_control` 与可用列表），即 sing-box 和未自选的一方所用的；每项负载的 `congestion` 是经过整形链路的代理连接实际用的拥塞控制（`ss -i`，客户端到服务端的连接与服务端接受的连接各一份，取各算法同时最多的连接数）。同一个 sail 二进制的两种设置互比时用 `--sail-bin NAME=PATH` 加 `--sail-arg NAME=--set --sail-arg NAME=KEY=VALUE`。每项负载还记两侧的重传段数与发出段数（`retrans`、`outsegs`，`/proc/net/snmp`）、变动的 TcpExt 计数与整形队列的丢包（`link`）；大流量负载另记发送方代理连接每秒的状态（`sender`：合计的 pacing 与 delivery 速率、BBR 的带宽估计与增益、RTT、最小 RTT、窗口），用来比较同一格里快慢不同的轮次。`--only coexist` 跑共存格（不在默认场景里）：100 Mbit/s、40 ms RTT 的链路，浅队列（0.5×BDP）与深队列（4×BDP）各一格，一条经代理的流和一条不经代理、用内核默认拥塞控制的流同时开始，记两者都还在传时各占的份额（`shares`，去掉开头 5 秒）。
 
 ## 运行
@@ -80,3 +81,13 @@ rtt_step 分两段，中间不重启任何进程，QUIC 类协议的那一条连
 - 编译和每次运行前检查 `df -h /`；可用空间不足 2 GiB 时 `run.py` 不启动。
 - sail 在临时 target 里用 `CARGO_BUILD_JOBS=2` 编译（默认并行度在这台机器上会被 OOM 杀掉），编完删除 target。
 - 24 小时长跑前先与机器上正在运行的其他长任务协调。
+
+## 命名空间启动回归测试
+
+在有 cgroup v2 memory 控制器、网络和挂载命名空间权限的 Linux 测试机上运行：
+
+```sh
+sudo python3 scripts/netem/test_ns_exec.py
+```
+
+测试只建立自己的命名空间、dummy 网卡和 64 MiB cgroup，不发网络流量；验证原启动方式隐藏 cgroup 的对照、修复后的限制可见性、DNS/hosts、网络 sysfs、CPU 绑定、引号、退出状态和进程组终止，并检查宿主挂载不变。另验证嵌套只读控制器式挂载的递归保留及无 cgroup、恢复失败路径。测试结束清理自己的资源。cgroup v1 的路径识别有单元测试；实际 memory 控制器测试使用 v2，嵌套挂载测试不声称运行了 v1 内存控制器。
