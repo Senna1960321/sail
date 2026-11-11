@@ -474,11 +474,40 @@ impl UserTraffic {
 /// A user, as sessions and credential tables hold it. Two are equal when
 /// their names are.
 #[derive(Clone)]
-pub struct UserRef(Arc<UserState>);
+pub struct UserRef(
+    Arc<UserState>,
+    Option<crate::control::context::RecordContext>,
+);
 
 static NEXT_CARRIER: AtomicU64 = AtomicU64::new(0);
 
 impl UserRef {
+    /// The immutable credential-registration snapshot, if the embedding
+    /// host supplied one. This belongs to this reference, not the mutable
+    /// name-indexed user state shared through reloads.
+    pub fn credential_context(&self) -> Option<&crate::control::context::RecordContext> {
+        self.1.as_ref()
+    }
+
+    #[cfg(any(
+        feature = "inbound-shadowsocks",
+        feature = "inbound-vless",
+        feature = "inbound-anytls"
+    ))]
+    pub(crate) fn with_credential_context(
+        mut self,
+        context: crate::control::context::RecordContext,
+    ) -> Self {
+        self.1 = Some(context);
+        self
+    }
+
+    /// Bookkeeping history needs the quota identity, not ownership of a
+    /// retired authentication row's private metadata.
+    pub(crate) fn without_credential_context(&self) -> Self {
+        UserRef(self.0.clone(), None)
+    }
+
     /// Keeps `close`, which closes a connection that carries others of
     /// this user through the inbound `tag`, until the guard is dropped:
     /// called when the user is shut out, or taken out of the inbound.
@@ -505,7 +534,10 @@ impl UserRef {
     #[cfg(test)]
     pub fn unbound(name: &str) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(1);
-        UserRef(Arc::new(UserState::new(name, Counts::default(), events)))
+        UserRef(
+            Arc::new(UserState::new(name, Counts::default(), events)),
+            None,
+        )
     }
 
     /// Whether `self` and `other` are the same user object, not only the
@@ -663,7 +695,7 @@ impl UserRegistry {
     pub fn bind(&self, name: &str) -> UserRef {
         let mut registry = self.lock();
         if let Some(user) = registry.users.get(name).and_then(Weak::upgrade) {
-            return UserRef(user);
+            return UserRef(user, None);
         }
         registry.users.retain(|_, user| user.strong_count() > 0);
         let counts = registry.kept.remove(name).unwrap_or_default();
@@ -673,7 +705,7 @@ impl UserRegistry {
         registry
             .users
             .insert(user.name.clone(), Arc::downgrade(&user));
-        UserRef(user)
+        UserRef(user, None)
     }
 
     /// Starts the users made from now on with the counts `kept`, the cache
@@ -766,7 +798,7 @@ impl UserRegistry {
             .users
             .get(name)
             .and_then(Weak::upgrade)
-            .map(UserRef)
+            .map(|user| UserRef(user, None))
     }
 
     /// Limits `user` by `limits`, over what the configuration sets, until
@@ -857,7 +889,7 @@ impl UserRegistry {
             .users
             .values()
             .filter_map(Weak::upgrade)
-            .map(UserRef)
+            .map(|user| UserRef(user, None))
             .collect()
     }
 

@@ -716,6 +716,7 @@ impl Dispatcher {
         // sessions, or is refused one.
         let handshake = sess.handshake.take();
         if self.env.events.records_refuse()
+            || !self.bind_record_context(&mut sess)
             || !self.admitted(&mut sess)
             || !self.host_admits(&mut sess)
         {
@@ -1169,6 +1170,12 @@ impl Dispatcher {
         if self.env.events.records_refuse() {
             return Err(io::Error::other(
                 "refused: the host has not taken its connection records",
+            ));
+        }
+        if !self.bind_record_context(&mut sess) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "record context refused",
             ));
         }
         // Its place, held by the datagram as long as the session lives.
@@ -1723,6 +1730,25 @@ impl Dispatcher {
 }
 
 impl Dispatcher {
+    /// Capture once after authentication, before any user/host refusal.
+    fn bind_record_context(&self, sess: &mut Session) -> bool {
+        if let Some(admission) = &self.env.admission {
+            if self.env.events.records_wanted() {
+                self.stat_manager.numbering().number(sess);
+            }
+            if let Err(reason) = admission.bind_session(sess) {
+                if let Some(number) = &sess.number {
+                    number.refused_by_host(sess, reason.map(std::borrow::Cow::into_owned));
+                }
+                return false;
+            }
+        }
+        if let Some(number) = &sess.number {
+            number.record_context_bound(sess);
+        }
+        true
+    }
+
     /// Whether the user of `sess`, if any, may have another connection:
     /// not shut out by `user_limits`, nor at its most. Checked before
     /// routing and dialing; the statistics decide once the connection is
@@ -1743,6 +1769,79 @@ impl Dispatcher {
             }
             _ => true,
         }
+    }
+
+    /// A new target on an already admitted UDP association. It has its
+    /// connection place already: only user revocation/quota/expiry and
+    /// the host policy apply, not another max_connections reservation.
+    /// Accepted targets stay accounted to the association; a rejection
+    /// has an independent, unlisted number and a zero-byte closed record.
+    pub(crate) fn admit_datagram_destination(&self, base: &Session, to: &SocksAddr) -> bool {
+        use crate::control::events::{ClosedBy, End, Outcome};
+        // Same first gate as a newly dispatched session. There is no
+        // host verdict to lose yet: the public RecordStream::refused
+        // counter reports these backlog refusals, without queueing yet
+        // another closed record behind a reader that is not keeping up.
+        if self.env.events.records_refuse() {
+            return false;
+        }
+        let mut probe = Session {
+            destination: to.clone(),
+            number: None,
+            state: Default::default(),
+            chain: Default::default(),
+            outbound_tag: String::new(),
+            fake_ip: false,
+            sniffed: None,
+            sniffed_protocol: None,
+            sniffed_http: None,
+            route: Default::default(),
+            matched_rule: None,
+            matched_rule_set: None,
+            routed_by: 0,
+            ..base.clone()
+        };
+        if probe
+            .user
+            .as_ref()
+            .is_some_and(|user| !user.active() || user.removed_from(&probe.inbound_tag))
+        {
+            if self.env.events.records_wanted() {
+                self.stat_manager.numbering().number(&mut probe);
+                if let Some(number) = &probe.number {
+                    number.closed(&probe, Outcome::Rejected, End::Closed(ClosedBy::User));
+                }
+            }
+            return false;
+        }
+        self.host_admits(&mut probe)
+    }
+
+    /// Prepare a root id before dispatch, also for unlisted DNS/health
+    /// associations. Numbering alone neither admits nor records a session.
+    pub(crate) fn datagram_admission(&self, sess: &mut Session) -> io::Result<Option<Session>> {
+        if !self
+            .env
+            .admission
+            .as_ref()
+            .is_some_and(|a| a.checks_sessions())
+        {
+            return Ok(None);
+        }
+        if self.env.events.records_refuse() || !self.bind_record_context(sess) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "record context refused",
+            ));
+        }
+        sess.parent_id = None;
+        self.stat_manager.numbering().number(sess);
+        Ok(Some(Session {
+            parent_id: sess.number.as_ref().map(|number| number.id()),
+            number: None,
+            state: Default::default(),
+            ..sess.clone()
+        }))
     }
 
     /// Whether the host's own check takes the session in, after sail's.
@@ -1782,6 +1881,61 @@ async fn refuse<T: AsyncWrite + Unpin>(sess: &Session, lhs: &mut T, e: &io::Erro
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "outbound-direct")]
+    #[tokio::test]
+    async fn a_user_refused_udp_target_keeps_its_parent_before_the_host_check() {
+        use crate::control::events::{ClosedBy, End, EventHub, Outcome, RecordKind};
+        use crate::session::{Network, Session, SocksAddr};
+        let config =
+            crate::config::Config::from_json(r#"{"outbounds":[{"type":"direct","tag":"d"}]}"#)
+                .unwrap();
+        let env = std::sync::Arc::new(crate::runtime::RuntimeEnv {
+            events: EventHub::with_records(16, Some(16)),
+            ..Default::default()
+        });
+        let instance = crate::app::instance::Instance::build(
+            &config,
+            Vec::new(),
+            env.clone(),
+            std::sync::Arc::default(),
+        )
+        .unwrap();
+        let mut records = env.events.lossless_records().unwrap().reader().unwrap();
+        let user = env.users.bind("alice");
+        let limits = crate::user::Limits {
+            expire_at: Some(std::time::UNIX_EPOCH),
+            ..Default::default()
+        };
+        env.users.set_limit(&user, limits);
+        let base = Session {
+            network: Network::Udp,
+            user: Some(user),
+            inbound_tag: "in".into(),
+            parent_id: Some(42),
+            ..Default::default()
+        };
+        let target = SocksAddr::Domain("new.example".into(), 5353);
+        assert!(!instance
+            .dispatcher
+            .admit_datagram_destination(&base, &target));
+        let rejected = records
+            .try_next()
+            .expect("the user refusal is recorded without a host call");
+        assert_eq!(rejected.parent_id, Some(42));
+        assert_ne!(rejected.id, 42);
+        assert_eq!(
+            rejected.kind,
+            RecordKind::Closed(End::Closed(ClosedBy::User))
+        );
+        assert_eq!(rejected.outcome, Some(Outcome::Rejected));
+        assert_eq!(rejected.destination, target);
+        assert_eq!((rejected.up_total, rejected.down_total), (0, 0));
+        assert!(rejected.chain.is_empty());
+        let json =
+            serde_json::to_value(crate::control::json::ConnectionRecord::of(&rejected)).unwrap();
+        assert_eq!(json["parent_id"], 42);
+    }
+
     /// A relayed connection's task is as large as what it awaits: the
     /// routing, dial and handshake are in a future of their own, freed
     /// once the connection is relayed, so the task keeps room for the

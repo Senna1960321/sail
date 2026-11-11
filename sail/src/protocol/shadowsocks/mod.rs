@@ -6,3 +6,6 @@ mod sip022;
 pub mod inbound;
 #[cfg(feature = "outbound-shadowsocks")]
 pub mod outbound;
+
+#[cfg(all(test, feature = "inbound-shadowsocks", feature = "outbound-direct"))]
+mod nat_reply_tests;

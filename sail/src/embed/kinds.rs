@@ -698,8 +698,11 @@ impl Sessions {
         .await
     }
 
-    /// Submits a UDP session: its datagrams are `datagrams`'. Returned, and
-    /// recorded, as `tcp`.
+    /// Submits a UDP association: its datagrams are `datagrams`'. Returned,
+    /// and recorded, as `tcp`. Its targets share one outbound, connection
+    /// place and byte counter. With `Options::admit`, uncached targets are
+    /// checked before forwarding; only rejected target attempts have
+    /// additional, independent zero-byte closed records.
     pub async fn udp(&self, session: NewSession, datagrams: Datagrams) -> Result<u64, Refused> {
         self.established();
         let mut sess = self.session(session, Network::Udp)?;
@@ -807,6 +810,7 @@ impl Sessions {
         }
         sess.inbound_type = inner.kind;
         sess.number = None;
+        sess.parent_id = None;
         inner.numbering.number(&mut sess);
         Ok(sess)
     }
@@ -1019,8 +1023,22 @@ pub struct SessionInfo {
     /// records' `ConnectionRecord::id`, and what `Sessions::tcp` and `udp`
     /// returned for a session of the host's inbound. A session the
     /// outbound refuses has a closed record still, with nothing sent or
-    /// received.
+    /// received. In `Options::admit`, an additional UDP target instead
+    /// has an attempt id: only rejection records that id; acceptance
+    /// keeps accounting to the association's original id.
     pub id: u64,
+    /// The run carried by this connection's records, so `(run, id)` names
+    /// it across restarts. Independent of `State::Running::since`; none
+    /// before a number with recording attached is assigned.
+    pub run: Option<std::time::SystemTime>,
+    /// Root UDP association for an additional target admission attempt;
+    /// none for an ordinary session. Interpreted within the same run.
+    pub parent_id: Option<u64>,
+    /// Snapshot of the actual named built-in credential row that
+    /// authenticated it; not a lookup of the user's current credentials.
+    pub credential_context: Option<crate::control::context::RecordContext>,
+    /// Frozen host binding; present before user and host session checks.
+    pub record_context: Option<crate::control::context::RecordContext>,
     pub network: Network,
     /// The client.
     pub source: SocketAddr,
@@ -1062,6 +1080,14 @@ impl SessionInfo {
         };
         SessionInfo {
             id,
+            run: sess.number.as_ref().and_then(|number| number.run()),
+            parent_id: sess.parent_id,
+            record_context: sess.record_context.clone(),
+            credential_context: sess
+                .user
+                .as_ref()
+                .and_then(|u| u.credential_context())
+                .cloned(),
             network: sess.network,
             source: sess.source,
             local: sess.local_addr,
@@ -1097,6 +1123,13 @@ impl SessionInfo {
     /// carrying `extensions`.
     fn next_hop(&self, network: Network) -> Session {
         let mut sess = self.sess.clone();
+        // An admission probe is not an accounting identity for a Via
+        // dial. In particular a retained rejected view must not reuse
+        // its pending terminal record's number or mutate that verdict.
+        if sess.parent_id.is_some() {
+            sess.number = None;
+        }
+        sess.parent_id = None;
         sess.network = network;
         if sess.destination != self.destination {
             sess.destination = self.destination.clone();
@@ -1302,5 +1335,84 @@ impl OutboundDatagramSendHalf for HostSend {
 
     async fn close(&mut self) -> io::Result<()> {
         self.0.get().close().await
+    }
+}
+
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+
+    #[test]
+    fn parent_metadata_is_optional_and_does_not_follow_a_via_hop() {
+        assert_eq!(SessionInfo::untold(&Session::default()).parent_id, None);
+        assert_eq!(SessionInfo::untold(&Session::default()).run, None);
+        let numbering = crate::app::stat_manager::Numbering::default();
+        let mut attempt = Session {
+            network: Network::Udp,
+            parent_id: Some(41),
+            ..Session::default()
+        };
+        numbering.number(&mut attempt);
+        let info = SessionInfo::untold(&attempt);
+        assert_eq!(info.parent_id, Some(41));
+        assert_eq!(info.run, None, "standalone numbering has no recorder");
+        assert_eq!(attempt.clone().parent_id, Some(41));
+        for network in [Network::Tcp, Network::Udp] {
+            let next = info.next_hop(network);
+            assert_eq!(next.parent_id, None);
+            assert!(
+                next.number.is_none(),
+                "a probe cannot reactivate its attempt id"
+            );
+        }
+        assert_eq!(info.parent_id, Some(41), "the original view is unchanged");
+    }
+
+    #[test]
+    fn run_tokens_match_records_even_when_old_closes_after_reused_ids() {
+        use crate::app::stat_manager::StatManager;
+        use crate::control::events::{EventHub, Outcome};
+        use crate::user::UserRegistry;
+        let events = EventHub::default();
+        let mut records = events.records();
+        let old = StatManager::new(0, UserRegistry::default()).recording(events.clone());
+        let make = |sm: &StatManager| {
+            let mut root = Session::default();
+            sm.numbering().number(&mut root);
+            let parent = root.number.as_ref().unwrap().id();
+            let mut attempt = Session {
+                network: Network::Udp,
+                parent_id: Some(parent),
+                ..Session::default()
+            };
+            sm.numbering().number(&mut attempt);
+            (root, attempt)
+        };
+        let (_old_root, old_attempt) = make(&old);
+        let old_info = SessionInfo::untold(&old_attempt);
+        let old_key = (old_info.run.unwrap(), old_info.id);
+        drop(old_info);
+        let new = StatManager::new(0, UserRegistry::default()).recording(events);
+        let (_new_root, new_attempt) = make(&new);
+        let new_info = SessionInfo::untold(&new_attempt);
+        let new_key = (new_info.run.unwrap(), new_info.id);
+        assert_eq!(old_key.1, new_key.1, "ids restart from the same value");
+        assert_ne!(old_key.0, new_key.0);
+        assert_eq!(new_info.parent_id, old_attempt.parent_id);
+        drop(new_info);
+        for (attempt, key) in [(new_attempt, new_key), (old_attempt, old_key)] {
+            attempt
+                .number
+                .as_ref()
+                .unwrap()
+                .refused_by_host(&attempt, None);
+            drop(attempt);
+            let record = futures::FutureExt::now_or_never(records.recv())
+                .unwrap()
+                .unwrap();
+            assert_eq!((record.run, record.id), key);
+            assert_eq!(record.parent_id, Some(1));
+            assert_eq!(record.outcome, Some(Outcome::Rejected));
+        }
     }
 }

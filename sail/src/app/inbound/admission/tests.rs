@@ -283,6 +283,7 @@ fn a_hosts_checks_are_counted_by_their_reasons() {
             port => Err(format!("reason {}", port).into()),
         })),
         admit: Some(Box::new(|_| Err("revoked".into()))),
+        ..Default::default()
     }));
     let a = Admission::new(&options.inbound, EventHub::default(), Some(&hooks)).unwrap();
     let at = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));

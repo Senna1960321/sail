@@ -109,7 +109,7 @@ impl InboundDatagramRecvHalf for RecvHalf {
         // The ciphertext is larger than the payload it carries, so receive
         // into a buffer with room for the overhead.
         self.buf.resize(buf.len() + 1024, 0);
-        let (n, src, _) = self.inner.recv_from(&mut self.buf).await?;
+        let (n, mut src, _) = self.inner.recv_from(&mut self.buf).await?;
         let packet = &mut self.buf[..n];
         let received = self
             .resource
@@ -122,6 +122,9 @@ impl InboundDatagramRecvHalf for RecvHalf {
             return Err(ProxyError::DatagramWarn(anyhow!("ss2022 packet too large")));
         }
         buf[..payload.len()].copy_from_slice(payload);
+        // The authenticated peer owns both the NAT identity and reply
+        // encryption. NAT must also carry this lease on queued replies.
+        src.resource_lease = Some(received.lease);
         Ok((
             payload.len(),
             src.with_user(received.user),

@@ -30,6 +30,8 @@ mod rule_set;
 mod streams;
 
 pub use crate::app::inbound::AdmissionInfo;
+pub use crate::control::context::RecordContext;
+pub use crate::control::records::RecordEnvelope;
 pub use crate::control::records::RecordStream;
 pub use crate::control::{
     ConnectionInfo, Delay, Failure, GroupInfo, InboundInfo, Mode, OutboundInfo, ProviderInfo,
@@ -44,7 +46,7 @@ pub use crate::runtime::platform::{ConnectionOwner, ConnectionQuery};
 pub use crate::runtime::{Platform, TunRequest};
 pub use crate::session::{Network, SocksAddr as Address};
 pub use crate::user::Limits as UserLimits;
-pub use admit::Verdict;
+pub use admit::{CredentialInfo, Verdict};
 pub use dial::{DialDatagram, DialStream};
 pub use error::{Error, ErrorKind};
 pub use instance::{ids_held, Instance};

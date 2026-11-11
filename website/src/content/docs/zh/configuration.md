@@ -117,6 +117,8 @@ sing-box 的 `ntp` 段会被读取：测得的时间用于各协议的时间校�
 
 `strategy` 可取 `prefer_ipv4`（默认）、`prefer_ipv6`、`ipv4_only` 或 `ipv6_only`。缓存容量为 1024 条，`cache_capacity` 更大时以其为准；对单个服务器的一次查询最长 10 秒，可用 `timeout` 修改。反向映射记住 DNS 应答对应的域名，让后续仅携带 IP 的连接仍能命中域名规则。Sail 的 `client_strategy` 限制返回给客户端查询的地址族，不影响 Sail 自身的解析。
 
+`tls` 服务器使用 DNS over TLS（DoT）流水线：并发查询通常共用一条 TLS 连接，应答按消息 ID 匹配，可以乱序返回。每个配置的服务器最多同时处理 64 个查询、保持 4 条活动连接，仍在完成旧查询的连接也计入上限。超过上限的查询会等待，等待时间计入正常的 DNS 超时。这些上限固定，没有对应的配置字段。已取消查询的迟到应答会被忽略，不会误配给后续查询。
+
 ### 本地链路上的名字（mDNS）
 
 `mdns` 服务器（`{ "type": "mdns", "tag": "lan", "interface": ["en0"] }`，`interface` 为空时用所有支持组播的网卡）以组播 DNS 解析 `.local` 名字和链路本地的反向区。非 Apple 系统上，`local` 服务器遇到这些名字也会自己走 mDNS；Apple 系统上交给系统解析器。DNS 规则的 `preferred_by` 列出服务器，匹配它们自己能回答的名字：`hosts` 服务器的条目，`local` 的 hosts 文件与 mDNS 名字，`mdns` 的 mDNS 名字。

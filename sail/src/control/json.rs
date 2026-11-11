@@ -248,6 +248,8 @@ fn unix_ms(at: std::time::SystemTime) -> u64 {
 #[derive(Serialize, Clone, PartialEq, Eq, Debug)]
 pub struct ConnectionRecord {
     pub id: u64,
+    /// Root association id within run_ms for an additional UDP target.
+    pub parent_id: Option<u64>,
     /// When the instance's run started, Unix milliseconds: with `id`, it
     /// names the connection across restarts.
     pub run_ms: u64,
@@ -305,6 +307,7 @@ impl ConnectionRecord {
         };
         Self {
             id: r.id,
+            parent_id: r.parent_id,
             run_ms: unix_ms(r.run),
             seq: r.seq,
             kind: match r.kind {
@@ -1388,7 +1391,7 @@ mod tests {
                 target: Some("203.0.113.5:443".into()), connect_ms: Some(31), connect_error: None,
             },
             "connection_record": ConnectionRecord {
-                id: 7, run_ms: 1_759_300_000_000, seq: 2, kind: "closed".into(),
+                id: 7, parent_id: None, run_ms: 1_759_300_000_000, seq: 2, kind: "closed".into(),
                 end: Some("error".into()), error: Some("connection reset".into()), closed_by: None,
                 outcome: Some("ok".into()), reason: None,
                 network: "tcp".into(), user: Some("alice".into()), inbound: "in".into(),

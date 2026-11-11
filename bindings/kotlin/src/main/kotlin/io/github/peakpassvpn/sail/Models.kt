@@ -217,6 +217,8 @@ data class ConnectionRecord(
     @SerialName("down_total") val downTotal: Long,
     @SerialName("start_ms") val startMs: Long,
     @SerialName("at_ms") val atMs: Long,
+    /** Root association within runMs for an additional UDP target. */
+    @SerialName("parent_id") val parentId: Long? = null,
 )
 
 /** A DNS query answered or failed. */

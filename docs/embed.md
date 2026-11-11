@@ -433,6 +433,13 @@ that some connections may not survive (a move), as `Event::Network`:
   TUN flow ends at the app with a reset. The log line `network changed:
   generation N, …, closed=K` counts them, and the next line names what
   differed.
+- **DNS over TLS.** A move aborts every DoT connection, including an
+  older one still finishing queries. It also cancels waits for a
+  connection slot and TLS handshakes, so those waits do not hold the
+  network change up. Closing idle DNS connections after a long sleep
+  lets active DoT queries finish on their existing connection; new
+  queries use a new one. A cancelled query's late reply cannot answer
+  another query on the shared connection.
 - **Sleep and wake.** A wake is no move: after a sleep shorter than 2
   minutes nothing is closed; after one of 2 minutes or more the carriers
   left idle (pooled connections with nothing open, the DNS servers'
@@ -669,12 +676,58 @@ yet, a source of its own list):
   it is no session yet, as one `inbound.max_connections` refuses.
 - `admit(|session: &SessionInfo| ...)` sees each session once its
   inbound authenticated it, before it is routed: a TCP connection, a
-  stream of a multiplexed one, a UDP session to each destination, a
-  session a host submitted. One it rejects is closed as a session of a
-  user that may not connect is, never routed. Its one closed record is
+  stream of a multiplexed one, the first target of a UDP association,
+  and each uncached later target (domain or IP, including its port),
+  including sessions a host submitted. One it rejects is closed as a
+  session of a user that may not connect is, never routed. Its one closed record is
   `Rejected`, ended `Closed(Host)`, with no bytes and the check's
   `reason` (none where the check panicked): a host that counts only what
   it took in leaves out those `Closed(Host)`.
+
+UDP keeps one NAT association, outbound, connection place and byte counter
+per inbound/source identity, not one per target. The first target selects
+the route; later targets use that outbound. The host's target check runs
+in the association's uplink task before a new target's bytes reach it,
+without holding the global NAT lock. Fake IPs have already become their
+domains. The most recent 64 accepted targets are remembered; a remembered
+target continues without another check, while an evicted one must be
+checked again. Rejections are not cached. Ending the NAT drops this cache.
+
+A later target does not reserve another inbound or user connection place:
+its user must still be active and present in the inbound, but an association
+already filling `max_connections=1` may send to another accepted target.
+Record backlog admission still runs first. When the lossless record sink
+is full, a new target is refused before the host hook runs and counted by
+`RecordStream::refused()`, as new connections are, without adding another
+record to the backlog. Already cached targets may continue.
+
+Each later target check has an independent attempt id and
+`SessionInfo::parent_id = Some(root_id)`. `SessionInfo::run` is the exact
+run captured by its number, identical to `ConnectionRecord::run`, not an
+approximation from instance status or the wall clock; it is optional for
+views not numbered yet. Its refusal record carries the same `parent_id`
+within that `run`; ordinary association records have
+`parent_id = None`. This also identifies a target rejected by the user's
+state before the host hook, or by a host hook that panicked. Hosts can
+bind the root id to authentication metadata frozen at entry, without
+looking up current credentials by username or guessing from addresses.
+The metadata itself remains the host's; `Extensions` is still passed
+unchanged to the hook, and is not serialized as an identity table.
+
+If the host rejects it, that id has the zero-byte `Closed(Host)`/`Rejected` record described
+above, with an empty chain; it cannot close the association's record. If
+accepted, it has no separate successful connection record: its bytes belong
+to the association's original id. An inbound's and a user's connection cap
+can therefore refuse a new association before the host sees it, while a
+new target of an existing association can reach the host check at the cap.
+These refusal reasons are deliberately not interchangeable.
+
+The optional read-only `parent_id` is an additive public field, not a new
+configuration or Cargo feature. It is nullable `parent_id` in record JSON
+and optional `parentId` in Swift/Kotlin; the C callback layout is unchanged.
+Older JSON readers ignore it. Internal Rust users constructing the public
+`control::json::ConnectionRecord` DTO with a complete struct literal must
+supply the new field; this is not a claim of universal source compatibility.
 
 Each returns `Verdict::Accept` or `Verdict::reject(reason)`. sail's own
 admission and its users' checks run first: the host sees only what sail
@@ -717,6 +770,116 @@ macOS one past the highest `utunN`) when none was. A host that opens the
 device itself (Android, iOS) has no entry. A chosen name that another
 program takes before the device opens fails the start ("chosen at start
 as free, was taken before it opened"); starting again chooses another.
+
+### Frozen context in lossless records
+
+A `Closed` record finishes that connection's accounting; it is not a
+parent/child family barrier. A host may keep a cloned admission
+`SessionInfo`, which can delay an unlisted child's record until after its
+root's `Closed`, even across stop/restart. DNS hijack and health checks
+also do not have the ordinary outbound `Accounts` lifetime (a health check
+may have no root record). Do not retain a closed-root identity table until
+an assumed timeout, or infer family drain from an empty queue.
+
+For Rust hosts that need frozen identity, `Options::record_context(capacity,
+bind)` attaches a host-defined, `Send + Sync + 'static` payload to each
+session before the dispatcher's user and host session checks. It requires
+`connection_records_lossless`; `Instance::new` rejects that combination
+without a lossless sink. The same `RecordContext` Arc is readable through
+`SessionInfo::record_context`, kept by the session/number/counter, inherited
+by later UDP targets, and carried in each `RecordEnvelope`. The callback
+runs once per root session, not again for a child. Session extensions
+remain available for host-submitted inbounds. Copying a host Arc from an
+extension or credential snapshot preserves the same host binding for
+routing and recording. Do not copy the root's target or refusal outcome
+into that identity: each record freezes its own destination and outcome. When a host submission told its number
+before dispatcher binding, binding updates that existing unlisted snapshot;
+a successful unlisted submission therefore carries its binding too. Listing
+the number discards the superseded unlisted copy.
+
+A username is not an authentication version. For **named SS2022, VLESS
+and AnyTLS credentials**, `Options::credential_context(capacity, bind)`
+provides the missing registration point: the callback runs while the
+actual credential table entry is constructed, before it authenticates a
+session. `CredentialInfo` borrows the protocol, inbound tag, name and
+configured credential; use that exact row/version to select the immutable
+host snapshot. Never log the borrowed secret or resolve current identity
+by name at session capture. That entry's `UserRef` keeps the snapshot,
+independently of the shared name-based quota state. A replacement entry
+gets its own snapshot; sessions authenticated by the old entry still
+expose the old `SessionInfo::credential_context`, even if the replacement
+commits before `record_context` runs. The host can store an `Arc` to its
+own immutable business type there and copy it into `record_context`.
+Sail does not define that business type or history policy.
+
+Credential callbacks may run for candidates that are never committed;
+they must have no external side effects. Exhaustion or a panic fails
+configuration construction and leaves the old configuration usable.
+Reserve headroom for old and new tables and discarded reload candidates.
+Anonymous credentials, legacy SS and other built-in protocols do not have
+this registration snapshot; their `credential_context` is `None`. A host
+must explicitly handle that state, restrict its supported inbounds, or
+supply a binding through its own authenticated inbound extensions.
+Changing a named credential snapshot also distinguishes its UDP source
+identity: an admitted source with a different snapshot cannot reuse the
+old NAT association. This does not change the rule that multiple targets of
+one association share one connection place and counter. Global user quota
+identity/equality remains name based.
+
+SS2022 also pins the authenticated encryption peer while a received
+packet, NAT task/source, queued plaintext reply or inbound delivery owns
+its protocol lease. A new session from that same source is explicitly
+refused while the old peer is pinned; it can retry after those owners
+release it. TTL/LRU cleanup cannot remove a pinned peer. NAT propagates
+the lease to every reply packet, and network/cat/host delivery keeps the
+whole packet through encode and socket-send completion, error or
+cancellation. This applies with or without record context and does not
+reserve another connection place for a target of the same association.
+
+Use `RecordStream::next_envelope` / `try_next_envelope` to read the record
+and its optional context together. A late child owns the frozen binding
+it needs; it does not depend on a root lookup. Keep the envelope (or an
+owned clone of its context) until the existing Collector/spool has
+successfully accepted it; retain/retry it if persistence fails. Then drop
+it. Root byte cursors and binding ownership have separate lifetimes.
+Legacy `next` / `try_next` return only the unchanged record DTO and release
+the envelope's context reference; they are unsuitable for this contract.
+Recent statistics are data-only projections: they retain IDs, timestamps,
+counts and status, but not Numbers, record bindings or credential snapshots.
+Thus an enabled recent-connections UI cannot exhaust binding slots after
+records were consumed. Retaining a live Counter/SessionInfo in host code
+still retains its binding and must fit the host's retained-view budget.
+The context is never included in JSON, C callbacks, broadcast records or
+`Debug` output. The JSON/FFI layout and record equality stay unchanged.
+
+Both capacities count **distinct bindings**, including outstanding
+configuration entries, live sessions, retained callback views, pending
+records and reader batches, across runs. A slot is reserved atomically
+before a provider is called and is returned at the last reference's drop,
+including unwind. Session binding exhaustion does not invoke the provider:
+it refuses with counted host reason `record_context_capacity` and an
+explicit zero-byte, **unbound** Host rejection record. A provider panic
+is counted in `host_panics`, with the usual no-reason Host rejection.
+Readers must handle these unbound refusals explicitly. The existing record
+backlog gate runs earlier and refuses without another record, counted in
+`RecordStream::refused`. Source/handshake/authentication failures and the
+host-submission checks before dispatch precede this binding point; they
+retain their existing no-session-record semantics. An inbound connection-place
+refusal also keeps its no-record semantics; capture may already have run,
+and the rejected session releases its binding. The protocol does not
+invent an authenticated identity for a failed authentication.
+
+These capacities are not hard memory limits: the host must bound payload
+size, configured credentials, retained views/clones and pending spool
+batches, and keep providers fast. A retained view can consume a binding
+slot for its entire lifetime; new bindings are then refused rather than
+creating a second pool or evicting a live binding. The lossless record cap
+is still a soft admission threshold: already active work may close past
+it. A binding must not retain an Instance, Session, Number, record or other
+back-reference to its owners, nor may its provider form such a cycle.
+Use immutable host snapshots; interior mutability is the host's explicit
+synchronization and versioning responsibility. No TTL, tombstone or new
+per-destination meter is introduced.
 
 ## Dialling
 
@@ -870,8 +1033,10 @@ let options = Options::new()
     outbound gets for it. Each number submitted has one closed record,
     however the session ends: one the rules or an outbound refuse, or
     whose dial fails, has one with nothing sent or received. A UDP
-    session that sends to more than one destination is a NAT session,
-    and a record, for each: the first has its number.
+    association may send to more than one destination: it keeps one
+    successful record and counter, by the returned number. Later target
+    admission refusals have independent zero-byte records, as described
+    under admission; accepted targets do not create another connection.
   - **Refusals.** A session whose user may not connect through the inbound
     is `Refused::User`, saying why: shut out, taken out of the inbound, at
     its `max_connections`, or a user of another instance or run.

@@ -24,6 +24,16 @@ use std::sync::{Arc, Mutex};
 
 use super::events::{ConnectionRecord, RecordKind};
 
+/// One record and the host-private binding captured for it. Keep the whole
+/// envelope until durable spool handoff succeeds. Neither JSON nor the C ABI
+/// serializes `context`; the record's target and outcome remain independent.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct RecordEnvelope {
+    pub record: Arc<ConnectionRecord>,
+    pub context: Option<super::context::RecordContext>,
+}
+
 /// A lossless sink of connection records, the instance's.
 pub struct LosslessRecords {
     cap: usize,
@@ -38,7 +48,7 @@ pub struct LosslessRecords {
 
 #[derive(Default)]
 struct Queue {
-    records: VecDeque<Arc<ConnectionRecord>>,
+    records: VecDeque<RecordEnvelope>,
     /// Interim records dropped since the sink was made.
     dropped: u64,
     /// Connections refused since the sink was made.
@@ -64,15 +74,26 @@ impl LosslessRecords {
 
     /// Takes `record`: queued, unless it is `droppable` and `cap` records
     /// wait; a closed record always is. Never waits for the reader.
+    #[cfg(test)]
     pub(crate) fn push(&self, record: Arc<ConnectionRecord>, droppable: bool) {
-        let closed = matches!(record.kind, RecordKind::Closed(_));
+        self.push_envelope(
+            RecordEnvelope {
+                record,
+                context: None,
+            },
+            droppable,
+        );
+    }
+
+    pub(crate) fn push_envelope(&self, envelope: RecordEnvelope, droppable: bool) {
+        let closed = matches!(envelope.record.kind, RecordKind::Closed(_));
         {
             let mut queue = self.lock();
             if !closed && droppable && queue.records.len() >= self.cap {
                 queue.dropped += 1;
                 return;
             }
-            queue.records.push_back(record);
+            queue.records.push_back(envelope);
             if closed {
                 self.closed.fetch_add(1, Ordering::Relaxed);
             }
@@ -101,9 +122,9 @@ impl LosslessRecords {
     }
 
     /// The next record; none now.
-    fn take(&self) -> Option<Arc<ConnectionRecord>> {
+    fn take(&self) -> Option<RecordEnvelope> {
         let record = self.lock().records.pop_front()?;
-        if matches!(record.kind, RecordKind::Closed(_)) {
+        if matches!(record.record.kind, RecordKind::Closed(_)) {
             self.closed.fetch_sub(1, Ordering::Relaxed);
         }
         Some(record)
@@ -122,6 +143,12 @@ pub struct RecordStream(Arc<LosslessRecords>);
 impl RecordStream {
     /// The next record, waiting for one.
     pub async fn next(&mut self) -> Arc<ConnectionRecord> {
+        self.next_envelope().await.record
+    }
+
+    /// The next record with its owned, frozen host context. Retain it on
+    /// persistence failure; dropping it releases this reader's reference.
+    pub async fn next_envelope(&mut self) -> RecordEnvelope {
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
@@ -136,6 +163,11 @@ impl RecordStream {
     /// The next record if there is one now: to drain what is left, as
     /// after a stop.
     pub fn try_next(&mut self) -> Option<Arc<ConnectionRecord>> {
+        self.0.take().map(|envelope| envelope.record)
+    }
+
+    /// The next envelope, without waiting. Empty is not a family drain.
+    pub fn try_next_envelope(&mut self) -> Option<RecordEnvelope> {
         self.0.take()
     }
 
@@ -150,8 +182,9 @@ impl RecordStream {
         self.0.lock().dropped
     }
 
-    /// Connections refused since the sink was made, its closed records
-    /// at the cap.
+    /// Admission attempts refused since the sink was made, its closed
+    /// records at the cap: new connections and uncached UDP targets.
+    /// The host's admission hook has not run for these attempts.
     pub fn refused(&self) -> u64 {
         self.0.lock().refused
     }

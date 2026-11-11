@@ -93,7 +93,7 @@ async fn handle_inbound_datagram_inner(
                     continue;
                 };
                 trace!("send udp packet dst={} len={}", &dst_addr, pkt.data.len());
-                if let Err(e) = ls.send_to(&pkt.data[..], &pkt.src_addr, dst_addr).await {
+                if let Err(e) = pkt.send_through(ls.as_mut()).await {
                     debug!("send datagram failed: {}", e);
                 }
             }

@@ -183,12 +183,11 @@ impl CatInboundListener {
 
                     crate::runtime::scope::spawn_essential("inbound datagram uplink", async move {
                         while let Some(pkt) = l_rx.recv().await {
-                            let Some(dst_addr) = pkt.dst_addr.as_socket_addr() else {
+                            if pkt.dst_addr.as_socket_addr().is_none() {
                                 debug!("Drop datagram to non-ip address {}", &pkt.dst_addr);
                                 continue;
-                            };
-                            if let Err(e) = ls.send_to(&pkt.data[..], &pkt.src_addr, dst_addr).await
-                            {
+                            }
+                            if let Err(e) = pkt.send_through(ls.as_mut()).await {
                                 debug!("Send datagram failed: {}", e);
                                 break;
                             }

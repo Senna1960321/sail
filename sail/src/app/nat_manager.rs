@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::{abortable, BoxFuture};
+use lru::LruCache;
 use tokio::sync::{
     mpsc::{self, Sender},
     oneshot, Mutex, MutexGuard,
@@ -17,6 +19,8 @@ pub struct UdpPacket {
     pub data: Vec<u8>,
     pub src_addr: SocksAddr,
     pub dst_addr: SocksAddr,
+    // Keep queued plaintext tied to its authenticated encryption peer.
+    resource_lease: Option<crate::session::DatagramResourceLease>,
 }
 
 impl UdpPacket {
@@ -25,7 +29,31 @@ impl UdpPacket {
             data,
             src_addr,
             dst_addr,
+            resource_lease: None,
         }
+    }
+
+    fn with_resource_lease(mut self, lease: Option<crate::session::DatagramResourceLease>) -> Self {
+        self.resource_lease = lease;
+        self
+    }
+
+    /// Consumes the whole reply, keeping its peer pinned through encode
+    /// and socket send, including error and cancellation. Both inbound
+    /// delivery loops use this ownership boundary.
+    pub(crate) async fn send_through(
+        self,
+        sender: &mut dyn crate::adapter::InboundDatagramSendHalf,
+    ) -> std::io::Result<usize> {
+        let result = match self.dst_addr.as_socket_addr() {
+            Some(dst) => sender.send_to(&self.data, &self.src_addr, dst).await,
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "datagram reply is not an IP address",
+            )),
+        };
+        drop(self);
+        result
     }
 }
 
@@ -299,7 +327,7 @@ impl NatManager {
 
     async fn add_session<'a>(
         &self,
-        sess: Session,
+        mut sess: Session,
         raddr: DatagramSource,
         client_ch_tx: Sender<UdpPacket>,
         guard: &mut MutexGuard<'a, SessionMap>,
@@ -339,6 +367,16 @@ impl NatManager {
                 // new socket to communicate with the target. A sniff rule
                 // reads the first datagrams off the uplink while routing;
                 // they are sent before the rest.
+                // Keep only the pre-route identity, never the listed
+                // number or state of the association's counter.
+                let admission_session = match dispatcher.datagram_admission(&mut sess) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        debug!("UDP binding refused: {}", e);
+                        sessions.lock().await.remove(&key);
+                        return;
+                    }
+                };
                 let mut sniffer = DatagramSniffer::new(&mut target_ch_rx);
                 let socket = dispatcher
                     .dispatch_datagram(sess, &mut sniffer)
@@ -384,7 +422,8 @@ impl NatManager {
                                     buf[..n].to_vec(),
                                     addr.clone(),
                                     SocksAddr::from(raddr_downlink.address),
-                                );
+                                )
+                                .with_resource_lease(raddr_downlink.resource_lease.clone());
                                 if let Err(err) = client_ch_tx.send(pkt).await {
                                     debug!(
                                         "Failed to send downlink packets on session {} to {}: {}",
@@ -438,6 +477,15 @@ impl NatManager {
                 crate::runtime::scope::spawn(
                     "nat uplink",
                     async move {
+                        // Authorization is bounded independently of the
+                        // association's lifetime/number of destinations.
+                        // Evicted targets must be checked again. Rejected
+                        // targets are never cached.
+                        let mut admitted = admission_session.as_ref().map(|base| {
+                            let mut targets = LruCache::new(NonZeroUsize::new(64).unwrap());
+                            targets.put(base.destination.clone(), ());
+                            targets
+                        });
                         let mut sniffed = sniffed.into_iter();
                         loop {
                             let pkt = match sniffed.next() {
@@ -447,6 +495,26 @@ impl NatManager {
                                     None => break,
                                 },
                             };
+                            if let (Some(base), Some(targets)) = (&admission_session, &mut admitted)
+                            {
+                                if targets.get(&pkt.dst_addr).is_none() {
+                                    // Do not authorize a new target after
+                                    // the entry ended, or commit a callback
+                                    // result onto an ended/replaced NAT.
+                                    // Existing authorized packets retain
+                                    // their previous drain semantics.
+                                    if target_ch_rx.is_closed() {
+                                        break;
+                                    }
+                                    if !dispatcher.admit_datagram_destination(base, &pkt.dst_addr) {
+                                        continue;
+                                    }
+                                    if target_ch_rx.is_closed() {
+                                        break;
+                                    }
+                                    targets.put(pkt.dst_addr.clone(), ());
+                                }
+                            }
                             trace!(
                                 "outbound send udp packet dst={} len={}",
                                 &pkt.dst_addr,

@@ -125,6 +125,27 @@ class SailTest {
         }
     }
 
+    @Test
+    fun connectionRecordParentIsOptionalWithinItsRun() {
+        val strict = Json { ignoreUnknownKeys = false }
+        val fields = strict.parseToJsonElement(
+            java.io.File("../../sail/src/control/json_snapshot.json").readText()
+        ).jsonObject.getValue("connection_record").jsonObject.toMutableMap()
+        fields.remove("parent_id")
+        fun read(): ConnectionRecord = strict.decodeFromJsonElement(
+            ConnectionRecord.serializer(), kotlinx.serialization.json.JsonObject(fields)
+        )
+        val legacy = read()
+        assertEquals(null, legacy.parentId)
+        fields["parent_id"] = kotlinx.serialization.json.JsonNull
+        assertEquals(null, read().parentId)
+        fields["parent_id"] = kotlinx.serialization.json.JsonPrimitive(6L)
+        val attempt = read()
+        assertEquals(6L, attempt.parentId)
+        assertEquals(legacy.id, attempt.id)
+        assertEquals(legacy.runMs, attempt.runMs)
+    }
+
     /** What a newer sail adds, a field or a string value, does not fail. */
     @Test
     fun aNewerSailsJsonStillReads() {

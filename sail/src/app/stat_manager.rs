@@ -438,6 +438,7 @@ impl Counter {
         };
         let record = ConnectionRecord {
             id: self.id,
+            parent_id: sess.parent_id,
             run,
             seq: reported.seq,
             kind: match closed {
@@ -473,8 +474,50 @@ impl Counter {
             closed: closed.is_some(),
         };
         // Under the lock: the next of this connection goes after it.
-        events.recorded(closed.is_none() && !asked, || record);
+        events.recorded_with_context(
+            closed.is_none() && !asked,
+            sess.record_context.clone(),
+            || record,
+        );
         true
+    }
+
+    /// A finished statistics projection must not keep binding slots or
+    /// a Number/Recorder alive just because the UI keeps recent entries.
+    fn recent_view(&self) -> Self {
+        let mut sess = self.sess.clone();
+        sess.number = None;
+        sess.record_context = None;
+        sess.user = sess.user.as_ref().map(UserRef::without_credential_context);
+        let reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
+        Self {
+            id: self.id,
+            sess,
+            start_time: self.start_time,
+            started: self.started,
+            bytes_recvd: AtomicU64::new(self.bytes_recvd()),
+            bytes_sent: AtomicU64::new(self.bytes_sent()),
+            recv_completed: AtomicBool::new(self.recv_completed()),
+            send_completed: AtomicBool::new(self.send_completed()),
+            last_peer_active: AtomicU32::new(self.last_peer_active.load(Ordering::Relaxed)),
+            logged: AtomicBool::new(self.logged.load(Ordering::Relaxed)),
+            closer: Closer {
+                closed: AtomicBool::new(self.closer.is_closed()),
+                by: AtomicU8::new(self.closer.by.load(Ordering::SeqCst)),
+                read: Default::default(),
+                write: Default::default(),
+            },
+            end: self.end.clone(),
+            reported: Mutex::new(Reported {
+                up: reported.up,
+                down: reported.down,
+                seq: reported.seq,
+                closed: reported.closed,
+            }),
+            asked: self.asked.clone(),
+            outcome: self.outcome.clone(),
+            dialing: AtomicBool::new(self.dialing.load(Ordering::Relaxed)),
+        }
     }
 
     pub fn bytes_recvd(&self) -> u64 {
@@ -550,7 +593,7 @@ impl Table {
                 if shard.recent.len() == self.recent_per_shard {
                     shard.recent.pop_front();
                 }
-                shard.recent.push_back(counter);
+                shard.recent.push_back(Arc::new(counter.recent_view()));
             }
         }
     }
@@ -617,9 +660,10 @@ impl Numbering {
 
     /// The number of a session about to be routed or dialled, unless it
     /// has one not listed yet: the one it is listed by once it is counted.
-    /// A UDP session of an inbound is a template, each destination's NAT
-    /// session dispatched from a copy: the first listed takes its number,
-    /// and each after a number of its own.
+    /// A UDP session of an inbound is a template: each NAT association
+    /// dispatched from a copy takes a number. Destinations sharing that
+    /// association share its counter; independent target rejections use
+    /// an unlisted probe number instead.
     pub fn number(&self, sess: &mut Session) {
         let listed = |number: &Arc<Number>| number.listed.load(Ordering::Relaxed);
         if sess.number.as_ref().is_none_or(listed) {
@@ -678,11 +722,41 @@ impl Number {
         self.id
     }
 
+    /// The same run that this number's records carry, when recording is
+    /// attached. Never inferred from the instance's state timestamps.
+    pub(crate) fn run(&self) -> Option<SystemTime> {
+        self.recorder.as_ref().map(|recorder| recorder.run)
+    }
+
     /// Takes the number for the session `sess` is the copy counted of;
     /// `None` when a copy of it was counted before, as one attempt of its
     /// dial after another: each counted is listed by a number of its own.
     fn list(&self) -> Option<u64> {
-        (!self.listed.swap(true, Ordering::Relaxed)).then_some(self.id)
+        let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
+        if self.listed.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        // The counted Session now owns the complete snapshot. The earlier
+        // unlisted copy is no longer a terminal-record owner.
+        let superseded = told.take();
+        drop(told);
+        drop(superseded);
+        Some(self.id)
+    }
+
+    /// Submission can tell the host a number before dispatcher binding.
+    /// Update that existing unlisted snapshot without marking another
+    /// number told, moving its start time or changing a final verdict.
+    pub(crate) fn record_context_bound(&self, sess: &Session) {
+        if sess.record_context.is_none() {
+            return;
+        }
+        let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(unlisted) = told.as_mut() {
+            if unlisted.end.is_none() && unlisted.sess.record_context.is_none() {
+                unlisted.sess.record_context = sess.record_context.clone();
+            }
+        }
     }
 
     /// The host was told the number of `sess`, a copy of the session: so
@@ -692,7 +766,7 @@ impl Number {
             return;
         }
         let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
-        if told.is_none() {
+        if !self.listed.load(Ordering::Relaxed) && told.is_none() {
             *told = Some(Box::new(Unlisted {
                 sess: Self::unlisted(sess),
                 at: SystemTime::now(),
@@ -734,6 +808,9 @@ impl Number {
             return;
         }
         let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
+        if self.listed.load(Ordering::Relaxed) {
+            return;
+        }
         let at = told
             .as_ref()
             .map_or_else(SystemTime::now, |unlisted| unlisted.at);
@@ -1319,7 +1396,8 @@ impl StatManager {
         self.count(|_| true)
     }
 
-    /// The finished connections kept, at most `max_recent_connections`,
+    /// Finished statistics projections, without private binding/number
+    /// ownership, at most `max_recent_connections`,
     /// the latest.
     pub fn recent(&self) -> Vec<Arc<Counter>> {
         let mut recent = self

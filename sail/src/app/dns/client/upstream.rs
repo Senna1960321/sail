@@ -3,8 +3,8 @@
 //! (`h3`, RFC 8484 on HTTP/3).
 //!
 //! Each server keeps its connections for the next query, so that the
-//! handshake is paid once, not per query: DoT keeps idle connections to
-//! take again, DoH keeps one HTTP/2 connection, or idle HTTP/1.1 ones when
+//! handshake is paid once, not per query: DoT pipelines queries on a
+//! bounded pool, DoH keeps one HTTP/2 connection, or idle HTTP/1.1 ones when
 //! the server does not speak HTTP/2, and DoQ and DoH3 keep one QUIC
 //! connection and open a stream per query on it.
 
@@ -109,7 +109,7 @@ impl Drop for Driver {
 }
 
 /// The idle connections of a server that sends its messages on a stream:
-/// TCP, DoT, and DoH on HTTP/1.1.
+/// TCP and DoH on HTTP/1.1.
 #[derive(Default)]
 pub(super) struct StreamPool {
     idle: std::sync::Mutex<Vec<(AnyStream, Instant)>>,
@@ -250,7 +250,7 @@ pub(super) struct Upstream {
 /// The connections an upstream keeps between queries.
 enum State {
     #[cfg(feature = "tls")]
-    Tls(StreamPool),
+    Tls(dot::Pool),
     #[cfg(feature = "dns-doh")]
     Https(doh::Pool),
     #[cfg(feature = "quic")]
@@ -450,7 +450,7 @@ impl Upstream {
     pub(super) async fn reset(&self) {
         match &self.state {
             #[cfg(feature = "tls")]
-            State::Tls(pool) => pool.clear(),
+            State::Tls(pool) => pool.clear().await,
             #[cfg(feature = "dns-doh")]
             State::Https(pool) => pool.clear().await,
             #[cfg(feature = "quic")]
@@ -473,7 +473,7 @@ impl Upstream {
     pub(super) async fn close_idle(&self) {
         match &self.state {
             #[cfg(feature = "tls")]
-            State::Tls(pool) => pool.clear(),
+            State::Tls(pool) => pool.close_idle().await,
             #[cfg(feature = "dns-doh")]
             State::Https(pool) => pool.close_idle().await,
             #[cfg(feature = "quic")]
@@ -707,7 +707,7 @@ impl State {
     fn new(protocol: Protocol) -> Result<Self> {
         match protocol {
             #[cfg(feature = "tls")]
-            Protocol::Tls => Ok(Self::Tls(StreamPool::default())),
+            Protocol::Tls => Ok(Self::Tls(dot::Pool::default())),
             #[cfg(feature = "dns-doh")]
             Protocol::Https => Ok(Self::Https(doh::Pool::default())),
             #[cfg(feature = "quic")]

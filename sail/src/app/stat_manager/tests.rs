@@ -391,6 +391,7 @@ async fn a_closed_record_tells_what_its_user_was_counted() {
     assert_eq!(record.outcome, Some(Outcome::Ok));
     assert_eq!((record.up_total, record.down_total), (3, 5));
     assert_eq!(record.seq, 0);
+    assert_eq!(record.parent_id, None);
     assert_eq!(record.user.as_deref(), Some("alice"));
     assert_eq!(record.inbound, "in");
     assert_eq!(record.outbound.as_deref(), Some("out"));
@@ -420,6 +421,84 @@ async fn a_closed_record_tells_what_its_user_was_counted() {
         )
     );
     assert_ne!(record.id, udp.id);
+}
+
+/// A rejected target's parent is metadata only: the attempt retains its
+/// own id and run, and its zero-byte Host/User rejection survives the
+/// unlisted-session copy used when the attempt is dropped.
+#[test]
+fn rejected_attempt_records_keep_the_parent_and_json_run() {
+    let (events, users) = (EventHub::default(), UserRegistry::default());
+    let sm = recording(&events, &users);
+    let mut records = events.records();
+    let mut root = Session::default();
+    sm.numbering().number(&mut root);
+    let parent = root.number.as_ref().unwrap().id();
+    for (by, reason) in [
+        (ClosedBy::Host, Some("blocked".to_string())),
+        (ClosedBy::Host, None), // The hook panicked: no host-supplied reason.
+        (ClosedBy::User, None),
+    ] {
+        let mut sess = Session {
+            network: Network::Udp,
+            parent_id: Some(parent),
+            ..Session::default()
+        };
+        sm.numbering().number(&mut sess);
+        let number = sess.number.as_ref().unwrap();
+        let id = number.id();
+        match by {
+            ClosedBy::Host => number.refused_by_host(&sess, reason.clone()),
+            _ => number.closed(&sess, Outcome::Rejected, End::Closed(by)),
+        }
+        let saved = sess.clone();
+        drop(sess);
+        drop(saved);
+        let record = next(&mut records);
+        assert_ne!(id, parent);
+        assert_eq!(record.id, id);
+        assert_eq!(record.parent_id, Some(parent));
+        assert_eq!(record.run, sm.recorder.run);
+        assert_eq!(record.kind, RecordKind::Closed(End::Closed(by)));
+        assert_eq!(record.outcome, Some(Outcome::Rejected));
+        assert_eq!(record.reason, reason);
+        assert_eq!((record.up_total, record.down_total), (0, 0));
+        let json =
+            serde_json::to_value(crate::control::json::ConnectionRecord::of(&record)).unwrap();
+        assert_eq!(json["id"], id);
+        assert_eq!(json["parent_id"], parent);
+        assert_eq!(
+            json["run_ms"],
+            record
+                .run
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        );
+    }
+    assert_eq!(root.parent_id, None);
+}
+
+#[test]
+fn a_numbers_run_is_the_recorder_it_captured_not_a_later_binding() {
+    let numbering = Numbering::default();
+    let recorder = |seconds| {
+        Arc::new(Recorder {
+            events: EventHub::default(),
+            run: std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            stopping: AtomicBool::new(false),
+        })
+    };
+    let old = recorder(100);
+    numbering.record_to(&old);
+    let mut before = Session::default();
+    numbering.number(&mut before);
+    let new = recorder(200);
+    numbering.record_to(&new);
+    let mut after = Session::default();
+    numbering.number(&mut after);
+    assert_eq!(before.number.as_ref().unwrap().run(), Some(old.run));
+    assert_eq!(after.number.as_ref().unwrap().run(), Some(new.run));
 }
 
 /// What a connection writes after its last read is in its closed record.
@@ -803,4 +882,71 @@ async fn a_number_told_has_one_closed_record() {
     );
     assert_eq!(record.outbound, None);
     assert!(futures::FutureExt::now_or_never(records.recv()).is_none());
+}
+
+#[test]
+fn recent_statistics_must_not_hold_binding_slots() {
+    let pool = crate::control::context::ContextPool::new(1);
+    let events = EventHub::with_records(16, Some(16));
+    let mut reader = events.lossless_records().unwrap().reader().unwrap();
+    let sm = StatManager::new(256, UserRegistry::default()).recording(events);
+    let mut sess = Session {
+        record_context: pool.bind(|| 7_u64),
+        ..Default::default()
+    };
+    sm.numbering().number(&mut sess);
+    sess.number.as_ref().unwrap().told(&sess);
+    let accounts = sm.register(sess);
+    let id = accounts.counter.id;
+    accounts.sent(3);
+    accounts.recvd(5);
+    drop(accounts);
+    let recent = sm.recent();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].id, id);
+    assert_eq!((recent[0].bytes_sent(), recent[0].bytes_recvd()), (3, 5));
+    let envelope = reader.try_next_envelope().unwrap();
+    assert_eq!(envelope.context.as_ref().unwrap().get::<u64>(), Some(&7));
+    assert!(pool.bind(|| 8_u64).is_none(), "reader still owns the slot");
+    drop(envelope);
+    assert!(
+        pool.bind(|| 8_u64).is_some(),
+        "finished UI statistics must not block new admission"
+    );
+    assert!(recent[0].sess.record_context.is_none());
+    assert!(recent[0].sess.number.is_none());
+}
+
+#[cfg(any(
+    feature = "inbound-shadowsocks",
+    feature = "inbound-vless",
+    feature = "inbound-anytls"
+))]
+#[test]
+fn recent_statistics_must_not_hold_authentication_rows() {
+    let rows = crate::control::context::ContextPool::new(1);
+    let user = UserRef::unbound("alice").with_credential_context(rows.bind(|| 7_u64).unwrap());
+    let sm = StatManager::new(256, UserRegistry::default());
+    let accounts = sm.register(Session {
+        user: Some(user),
+        ..Default::default()
+    });
+    drop(accounts);
+    let recent = sm.recent();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(
+        recent[0].sess.user.as_ref().unwrap().name().as_ref(),
+        "alice"
+    );
+    assert!(
+        rows.bind(|| 8_u64).is_some(),
+        "UI history must not own a retired credential row"
+    );
+    assert!(recent[0]
+        .sess
+        .user
+        .as_ref()
+        .unwrap()
+        .credential_context()
+        .is_none());
 }

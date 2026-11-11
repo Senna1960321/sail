@@ -117,6 +117,8 @@ Server types are `local`, `hosts`, `udp`, `tcp`, `tls`, `quic`, `https`, `h3`, `
 
 `strategy` is one of `prefer_ipv4` (the default), `prefer_ipv6`, `ipv4_only` or `ipv6_only`. The cache holds 1024 answers unless `cache_capacity` is larger, and one query to one server may take 10 seconds unless `timeout` says otherwise. Reverse mapping remembers the domain associated with DNS answers so later connections to those addresses can still match domain rules. Sail's `client_strategy` limits the address families in answers to clients' queries without changing Sail's own lookups.
 
+`tls` servers use DNS over TLS (DoT) pipelining: concurrent queries normally share one TLS connection, and replies are matched by message ID even when they arrive out of order. Each configured server admits up to 64 queries at once and has at most 4 live connections, including older connections still finishing queries. Further queries wait within their normal DNS timeout. These limits are fixed, with no configuration fields. A late reply to a cancelled query is ignored and cannot answer a later query.
+
 ### Names on the local link (mDNS)
 
 An `mdns` server (`{ "type": "mdns", "tag": "lan", "interface": ["en0"] }`, every multicast interface when `interface` is empty) resolves `.local` names and the link-local reverse zones by multicast DNS. Off Apple's systems a `local` server does the same for those names on its own; on Apple's the system resolver does. A DNS rule's `preferred_by` names servers and matches the names they answer for themselves: a `hosts` server its entries, `local` its hosts file and the mDNS names, `mdns` the mDNS names.

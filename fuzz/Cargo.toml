@@ -48,8 +48,8 @@ sail_ffi = { package = "sail-ffi-fuzz", path = "ffi" }
 btls = { git = "https://github.com/peakpassvpn/btls.git", rev = "132da2caff5d94c0f9ea52aa82bbc170bf2baaa6" }
 btls-sys = { git = "https://github.com/peakpassvpn/btls.git", rev = "132da2caff5d94c0f9ea52aa82bbc170bf2baaa6" }
 # One revision for both; FORK.md there says what each carries.
-quinn = { git = "https://github.com/peakpassvpn/quinn.git", rev = "072a218460c77006dbc799079cd7bf5866c2a678" }
-quinn-proto = { git = "https://github.com/peakpassvpn/quinn.git", rev = "072a218460c77006dbc799079cd7bf5866c2a678" }
+quinn = { git = "https://github.com/peakpassvpn/quinn.git", rev = "c97ac77afac2a2ea82c389313dfaa7768abf7d17" }
+quinn-proto = { git = "https://github.com/peakpassvpn/quinn.git", rev = "c97ac77afac2a2ea82c389313dfaa7768abf7d17" }
 
 [[bin]]
 name = "sniff_tls"

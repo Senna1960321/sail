@@ -138,6 +138,26 @@ final class Tracked: @unchecked Sendable {
 }
 
 final class SailTests: XCTestCase {
+    func testConnectionRecordParentIsOptionalWithinItsRun() throws {
+        let file = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().appendingPathComponent("../../../../sail/src/control/json_snapshot.json")
+        let snapshot = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+        var record = snapshot["connection_record"] as! [String: Any]
+        record.removeValue(forKey: "parent_id")
+        func read() throws -> ConnectionRecord {
+            try decoder.decode(ConnectionRecord.self, from: JSONSerialization.data(withJSONObject: record))
+        }
+        let legacy = try read()
+        XCTAssertNil(legacy.parentId)
+        record["parent_id"] = NSNull()
+        XCTAssertNil(try read().parentId)
+        record["parent_id"] = UInt64(6)
+        let attempt = try read()
+        XCTAssertEqual(attempt.parentId, 6)
+        XCTAssertEqual(attempt.id, legacy.id)
+        XCTAssertEqual(attempt.runMs, legacy.runMs)
+    }
+
     func testCapabilities() throws {
         let capabilities = try Sail.capabilities()
         XCTAssertFalse(capabilities.version.isEmpty)

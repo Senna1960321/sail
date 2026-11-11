@@ -119,7 +119,16 @@ fn build_2022(
                     let psk = sip022::decode_psk(method, &u.password)
                         .map_err(|e| anyhow!("[{}] inbound: users[{}]: password: {}", tag, i, e))?;
                     Ok(sip022::User {
-                        name: ctx.env.users.bind_named(u.name.as_deref()),
+                        name: match &ctx.env.admission {
+                            Some(admission) => admission.bind_credential(
+                                &ctx.env.users,
+                                "shadowsocks",
+                                ctx.tag,
+                                u.name.as_deref(),
+                                &u.password,
+                            )?,
+                            None => ctx.env.users.bind_named(u.name.as_deref()),
+                        },
                         psk,
                     })
                 })

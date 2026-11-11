@@ -95,7 +95,19 @@ fn build(ctx: &InboundContext<'_>) -> Result<AnyInboundHandler> {
     for user in options.users {
         let hash: [u8; 32] = Sha256::digest(user.password.as_bytes()).into();
         if users
-            .insert(hash, ctx.env.users.bind_named(user.name.as_deref()))
+            .insert(
+                hash,
+                match &ctx.env.admission {
+                    Some(admission) => admission.bind_credential(
+                        &ctx.env.users,
+                        "anytls",
+                        ctx.tag,
+                        user.name.as_deref(),
+                        &user.password,
+                    )?,
+                    None => ctx.env.users.bind_named(user.name.as_deref()),
+                },
+            )
             .is_some()
         {
             return Err(anyhow!(
