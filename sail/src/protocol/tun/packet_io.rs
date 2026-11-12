@@ -48,6 +48,9 @@ impl<I: PacketIo> PacketIo for OwnedHostIo<I> {
     fn capabilities(&self) -> PacketCapabilities {
         self.io.capabilities()
     }
+    fn owns_flow(&self, endpoint: sail_netstack::IpEndpoint) -> bool {
+        self.io.owns_flow(endpoint)
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2869,5 +2872,35 @@ mod owned_host_tests {
         let mut buffer = [0; 64];
         let length = original.recv(&mut buffer).unwrap();
         assert_eq!(&buffer[..length], b"host original survives");
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_group_construction_releases_the_actual_io_owner() {
+        let (original, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let (raw, owned) = duplicate(&original);
+        let io = OwnedHostIo::open(owned, |borrowed| {
+            let mut config = tun::Configuration::default();
+            config.raw_fd(borrowed).close_fd_on_drop(false);
+            let device = tun::create_as_async(&config)?;
+            TunPacketIo::new(device, 1500, 1).map_err(Into::into)
+        })
+        .unwrap();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::net::netstack::NativeRuntimeGroup::new(
+                vec![io],
+                sail_netstack::ResourceLedger::new(sail_netstack::BudgetProfile::Mobile.budget())
+                    .unwrap(),
+                sail_netstack::RunnerConfig::default(),
+                8,
+                0,
+                8,
+            )
+        }));
+        assert!(
+            failed.is_err(),
+            "the actual runtime rejects zero accept capacity"
+        );
+        closed(raw);
+        assert!(unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) } >= 0);
     }
 }

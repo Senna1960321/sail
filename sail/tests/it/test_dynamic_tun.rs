@@ -1360,6 +1360,34 @@ async fn a_kernel_verified_host_device_closes_only_each_transferred_duplicate() 
     }
     i.stop().await.unwrap();
     drop(i);
+    // These two failures happen after the same real descriptor has passed
+    // kernel name validation. They are not UnixDatagram identity positives.
+    for override_setting in ["netstack.batch_size=0", "netstack.command_channel_size=0"] {
+        let settings = serde_json::json!({"set":[override_setting]}).to_string();
+        let failed = Instance::new(
+            Options::new()
+                .dynamic_tun(true)
+                .platform(host.clone())
+                .settings_json(&settings)
+                .unwrap()
+                .runtime(Runtime::Host(tokio::runtime::Handle::current())),
+        )
+        .unwrap();
+        start_config(&failed).await;
+        let prepared = failed.prepare_tun_device(&config).await.unwrap();
+        let error = prepared.commit().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Failed);
+        assert!(!error.message().contains("kernel identity query failed"));
+        let duplicate = host.last.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(unsafe { libc::fcntl(duplicate, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(unsafe { libc::fcntl(host.original.as_raw_fd(), libc::F_GETFD) } >= 0);
+        assert!(failed.detach_tun().await.unwrap().clean());
+        failed.stop().await.unwrap();
+    }
     drop(host);
     assert_eq!(unsafe { libc::if_nametoindex(cname.as_ptr()) }, 0);
 }
