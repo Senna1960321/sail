@@ -1229,9 +1229,12 @@ async fn restart_refuses_an_old_callback_before_its_first_host_slot_read() {
         .unwrap();
     assert!(i.stop().await.is_err());
     assert_eq!(host.observed.load(Ordering::SeqCst), 0);
+    let prior_report = i.stop_report().expect("the prior resource remains reported");
+    assert!(!prior_report.clean());
     let restart = i
         .start(Config::Json(config(crate::common::free_port())))
         .await;
+    assert_eq!(i.stop_report(), Some(prior_report));
     // Cleanup before asserting so the negative control cannot strand a host
     // callback or a successfully (but incorrectly) restarted instance.
     let refused = restart.is_err();

@@ -935,6 +935,11 @@ while a previous run still owns tasks or returned resources. A bounded
 stop cannot cancel an already running host callback. Wait for its actual
 resource barrier to clear before restarting or replacing the host's staged
 device; a stopped run thread alone does not establish that clearance.
+This guard rejects Sail's `start`; it cannot prevent a host from replacing
+its own mutable staging slot earlier. The host must keep that slot stable
+until the old callback and owned results end. `TunRequest` currently does
+not bind an immutable host resource generation. Supporting earlier staging
+would require a separate request-bound resource contract and host changes.
 
 Sail's existing C callback layout is unchanged; these are Rust APIs. A
 client C/Swift packet-flow wrapper owns its generation fences, callback
