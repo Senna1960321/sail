@@ -767,7 +767,10 @@ impl RouteMonitor {
             return Err(io::Error::last_os_error());
         }
         Ok(RouteMonitor {
-            fd: tokio::io::unix::AsyncFd::new(fd)?,
+            // SAFETY: fd owns the live routing socket set nonblocking above.
+            // This private AsyncFd only lends shared references for read;
+            // nothing closes or replaces its descriptor before deregistration.
+            fd: unsafe { tokio::io::unix::AsyncFd::register(fd)? },
         })
     }
 

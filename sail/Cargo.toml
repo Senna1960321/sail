@@ -230,7 +230,7 @@ fault-injection = []
 
 [dependencies]
 # Common
-tokio = { version = "1", features = ["sync", "io-util", "net", "time", "rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.53.3", features = ["sync", "io-util", "net", "time", "rt", "rt-multi-thread", "macros"] }
 protobuf = "3.7.2"
 # sing-box's cache_file: selections, the Clash mode and fake IPs kept across restarts.
 redb = "4.3"
@@ -393,7 +393,7 @@ aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 rcgen = "0.13"
 sha2 = "0.10"
-tokio = { version = "1", features = ["fs", "sync", "io-util", "net", "time", "rt", "rt-multi-thread", "test-util"] }
+tokio = { version = "1.53.3", features = ["fs", "sync", "io-util", "net", "time", "rt", "rt-multi-thread", "test-util"] }
 
 [build-dependencies]
 cc = "1.2"

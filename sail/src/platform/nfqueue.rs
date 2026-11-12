@@ -515,7 +515,11 @@ mod linux {
             }
             Ok(Queue {
                 num,
-                socket: AsyncFd::new(socket)?,
+                // SAFETY: Socket owns a live OwnedFd and always returns that
+                // descriptor from AsRawFd. It is nonblocking above. Queue only
+                // borrows Socket for I/O; no API closes or replaces its fd while
+                // this private AsyncFd owns it, including during cancellation.
+                socket: unsafe { AsyncFd::register(socket)? },
                 seq: AtomicU32::new(seq.wrapping_add(5)),
                 pending: Mutex::new(pending),
                 buf: Mutex::new(vec![0; RECV_BUF]),

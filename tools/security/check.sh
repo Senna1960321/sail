@@ -82,7 +82,8 @@ run_audit() {
     echo "security-check: ERROR: Cargo.lock is required for cargo-audit: $lockfile" >&2
     return "$EXIT_ERROR"
   fi
-  local -a audit_args=(cargo audit --file "$lockfile")
+  # Unsound advisories are warnings by default; they must fail this gate.
+  local -a audit_args=(cargo audit --deny unsound --file "$lockfile")
   # The advisories deny.toml allows, each with its reason there.
   local id
   for id in $(grep -oE 'id = "RUSTSEC-[0-9]{4}-[0-9]{4}"' "$script_dir/deny.toml" | grep -oE 'RUSTSEC-[0-9-]+'); do

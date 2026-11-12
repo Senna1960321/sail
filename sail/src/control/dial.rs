@@ -192,7 +192,12 @@ impl Dialer {
             }
             Dialed::Datagram(datagram) => {
                 let (host, ours) = messages::pair().map_err(failed)?;
-                let ours = tokio::io::unix::AsyncFd::new(ours).map_err(failed)?;
+                // SAFETY: messages::pair returns a fresh, nonblocking OwnedFd.
+                // AsyncFd owns it until deregistration; the relay only borrows it
+                // for I/O and never closes or replaces it. The host owns the
+                // other socket endpoint, so closing that cannot invalidate ours.
+                let ours = unsafe { tokio::io::unix::AsyncFd::register(ours) }
+                    .map_err(|error| failed(error.into()))?;
                 self.env
                     .scope
                     .spawn("dial relay", messages::relay(ours, datagram, destination));

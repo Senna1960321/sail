@@ -2013,3 +2013,54 @@ async fn each_connection_has_one_closed_record_telling_its_outcome() {
     );
     instance.stop().await.unwrap();
 }
+
+/// Exercises the production AsyncFd registration in dial_fd, including a
+/// cancelled read, peer closure, a fresh dial, and instance teardown. No TUN
+/// or system routes are involved; only loopback UDP and Unix socket pairs.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_dial_fd_survives_cancel_and_peer_close_then_stops() {
+    use sail::session::Network;
+
+    let (echo, serve) = common::run_udp_echo_server("127.0.0.1:0").await.unwrap();
+    let server = tokio::spawn(serve);
+    let instance = Instance::new(options()).unwrap();
+    instance
+        .start(Config::Json(config(common::free_port(), 53)))
+        .await
+        .unwrap();
+    for round in 0..2 {
+        let fd = instance
+            .dial_fd("direct", Network::Udp, echo.into(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let host = std::os::unix::net::UnixDatagram::from(fd);
+        host.set_nonblocking(true).unwrap();
+        let host = tokio::net::UnixDatagram::from_std(host).unwrap();
+        let mut back = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), host.recv(&mut back))
+                .await
+                .is_err()
+        );
+        host.send(b"registered UDP owner").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(5), host.recv(&mut back))
+            .await
+            .expect("relay remains usable after cancellation")
+            .unwrap();
+        assert_eq!(&back[..n], b"registered UDP owner");
+        if round == 1 {
+            instance.stop().await.unwrap();
+            let n = tokio::time::timeout(Duration::from_secs(5), host.recv(&mut back))
+                .await
+                .expect("stop closes the registered relay endpoint")
+                .unwrap();
+            assert_eq!(n, 0, "SEQPACKET EOF after the relay owner is dropped");
+        }
+        // The first endpoint closes while the instance remains live. A fresh
+        // pair must still register and relay on the same instance/runtime.
+        drop(host);
+    }
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}

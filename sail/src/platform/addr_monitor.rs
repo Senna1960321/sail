@@ -58,7 +58,10 @@ impl AddressMonitor {
             return Err(io::Error::last_os_error());
         }
         Ok(AddressMonitor {
-            fd: AsyncFd::new(fd)?,
+            // SAFETY: fd owns the live, nonblocking netlink socket above.
+            // This private AsyncFd only lends shared references for recv;
+            // nothing closes or replaces its descriptor before deregistration.
+            fd: unsafe { AsyncFd::register(fd)? },
         })
     }
 

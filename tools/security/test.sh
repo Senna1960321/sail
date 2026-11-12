@@ -87,4 +87,24 @@ write_mock_cargo 'RUSTSEC-2026-0001: vulnerability found'
 expect_exit 1 env PATH="$mock_bin:/usr/bin:/bin" \
   SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit
 
+# An informational unsound advisory exits zero unless the scanner is told
+# to deny it. Exercise the actual cargo argument contract, not log wording.
+cat >"$mock_bin/cargo" <<'MOCK'
+#!/usr/bin/env bash
+for ((i=1; i<=$#; i++)); do
+  if [[ "${!i}" == --deny ]]; then
+    next=$((i + 1))
+    if [[ "${!next}" == unsound ]]; then
+      echo 'RUSTSEC-2026-0001: unsound advisory denied' >&2
+      exit 1
+    fi
+  fi
+done
+echo 'warning: unsound advisory (informational by default)' >&2
+exit 0
+MOCK
+chmod +x "$mock_bin/cargo"
+expect_exit 1 env PATH="$mock_bin:/usr/bin:/bin" \
+  SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit
+
 echo "security self-tests: PASS"
