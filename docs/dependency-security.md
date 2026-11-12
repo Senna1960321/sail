@@ -36,7 +36,10 @@ The individual networked checks are also available as
 audit refreshes the RustSec advisory database, denies unsound advisories,
 and requires `cargo-deny` advisories with transitive unsound dependencies,
 yanked versions, and the native `index-failure` diagnostic treated as errors.
-A zero `cargo-audit` exit alone does not establish registry availability.
+The deny registry check reads Cargo's local index cache; it does not attest
+to a fresh online yank query. A zero `cargo-audit` exit does not establish
+online availability: any lookup error remains incomplete verification and
+must be reported separately, even when the cached check passes.
 `python3 tools/security/test-index-failure.py`, after a successful audit,
 checks the native warning-to-error behavior with an isolated, vendored fixture;
 it does not modify the shared registry cache. `cargo-deny` runs with

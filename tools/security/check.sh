@@ -101,8 +101,9 @@ run_audit() {
     audit_args+=(--db "$CARGO_AUDIT_DB")
   fi
   run_logged "cargo-audit advisories" "${audit_args[@]}" || return $?
-  # cargo-audit can return zero after a registry lookup error. Require the
-  # native typed index diagnostic to be fatal in the second scanner too.
+  # Independently require readable local registry entries. This native
+  # check does not attest to a fresh online yank query; cargo-audit can
+  # return zero after an online lookup error, which remains incomplete.
   run_logged "cargo-deny advisories" \
     cargo deny --locked --manifest-path "$repo_root/Cargo.toml" \
       --config "$script_dir/deny.toml" check --deny index-failure advisories
