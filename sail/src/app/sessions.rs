@@ -24,8 +24,14 @@ pub const MAX_CONNECTIONS_WAIT: Duration = Duration::from_secs(1);
 /// The refusals are logged at most this often, with their count since.
 const WARN_EVERY: Duration = Duration::from_secs(10);
 
+#[cfg(feature = "internal-diagnostics")]
+#[doc(hidden)]
+pub mod diagnostics;
+
 /// The places, when there is a limit.
 pub struct Sessions {
+    #[cfg(feature = "internal-diagnostics")]
+    diagnostics: diagnostics::Counters,
     places: Arc<Semaphore>,
     limit: usize,
     /// Those waiting for a place: they hold their inbound side already, so
@@ -53,6 +59,8 @@ impl Sessions {
     /// None for 0, no limit.
     pub fn new(limit: usize) -> Option<Self> {
         (limit > 0).then(|| Self {
+            #[cfg(feature = "internal-diagnostics")]
+            diagnostics: Default::default(),
             places: Arc::new(Semaphore::new(limit)),
             limit,
             waiting: AtomicUsize::new(0),
@@ -69,18 +77,35 @@ impl Sessions {
     /// refused.
     pub async fn enter(&self, wait: Duration) -> Option<Place> {
         if let Ok(permit) = self.places.clone().try_acquire_owned() {
+            #[cfg(feature = "internal-diagnostics")]
+            self.diagnostics.admitted();
             return Some(Place(permit));
         }
+        #[cfg(feature = "internal-diagnostics")]
+        let mut observation = diagnostics::WaitObservation::new(&self.diagnostics);
         let previous = self.waiting.fetch_add(1, Ordering::AcqRel);
         let waiting = Waiting(&self.waiting);
         if previous >= self.max_waiting {
+            #[cfg(feature = "internal-diagnostics")]
+            observation.finish();
             self.refused();
             return None;
         }
         let waited = tokio::time::timeout(wait, self.places.clone().acquire_owned()).await;
+        #[cfg(feature = "internal-diagnostics")]
+        {
+            observation.finish();
+            if waited.is_err() {
+                self.diagnostics.timed_out();
+            }
+        }
         drop(waiting);
         match waited {
-            Ok(Ok(permit)) => Some(Place(permit)),
+            Ok(Ok(permit)) => {
+                #[cfg(feature = "internal-diagnostics")]
+                self.diagnostics.admitted();
+                Some(Place(permit))
+            }
             _ => {
                 self.refused();
                 None
@@ -93,7 +118,19 @@ impl Sessions {
         self.limit - self.places.available_permits()
     }
 
+    #[cfg(feature = "internal-diagnostics")]
+    pub(crate) fn diagnostics_snapshot(&self) -> diagnostics::AdmissionDiagnostics {
+        self.diagnostics.snapshot(
+            self.limit,
+            self.live(),
+            self.waiting.load(Ordering::Acquire),
+            self.max_waiting,
+        )
+    }
+
     fn refused(&self) {
+        #[cfg(feature = "internal-diagnostics")]
+        self.diagnostics.refused();
         let refused = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
         let mut warned = self.warned.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -381,3 +418,6 @@ mod tests {
         assert_eq!(sessions.live(), 0);
     }
 }
+
+#[cfg(test)]
+mod diagnostics_tests;

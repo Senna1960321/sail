@@ -373,6 +373,24 @@ impl Instance {
             .ok_or_else(Error::not_running)
     }
 
+    /// Read-only, nontransactional counters of this running dispatcher.
+    /// No previous run is returned while idle, starting, stopping or stopped.
+    #[cfg(feature = "internal-diagnostics")]
+    #[doc(hidden)]
+    pub fn internal_diagnostics(&self) -> Result<super::InternalDiagnostics, Error> {
+        let inner = self.inner();
+        let life = lock(&inner.life);
+        if life.phase != Phase::Running {
+            return Err(Error::not_running());
+        }
+        let dispatcher = life
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.dispatcher())
+            .ok_or_else(Error::not_running)?;
+        Ok(dispatcher.internal_diagnostics(inner.id))
+    }
+
     /// The runtime id, unique among the instances alive.
     #[doc(hidden)]
     pub fn id(&self) -> RuntimeId {
@@ -912,5 +930,121 @@ mod dynamic_feature_tests {
     fn an_explicit_dynamic_tun_option_requires_the_feature() {
         let error = super::Instance::new(super::Options::new().dynamic_tun(true)).unwrap_err();
         assert_eq!(error.kind(), super::ErrorKind::Unsupported);
+    }
+}
+
+#[cfg(all(test, feature = "internal-diagnostics", feature = "outbound-direct"))]
+mod internal_diagnostics_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn diagnostics_read_the_running_dispatcher_limit_and_serialize_unknowns() {
+        let instance = Instance::new(
+            super::super::Options::new()
+                .threads(super::super::Threads::One)
+                .settings_json(r#"{"set":["inbound.max_connections=256"]}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        instance.start(Config::Json("{}".into())).await.unwrap();
+        let snapshot = instance.internal_diagnostics().unwrap();
+        assert_eq!(snapshot.sessions.limit, 256);
+        assert_eq!(snapshot.sessions.live, Some(0));
+        assert_eq!(snapshot.sessions.waiting, Some(0));
+        assert_eq!(snapshot.sessions.waiting_limit, Some(64));
+        assert_eq!(snapshot, instance.internal_diagnostics().unwrap());
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["instance_id"], instance.id());
+        assert_eq!(json["sessions"]["limit"], 256);
+        assert!(json["sessions"]["active_cancel_total"].is_null());
+        assert!(json["dot_live_carriers"].is_null());
+        assert!(json["dot_active_queries"].is_null());
+        instance.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_leave_absent_pool_metrics_unobserved() {
+        let instance = Instance::new(
+            super::super::Options::new()
+                .threads(super::super::Threads::One)
+                .settings_json(r#"{"set":["inbound.max_connections=0"]}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        instance.start(Config::Json("{}".into())).await.unwrap();
+        let snapshot = instance.internal_diagnostics().unwrap();
+        assert_eq!(
+            snapshot.sessions,
+            super::super::AdmissionDiagnostics::default()
+        );
+        let json = serde_json::to_value(snapshot).unwrap();
+        for key in [
+            "live",
+            "waiting",
+            "waiting_limit",
+            "admitted_total",
+            "refused_total",
+            "wait_timeout_total",
+            "wait_cancelled_total",
+            "active_cancel_total",
+        ] {
+            assert!(json["sessions"][key].is_null(), "unknown pool metric {key}");
+        }
+        instance.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_select_only_the_current_running_epoch() {
+        let instance = Instance::new(
+            super::super::Options::new()
+                .threads(super::super::Threads::One)
+                .settings_json(r#"{"set":["inbound.max_connections=1"]}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            instance.internal_diagnostics().unwrap_err().kind(),
+            super::super::ErrorKind::NotRunning
+        );
+        instance.start(Config::Json("{}".into())).await.unwrap();
+        let old_manager = instance.manager().unwrap();
+        let first = instance.internal_diagnostics().unwrap();
+        assert_eq!(first.schema_version, 1);
+        assert_eq!(first.instance_id, instance.id());
+        assert_eq!(first.sessions.limit, 1);
+        assert_eq!(first.sessions.live, Some(0));
+        assert_eq!(first.sessions.admitted_total, Some(0));
+        assert_eq!(first.dot_live_carriers, None);
+        // A stale manager may exist in every one of these states. It must
+        // not bypass the explicit current Running phase check.
+        for phase in [
+            Phase::Starting,
+            Phase::Stopping,
+            Phase::Failed,
+            Phase::Idle,
+            Phase::Stopped,
+        ] {
+            lock(&instance.inner().life).phase = phase;
+            assert_eq!(
+                instance.internal_diagnostics().unwrap_err().kind(),
+                super::super::ErrorKind::NotRunning
+            );
+            lock(&instance.inner().life).phase = Phase::Running;
+        }
+        instance.stop().await.unwrap();
+        assert_eq!(
+            instance.internal_diagnostics().unwrap_err().kind(),
+            super::super::ErrorKind::NotRunning
+        );
+        instance.start(Config::Json("{}".into())).await.unwrap();
+        let second = instance.internal_diagnostics().unwrap();
+        assert_ne!(first.epoch, second.epoch);
+        assert_eq!(first.instance_id, second.instance_id);
+        assert_eq!(second.sessions.admitted_total, Some(0));
+        assert_eq!(second.sessions.refused_total, Some(0));
+        drop(old_manager);
+        assert_eq!(instance.internal_diagnostics().unwrap(), second);
+        instance.stop().await.unwrap();
     }
 }

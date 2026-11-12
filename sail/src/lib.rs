@@ -340,7 +340,8 @@ impl RuntimeManager {
             any(feature = "outbound-provider", feature = "http-client")
         ),
         feature = "outbound-provider",
-        feature = "rule-set"
+        feature = "rule-set",
+        feature = "internal-diagnostics"
     ))]
     pub(crate) fn dispatcher(&self) -> Option<Arc<app::dispatcher::Dispatcher>> {
         self.dispatcher.upgrade()

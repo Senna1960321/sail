@@ -558,6 +558,8 @@ pub struct Dispatcher {
     owners: super::owner::Owners,
     /// The places for sessions, under `inbound.max_connections`.
     sessions: Option<super::sessions::Sessions>,
+    #[cfg(feature = "internal-diagnostics")]
+    diagnostics_epoch: u64,
 }
 
 impl Dispatcher {
@@ -578,6 +580,8 @@ impl Dispatcher {
             dns_client,
             stat_manager,
             sessions: super::sessions::Sessions::new(env.options.inbound.max_connections),
+            #[cfg(feature = "internal-diagnostics")]
+            diagnostics_epoch: super::sessions::diagnostics::next_epoch(),
             env,
             inbound_types: Default::default(),
             owners: Default::default(),
@@ -596,6 +600,25 @@ impl Dispatcher {
         self.sessions
             .as_ref()
             .map_or(0, super::sessions::Sessions::live)
+    }
+
+    #[cfg(feature = "internal-diagnostics")]
+    pub(crate) fn internal_diagnostics(
+        &self,
+        instance_id: crate::RuntimeId,
+    ) -> super::sessions::diagnostics::InternalDiagnostics {
+        super::sessions::diagnostics::InternalDiagnostics {
+            schema_version: 1,
+            instance_id,
+            epoch: self.diagnostics_epoch,
+            sessions: self
+                .sessions
+                .as_ref()
+                .map(super::sessions::Sessions::diagnostics_snapshot)
+                .unwrap_or_default(),
+            dot_live_carriers: None,
+            dot_active_queries: None,
+        }
     }
 
     /// A place for one more session, or none: it is refused.

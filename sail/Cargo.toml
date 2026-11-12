@@ -10,6 +10,9 @@ name = "sail"
 path = "src/lib.rs"
 
 [features]
+# Read-only internal diagnostics, absent from ordinary builds.
+internal-diagnostics = []
+
 default = [
     "all-endpoints",
     "config-clash",

@@ -427,6 +427,9 @@ pub fn features() -> Vec<&'static str> {
 /// the process. A host asserts it at start.
 pub const PANICS_ARE_CAUGHT: bool = cfg!(panic = "unwind");
 
+#[cfg(feature = "internal-diagnostics")]
+#[doc(hidden)]
+pub use crate::app::sessions::diagnostics::{AdmissionDiagnostics, InternalDiagnostics};
 pub use crate::control::events::Fault;
 pub use crate::runtime::scope::{StopReport, TaskClass};
 #[doc(hidden)]
