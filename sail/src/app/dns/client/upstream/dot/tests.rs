@@ -683,7 +683,7 @@ async fn cancelling_an_exchange_releases_its_query_quota_and_pending_id() {
 
 /// An attachment owns the datagram, while queries and its shared DoT
 /// carrier poll in the root scope. Stopping it must cancel only its query.
-#[cfg(feature = "inbound-tun")]
+#[cfg(feature = "outbound-direct")]
 #[tokio::test]
 async fn stopping_an_isolated_receiver_releases_query_but_keeps_root_carrier() {
     use crate::adapter::OutboundDatagram;
