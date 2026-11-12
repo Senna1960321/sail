@@ -695,7 +695,7 @@ async fn stopping_an_isolated_receiver_releases_query_but_keeps_root_carrier() {
 
     scoped(async {
         let root = crate::runtime::scope::TaskScope::current().unwrap();
-        let attachment = root.isolated();
+        let attachment = crate::runtime::scope::TaskScope::default();
         let (client, upstream) = client();
         let super::super::State::Tls(pool) = &upstream.state else {
             panic!("not a DoT pool");
