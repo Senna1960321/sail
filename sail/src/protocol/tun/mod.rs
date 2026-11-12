@@ -2,6 +2,8 @@
 pub(crate) mod auto_redirect;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) mod auto_route;
+#[cfg(unix)]
+pub(crate) mod device_identity;
 pub mod inbound;
 mod packet_io;
 #[cfg(all(target_os = "linux", feature = "fuzzing"))]

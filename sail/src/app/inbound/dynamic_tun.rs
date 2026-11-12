@@ -384,7 +384,7 @@ impl RuntimeManager {
                     })
                     .await
                     .map_err(|e| Error::new(ErrorKind::Failed, format!("TUN open task ended: {e}")))
-                    .and_then(|r| r.map_err(|e| Error::new(ErrorKind::Failed, format!("{e:#}"))))
+                    .and_then(|r| r.map_err(device_open_error))
             }
         };
         // Drop a late/unjoined result before waiting on update or drain;
@@ -564,10 +564,47 @@ fn dispatcher_type(
     }
 }
 
+#[cfg(unix)]
+fn device_open_error(error: anyhow::Error) -> Error {
+    use crate::protocol::tun::device_identity::DeviceIdentityError;
+    let kind = match error
+        .downcast_ref::<DeviceIdentityError>()
+        .map(DeviceIdentityError::kind)
+    {
+        Some(std::io::ErrorKind::Unsupported) => ErrorKind::Unsupported,
+        Some(std::io::ErrorKind::InvalidInput) => ErrorKind::InvalidArgument,
+        _ => ErrorKind::Failed,
+    };
+    Error::new(kind, format!("{error:#}"))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[test]
+    fn device_identity_errors_keep_their_public_error_category() {
+        use crate::protocol::tun::device_identity::DeviceIdentityError;
+        let mismatch = DeviceIdentityError::Mismatch {
+            expected: "tunA".into(),
+            actual: "tunB".into(),
+        };
+        assert_eq!(
+            device_open_error(mismatch.into()).kind(),
+            ErrorKind::InvalidArgument
+        );
+        let unsupported = DeviceIdentityError::Query(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "controlled unsupported platform",
+        ));
+        assert_eq!(
+            device_open_error(unsupported.into()).kind(),
+            ErrorKind::Unsupported
+        );
+        let query = DeviceIdentityError::Query(std::io::Error::other("controlled query failure"));
+        assert_eq!(device_open_error(query.into()).kind(), ErrorKind::Failed);
+    }
 
     #[cfg(feature = "outbound-direct")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -675,6 +712,7 @@ mod tests {
             )
             .unwrap();
         let runner = TunRunner {
+            verified_name: None,
             runner: Box::pin(async move {
                 let _owned = (runtime, owned);
                 std::future::pending::<()>().await;

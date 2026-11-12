@@ -910,6 +910,15 @@ startup and is not dynamic-device discovery. Device and public packet-flow
 framing are different contracts. Windows offers the packet API, not this
 Unix device method.
 
+Dynamic device commit verifies the descriptor's interface identity with a
+read-only kernel query and requires it to match the requested nonempty name.
+Configuration hints and the device crate's cached name are not proof. Query
+failure or an unsupported platform refuses the commit; a mismatch returns
+`InvalidArgument`. Failure closes the transferred duplicate, retaining the
+host's original. Packet bridges carry no OS device identity. The real-device
+positive and FD lifecycle platform checks require an isolated capable host;
+UnixDatagram and memory-stack witnesses do not establish that acceptance.
+
 Dropping an unused `PreparedTun` releases only its own reservation. A
 stopped/restarted run and later generations reject stale handles. Once a
 commit future has been polled, cancelling its host await does not imply

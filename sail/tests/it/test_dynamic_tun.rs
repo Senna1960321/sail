@@ -528,7 +528,7 @@ impl sail::embed::Platform for OwnedFdHost {
 }
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn transferred_fd_closes_on_commit_failure_and_detach_but_host_original_survives() {
+async fn unverified_device_fd_is_closed_but_the_host_original_survives() {
     use std::os::fd::AsRawFd;
     for regular_file in [true, false] {
         let (original, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
@@ -555,13 +555,12 @@ async fn transferred_fd_closes_on_commit_failure_and_detach_but_host_original_su
         .unwrap();
         for _ in 0..3 {
             let p = i.prepare_tun_device(TUN).await.unwrap();
-            let result = p.commit().await;
-            if regular_file {
-                assert!(result.is_err(), "epoll must refuse /dev/null");
-            } else {
-                result.unwrap();
-                assert!(i.detach_tun().await.unwrap().clean());
-            }
+            let error = p.commit().await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Failed);
+            assert!(
+                error.message().contains("kernel identity query failed"),
+                "neither /dev/null nor a UnixDatagram may become a device via its name hint"
+            );
             let fd = host.last.load(std::sync::atomic::Ordering::SeqCst);
             assert!(fd >= 10000);
             // SAFETY: F_GETFD only queries the numeric descriptor, no pointer.
@@ -1032,7 +1031,7 @@ impl sail::embed::Platform for BlockingOwnedFdHost {
 }
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_late_successful_host_fd_is_closed_after_detach_or_instance_stop() {
+async fn a_late_unverified_host_fd_is_closed_after_detach_or_instance_stop() {
     use std::os::fd::AsRawFd;
     for stop_instance in [false, true] {
         let (original, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
@@ -1286,4 +1285,110 @@ async fn restart_refuses_an_old_callback_before_its_first_host_slot_read() {
     assert!(flow.downlink.recv().await.is_none());
     i.stop().await.unwrap();
     assert_eq!(host.observed.load(Ordering::SeqCst), 1);
+}
+
+/// A real host-owned device positive, kept separate from UnixDatagram and
+/// in-memory resource witnesses. Run only in a disposable network namespace.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an isolated network namespace, CAP_NET_ADMIN and /dev/net/tun"]
+async fn a_kernel_verified_host_device_closes_only_each_transferred_duplicate() {
+    use std::os::fd::AsRawFd;
+    let name = format!("sdh{}", std::process::id());
+    assert!(name.len() < libc::IFNAMSIZ);
+    let original = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")
+        .unwrap();
+    // SAFETY: ifreq is a valid zero-initialized ioctl output/request buffer.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (to, from) in request.ifr_name.iter_mut().zip(name.bytes()) {
+        *to = from as libc::c_char;
+    }
+    request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+    // SAFETY: this owned /dev/net/tun FD and correctly sized request remain live.
+    assert_eq!(
+        unsafe { libc::ioctl(original.as_raw_fd(), libc::TUNSETIFF, &request) },
+        0
+    );
+    let cname = std::ffi::CString::new(name.clone()).unwrap();
+    let host = Arc::new(OwnedFdHost {
+        original: original.into(),
+        last: std::sync::atomic::AtomicI32::new(-1),
+    });
+    let i = Instance::new(
+        Options::new()
+            .dynamic_tun(true)
+            .platform(host.clone())
+            .runtime(Runtime::Host(tokio::runtime::Handle::current())),
+    )
+    .unwrap();
+    start_config(&i).await;
+    let config = serde_json::json!({"type":"tun","tag":"capture","interface_name":name,
+        "address":["10.66.0.1/24"],"mtu":1500})
+    .to_string();
+    let wrong = config.replace(&name, &format!("{name}x"));
+    let reservation = i.prepare_tun_device(&wrong).await.unwrap();
+    assert_eq!(
+        reservation.commit().await.unwrap_err().kind(),
+        ErrorKind::InvalidArgument
+    );
+    let rejected = host.last.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(unsafe { libc::fcntl(rejected, libc::F_GETFD) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF)
+    );
+    assert!(i.detach_tun().await.unwrap().clean());
+    assert!(unsafe { libc::fcntl(host.original.as_raw_fd(), libc::F_GETFD) } >= 0);
+    for _ in 0..3 {
+        let prepared = i.prepare_tun_device(&config).await.unwrap();
+        prepared.commit().await.unwrap();
+        assert!(matches!(i.tun_state().unwrap(), TunState::Attached { .. }));
+        assert!(i.detach_tun().await.unwrap().clean());
+        let transferred = host.last.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(transferred >= 10000);
+        // SAFETY: queries only; neither descriptor is adopted or closed here.
+        assert_eq!(unsafe { libc::fcntl(transferred, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(unsafe { libc::fcntl(host.original.as_raw_fd(), libc::F_GETFD) } >= 0);
+        assert!(unsafe { libc::if_nametoindex(cname.as_ptr()) } > 0);
+    }
+    i.stop().await.unwrap();
+    drop(i);
+    drop(host);
+    assert_eq!(unsafe { libc::if_nametoindex(cname.as_ptr()) }, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_negative_host_descriptor_returns_a_typed_error_without_adoption() {
+    struct NegativeFd;
+    impl sail::embed::Platform for NegativeFd {
+        fn log(&self, _: &str) {}
+        fn opens_tun(&self) -> bool {
+            true
+        }
+        fn open_tun(&self, _: &sail::embed::TunRequest) -> std::io::Result<i32> {
+            Ok(-1)
+        }
+    }
+    let i = Instance::new(
+        Options::new()
+            .dynamic_tun(true)
+            .platform(Arc::new(NegativeFd))
+            .runtime(Runtime::Host(tokio::runtime::Handle::current())),
+    )
+    .unwrap();
+    start_config(&i).await;
+    let prepared = i.prepare_tun_device(TUN).await.unwrap();
+    let error = prepared.commit().await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert!(error.message().contains("negative owned descriptor"));
+    assert!(i.detach_tun().await.unwrap().clean());
+    i.stop().await.unwrap();
 }

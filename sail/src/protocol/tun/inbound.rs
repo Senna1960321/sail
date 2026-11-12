@@ -85,6 +85,8 @@ async fn with_faults(runner: impl std::future::Future<Output = ()>) {
 pub(crate) struct TunRunner {
     pub runner: Runner,
     pub control: NativeRuntimeControl,
+    #[cfg(unix)]
+    pub verified_name: Option<super::device_identity::VerifiedDeviceName>,
 }
 
 const fn budget_profile(budget: NetstackBudget) -> BudgetProfile {
@@ -361,6 +363,8 @@ pub(crate) fn run<I: sail_netstack::PacketIo + 'static>(
     Ok(TunRunner {
         runner,
         control: runtime_control,
+        #[cfg(unix)]
+        verified_name: None,
     })
 }
 
@@ -371,7 +375,15 @@ const MAX_QUEUES: usize = 8;
 /// The device's queues, a shard each with its own runner: one, or with
 /// `multi_queue` one to each CPU, up to [`MAX_QUEUES`].
 #[cfg(target_os = "linux")]
-fn linux_queues(settings: &TunSettings, netstack: &Netstack) -> Result<Vec<TunRsPacketIo>> {
+fn linux_queues(
+    settings: &TunSettings,
+    netstack: &Netstack,
+    verify_identity: bool,
+) -> Result<(
+    Vec<TunRsPacketIo>,
+    Option<super::device_identity::VerifiedDeviceName>,
+)> {
+    use std::os::fd::AsRawFd;
     let queue_count = if settings.multi_queue {
         std::thread::available_parallelism()
             .map_or(1, NonZeroUsize::get)
@@ -394,6 +406,9 @@ fn linux_queues(settings: &TunSettings, netstack: &Netstack) -> Result<Vec<TunRs
     let first = builder
         .build_async()
         .map_err(|e| anyhow!("create tun failed: {}", e))?;
+    let verified_name = verify_identity
+        .then(|| super::device_identity::verify(first.as_raw_fd(), &settings.name))
+        .transpose()?;
     let mut devices = Vec::with_capacity(queue_count);
     for _ in 1..queue_count {
         devices.push(
@@ -403,7 +418,7 @@ fn linux_queues(settings: &TunSettings, netstack: &Netstack) -> Result<Vec<TunRs
         );
     }
     devices.push(first);
-    devices
+    let queues = devices
         .into_iter()
         .map(|device| {
             TunRsPacketIo::new(
@@ -414,8 +429,8 @@ fn linux_queues(settings: &TunSettings, netstack: &Netstack) -> Result<Vec<TunRs
                 netstack.offload,
             )
         })
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(Into::into)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok((queues, verified_name))
 }
 
 /// The options of a TUN inbound, as sing-box's `tun` inbound names them.
@@ -1377,6 +1392,11 @@ pub(crate) fn dynamic_options(
         return Err(anyhow!("dynamic TUN: expected a tun inbound"));
     }
     let settings = options(inbound, host)?;
+    if settings.name.is_empty() {
+        return Err(anyhow!(
+            "dynamic TUN: an explicit nonempty device identity is required"
+        ));
+    }
     if settings.auto_route || settings.auto_redirect.is_some() {
         return Err(anyhow!(
             "dynamic TUN: auto_route and auto_redirect require a host network transaction"
@@ -1417,7 +1437,7 @@ pub(crate) fn new_dynamic(
         .platform
         .clone()
         .filter(|platform| platform.opens_tun());
-    open_device(
+    let opened = open_device(
         inbound,
         dispatcher,
         nat_manager,
@@ -1427,7 +1447,18 @@ pub(crate) fn new_dynamic(
             teardown: &teardown,
             publish_name: false,
         },
-    )
+    )?;
+    let name = opened.verified_name.as_ref().ok_or_else(|| {
+        super::device_identity::DeviceIdentityError::Query(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dynamic device did not provide a verified kernel identity",
+        ))
+    })?;
+    debug!(
+        interface = name.as_str(),
+        "opened kernel-verified dynamic TUN"
+    );
+    Ok(opened)
 }
 
 /// The TUN on Windows: a wintun adapter sail sets up itself.
@@ -1543,6 +1574,7 @@ fn open_device(
     platform: Option<crate::runtime::PlatformRef>,
     context: DeviceContext<'_>,
 ) -> Result<TunRunner> {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     let netstack = &dispatcher.env().options.netstack;
     let mtu = usize::from(settings.mtu);
     let mut cfg = tun::Configuration::default();
@@ -1556,19 +1588,40 @@ fn open_device(
         });
     }
     let host_opened = platform.is_some();
+    let mut verified_name = None;
     if let Some(platform) = platform {
         let fd = platform
             .open_tun(&settings.request())
             .map_err(|e| anyhow!("the host did not open the tun: {}", e))?;
-        cfg.raw_fd(fd);
+        if !context.publish_name {
+            if fd < 0 {
+                return Err(super::device_identity::DeviceIdentityError::Query(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "host returned a negative owned descriptor",
+                    ),
+                )
+                .into());
+            }
+            // SAFETY: open_tun transfers this owned duplicate, never the
+            // host's borrowed original. Query failure drops only this owner.
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            verified_name = Some(super::device_identity::verify(
+                owned.as_raw_fd(),
+                &settings.name,
+            )?);
+            cfg.raw_fd(owned.into_raw_fd());
+        } else {
+            cfg.raw_fd(fd);
+        }
     } else {
         #[cfg(target_os = "linux")]
         {
-            let queues = linux_queues(&settings, netstack)?;
+            let (queues, name) = linux_queues(&settings, netstack, !context.publish_name)?;
             if !context.publish_name {
                 context.teardown.push_check(device_gone(&settings.name));
             }
-            return run(
+            let mut opened = run(
                 inbound,
                 dispatcher.clone(),
                 nat_manager,
@@ -1576,7 +1629,9 @@ fn open_device(
                 mtu,
                 netstack,
                 settings.endpoint_independent_nat,
-            );
+            )?;
+            opened.verified_name = name;
+            return Ok(opened);
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1619,6 +1674,9 @@ fn open_device(
             .map_err(|e| anyhow!("[{}] inbound: open the host's tun: {}", inbound.tag, e))?;
         (tun, settings.name.clone())
     };
+    if !context.publish_name && verified_name.is_none() {
+        verified_name = Some(super::device_identity::verify(tun.as_raw_fd(), &name)?);
+    }
     let mut settings = settings;
     if context.publish_name && name != settings.name {
         // What reads the name from here on reads the one the TUN got.
@@ -1650,7 +1708,7 @@ fn open_device(
         )?;
     }
     let io = TunPacketIo::new(tun, mtu, netstack.batch_size)?;
-    run(
+    let mut opened = run(
         inbound,
         dispatcher.clone(),
         nat_manager,
@@ -1658,7 +1716,9 @@ fn open_device(
         mtu,
         netstack,
         settings.endpoint_independent_nat,
-    )
+    )?;
+    opened.verified_name = verified_name;
+    Ok(opened)
 }
 
 /// The check that the TUN `name` went with its runner. The kernel
