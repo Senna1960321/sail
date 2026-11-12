@@ -62,6 +62,8 @@ mock_bin="$test_root/mock-bin"
 mkdir -p "$mock_bin"
 printf '%s\n' '#!/usr/bin/env bash' 'echo "cargo-audit 0.22.2"' >"$mock_bin/cargo-audit"
 chmod +x "$mock_bin/cargo-audit"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "cargo-deny 0.20.2"' >"$mock_bin/cargo-deny"
+chmod +x "$mock_bin/cargo-deny"
 
 write_mock_cargo() {
   local message="$1"
@@ -106,5 +108,26 @@ MOCK
 chmod +x "$mock_bin/cargo"
 expect_exit 1 env PATH="$mock_bin:/usr/bin:/bin" \
   SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit
+
+# A successful audit alone is insufficient. The native index diagnostic
+# must be denied in the required advisories check, with its exit propagated.
+cat >"$mock_bin/cargo" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == audit ]]; then exit 0; fi
+if [[ "$1" == deny && " $* " == *" check --deny index-failure advisories "* ]]; then
+  echo 'error[index-failure]: unable to verify the registry index' >&2
+  exit 1
+fi
+exit 0
+MOCK
+chmod +x "$mock_bin/cargo"
+expect_exit 1 env PATH="$mock_bin:/usr/bin:/bin" \
+  SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit
+
+# A different lockfile must not silently split the two scanners' graphs.
+cp "$repo_root/Cargo.lock" "$test_root/different.lock"
+printf '\n# different input\n' >>"$test_root/different.lock"
+expect_exit 2 env PATH="$mock_bin:/usr/bin:/bin" \
+  SECURITY_LOCKFILE="$test_root/different.lock" "$script_dir/check.sh" audit
 
 echo "security self-tests: PASS"

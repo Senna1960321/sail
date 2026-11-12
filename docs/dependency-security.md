@@ -33,12 +33,19 @@ evidence with exit 2 when a scanner fails before policy evaluation.
 
 The individual networked checks are also available as
 `tools/security/check.sh audit` and `tools/security/check.sh licenses`. The
-audit refreshes the RustSec advisory database. `cargo-deny` runs with
+audit refreshes the RustSec advisory database, denies unsound advisories,
+and requires `cargo-deny` advisories with transitive unsound dependencies,
+yanked versions, and the native `index-failure` diagnostic treated as errors.
+A zero `cargo-audit` exit alone does not establish registry availability.
+`python3 tools/security/test-index-failure.py`, after a successful audit,
+checks the native warning-to-error behavior with an isolated, vendored fixture;
+it does not modify the shared registry cache. `cargo-deny` runs with
 `--locked`, the root workspace manifest, and `tools/security/deny.toml`.
 Neither command is allowed to resolve a different dependency graph.
 
 For a read-only diagnostic snapshot, `SECURITY_LOCKFILE` can point the audit at
-a copied lockfile and `CARGO_AUDIT_DB` can place the advisory database outside
+a byte-identical copy of the repository lockfile (other inputs are refused)
+and `CARGO_AUDIT_DB` can place the advisory database outside
 the user's Cargo directory:
 
 ```sh
@@ -47,8 +54,9 @@ CARGO_AUDIT_DB=/path/to/advisory-db \
 tools/security/check.sh audit
 ```
 
-CI deliberately leaves both variables unset and audits the committed root
-lockfile.
+`CARGO_AUDIT_DB` controls only cargo-audit's database; cargo-deny uses its
+own database in the Cargo home. CI leaves both variables unset and audits
+the committed root lockfile.
 
 Exit status `0` means the requested checks passed, `1` means policy findings,
 `2` means a scanner or configuration error prevented a trustworthy result,

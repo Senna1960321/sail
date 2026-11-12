@@ -47,6 +47,9 @@ allow-git = [
 # Advisories allowed, each with its reason; tools/security/check.sh passes
 # them to cargo-audit too.
 [advisories]
+# Include transitive unsound dependencies and reject yanked versions.
+unsound = "all"
+yanked = "deny"
 ignore = [
   # paste, unmaintained, a proc macro used at compile time only. tun-rs's
   # netlink graph (netconfig-rs 0.1.6, route_manager 0.2.16, through

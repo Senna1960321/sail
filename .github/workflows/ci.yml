@@ -1729,6 +1729,9 @@ jobs:
       - name: audit locked dependencies
         run: tools/security/check.sh audit
 
+      - name: test native registry index failure
+        run: python3 tools/security/test-index-failure.py
+
       - name: check licenses and resolved sources
         run: tools/security/check.sh licenses
 

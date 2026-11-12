@@ -82,6 +82,14 @@ run_audit() {
     echo "security-check: ERROR: Cargo.lock is required for cargo-audit: $lockfile" >&2
     return "$EXIT_ERROR"
   fi
+  # Both scanners must inspect the repository graph. A copied lockfile is
+  # accepted only when it is byte-identical, then the canonical file is used.
+  if ! cmp -s "$lockfile" "$repo_root/Cargo.lock"; then
+    echo "security-check: ERROR: audit requires the repository Cargo.lock or an identical copy" >&2
+    return "$EXIT_ERROR"
+  fi
+  lockfile="$repo_root/Cargo.lock"
+  require_tool cargo-deny "$DENY_VERSION" || return $?
   # Unsound advisories are warnings by default; they must fail this gate.
   local -a audit_args=(cargo audit --deny unsound --file "$lockfile")
   # The advisories deny.toml allows, each with its reason there.
@@ -92,7 +100,12 @@ run_audit() {
   if [[ -n "${CARGO_AUDIT_DB:-}" ]]; then
     audit_args+=(--db "$CARGO_AUDIT_DB")
   fi
-  run_logged "cargo-audit" "${audit_args[@]}"
+  run_logged "cargo-audit advisories" "${audit_args[@]}" || return $?
+  # cargo-audit can return zero after a registry lookup error. Require the
+  # native typed index diagnostic to be fatal in the second scanner too.
+  run_logged "cargo-deny advisories" \
+    cargo deny --locked --manifest-path "$repo_root/Cargo.toml" \
+      --config "$script_dir/deny.toml" check --deny index-failure advisories
 }
 
 run_licenses() {
