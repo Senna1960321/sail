@@ -560,6 +560,8 @@ pub struct Dispatcher {
     sessions: Option<super::sessions::Sessions>,
     #[cfg(feature = "internal-diagnostics")]
     diagnostics_epoch: u64,
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    udp_target: Option<std::sync::Arc<super::udp_target_diagnostics::Sink>>,
 }
 
 impl Dispatcher {
@@ -574,6 +576,8 @@ impl Dispatcher {
         crate::runtime::transfer_budget::configure(&env.options.memory);
         #[cfg(feature = "quic")]
         crate::transport::quic::configure_stall_timeout(env.options.mux.stall_timeout);
+        #[cfg(feature = "internal-diagnostics")]
+        let diagnostics_epoch = super::sessions::diagnostics::next_epoch();
         Dispatcher {
             outbound_manager,
             router,
@@ -581,7 +585,14 @@ impl Dispatcher {
             stat_manager,
             sessions: super::sessions::Sessions::new(env.options.inbound.max_connections),
             #[cfg(feature = "internal-diagnostics")]
-            diagnostics_epoch: super::sessions::diagnostics::next_epoch(),
+            diagnostics_epoch,
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            udp_target: env
+                .host
+                .kinds
+                .internal_udp_target_policy()
+                .cloned()
+                .map(|policy| super::udp_target_diagnostics::Sink::new(diagnostics_epoch, policy)),
             env,
             inbound_types: Default::default(),
             owners: Default::default(),
@@ -618,6 +629,26 @@ impl Dispatcher {
                 .unwrap_or_default(),
             dot_live_carriers: None,
             dot_active_queries: None,
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            udp_target: self.udp_target.as_ref().map_or_else(
+                || super::udp_target_diagnostics::Snapshot::unconfigured(self.diagnostics_epoch),
+                |sink| sink.snapshot(),
+            ),
+        }
+    }
+
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    pub(crate) fn udp_target_trace(
+        &self,
+        address: &SocksAddr,
+    ) -> Option<super::udp_target_diagnostics::Trace> {
+        let sink = self.udp_target.as_ref()?;
+        if !sink.is_fixture(address) {
+            return None;
+        }
+        match super::udp_target_diagnostics::current() {
+            Some(trace) => sink.owns(&trace).then_some(trace),
+            None => sink.begin(address),
         }
     }
 
@@ -1384,6 +1415,10 @@ impl Dispatcher {
             }
         }
 
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        if let Some(trace) = self.udp_target_trace(&sess.destination) {
+            trace.chain(h.tag(), &sess.chain);
+        }
         match handshake {
             Ok(mut d) => {
                 let elapsed = tokio::time::Instant::now().duration_since(handshake_start);
@@ -1715,6 +1750,28 @@ impl Dispatcher {
             .pick_route(sess, sniffer, &*outbounds)
             .await
             .map_err(|e| io::Error::other(format!("pick route: {}", e)))?;
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        if let Some(trace) = self.udp_target_trace(&sess.destination) {
+            let mut event = trace.event(super::udp_target_diagnostics::ROUTE);
+            event.router_generation = router.generation();
+            event.source_rule_index = sess
+                .matched_rule
+                .as_ref()
+                .and_then(|rule| router.rule_index(rule))
+                .unwrap_or(if sess.matched_rule.is_none() {
+                    super::udp_target_diagnostics::FINAL_RULE
+                } else {
+                    super::udp_target_diagnostics::UNKNOWN_RULE
+                });
+            event.action = match &decision {
+                Decision::Route(_) => super::udp_target_diagnostics::Action::Route,
+                Decision::Direct => super::udp_target_diagnostics::Action::Direct,
+                Decision::Reject { drop: false } => super::udp_target_diagnostics::Action::Reject,
+                Decision::Reject { drop: true } => super::udp_target_diagnostics::Action::Drop,
+                Decision::HijackDns => super::udp_target_diagnostics::Action::HijackDns,
+            };
+            trace.emit(event);
+        }
         // From the router that decided: a reload after numbers its own.
         if self.env.events.routes_wanted() {
             matched.rule = sess
@@ -2416,5 +2473,92 @@ mod tests {
              lhs: crate::adapter::AnyStream| async move { d.dispatch_stream(s, lhs).await },
         );
         assert!(routed <= 7 * 1024, "{} bytes", routed);
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "internal-udp-target-diagnostics",
+    feature = "outbound-direct"
+))]
+mod udp_target_route_tests {
+    use super::*;
+    use crate::app::udp_target_diagnostics::{self as diag, Action, Stage};
+
+    #[tokio::test]
+    async fn udp_target_none_policy_allocates_no_sink_or_ring() {
+        let instance = crate::embed::Instance::new(
+            crate::embed::Options::new().threads(crate::embed::Threads::One),
+        )
+        .unwrap();
+        instance
+            .start(crate::embed::Config::Json("{}".into()))
+            .await
+            .unwrap();
+        let dispatcher = instance.manager().unwrap().dispatcher().unwrap();
+        assert!(dispatcher.udp_target.is_none());
+        assert!(dispatcher
+            .udp_target_trace(&SocksAddr::Ip(diag::TEST_ADDR.into()))
+            .is_none());
+        instance.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn udp_target_source_rule_identity_and_final_sentinel() {
+        for (port, expected, action) in [
+            (diag::TEST_ADDR.port(), 1, Action::Reject),
+            (diag::TEST_ADDR.port() + 1, diag::FINAL_RULE, Action::Route),
+        ] {
+            let config=crate::config::Config::from_json(&serde_json::json!({
+                "outbounds":[{"type":"direct","tag":"private-node"}],
+                "route":{"rules":[{"domain":["secret.example"],"action":"reject"},{"port":[port],"action":"reject"}],"final":"private-node"}
+            }).to_string()).unwrap();
+            let env = std::sync::Arc::new(diag::test_env());
+            let instance = env
+                .scope
+                .enter(async {
+                    crate::app::instance::Instance::build(
+                        &config,
+                        config.route.rules.clone(),
+                        env.clone(),
+                        Default::default(),
+                    )
+                    .unwrap()
+                })
+                .await;
+            let d = instance.dispatcher.clone();
+            let address = SocksAddr::Ip(crate::app::udp_target_diagnostics::TEST_ADDR.into());
+            let trace = d.udp_target_trace(&address).unwrap();
+            let mut sess = Session {
+                network: crate::session::Network::Udp,
+                destination: address,
+                ..Default::default()
+            };
+            let (_tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let mut sniffer = DatagramSniffer::new(&mut rx);
+            let mut matched = Matched::default();
+            let result = diag::scope(
+                Some(trace),
+                d.route_told(&mut sess, &mut sniffer, &mut matched),
+            )
+            .await;
+            assert_eq!(result.is_err(), action == Action::Reject);
+            let snapshot = d.internal_diagnostics(0).udp_target;
+            let event = snapshot
+                .events
+                .iter()
+                .find(|e| e.stage == Stage::Route)
+                .unwrap();
+            assert_eq!(event.source_rule_index, expected);
+            assert_eq!(event.action, action);
+            assert_eq!(event.router_generation, d.router.load().generation());
+            let json = serde_json::to_string(&snapshot).unwrap();
+            assert!(!json.contains("secret.example"));
+            assert!(!json.contains("private-node"));
+            assert!(env
+                .scope
+                .stop(std::time::Duration::from_secs(1))
+                .await
+                .clean());
+        }
     }
 }

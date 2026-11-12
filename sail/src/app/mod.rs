@@ -33,6 +33,9 @@ pub(crate) mod recheck;
 pub mod router;
 pub mod sessions;
 pub mod stat_manager;
+#[cfg(feature = "internal-udp-target-diagnostics")]
+#[doc(hidden)]
+pub mod udp_target_diagnostics;
 
 #[cfg(feature = "api")]
 pub mod api;

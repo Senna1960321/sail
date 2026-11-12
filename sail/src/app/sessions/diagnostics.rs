@@ -30,6 +30,8 @@ pub struct AdmissionDiagnostics {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct InternalDiagnostics {
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    pub udp_target: crate::app::udp_target_diagnostics::Snapshot,
     pub schema_version: u32,
     pub instance_id: crate::RuntimeId,
     pub epoch: u64,

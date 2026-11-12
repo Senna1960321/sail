@@ -284,6 +284,8 @@ where
 /// reach any.
 pub struct OutboundDatagram<S> {
     stream: S,
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    diagnostic_trace: Option<crate::app::udp_target_diagnostics::Trace>,
     /// A domain destination, which replies are reported as coming from, as
     /// the trojan outbound does: the server answers from the address it
     /// resolved.
@@ -291,10 +293,20 @@ pub struct OutboundDatagram<S> {
 }
 
 impl<S> OutboundDatagram<S> {
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    pub(crate) fn with_diagnostic_trace(
+        mut self,
+        trace: Option<crate::app::udp_target_diagnostics::Trace>,
+    ) -> Self {
+        self.diagnostic_trace = trace;
+        self
+    }
     pub fn new(stream: S, destination: &SocksAddr) -> Self {
         OutboundDatagram {
             stream,
             destination: destination.is_domain().then(|| destination.clone()),
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            diagnostic_trace: None,
         }
     }
 }
@@ -315,7 +327,11 @@ where
                 r,
                 destination: self.destination,
             }),
-            Box::new(OutboundSendHalf(w)),
+            Box::new(OutboundSendHalf {
+                w,
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                diagnostic_trace: self.diagnostic_trace,
+            }),
         )
     }
 }
@@ -341,7 +357,11 @@ where
     }
 }
 
-struct OutboundSendHalf<S>(WriteHalf<S>);
+struct OutboundSendHalf<S> {
+    w: WriteHalf<S>,
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    diagnostic_trace: Option<crate::app::udp_target_diagnostics::Trace>,
+}
 
 #[async_trait]
 impl<S> OutboundDatagramSendHalf for OutboundSendHalf<S>
@@ -349,13 +369,46 @@ where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
     async fn send_to(&mut self, buf: &[u8], target: &SocksAddr) -> io::Result<usize> {
-        let packet = encode_packet(Some(target), buf)?;
-        self.0.write_all(&packet).await?;
-        Ok(buf.len())
+        #[cfg(not(feature = "internal-udp-target-diagnostics"))]
+        {
+            let packet = encode_packet(Some(target), buf)?;
+            self.w.write_all(&packet).await?;
+            Ok(buf.len())
+        }
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        {
+            let result: io::Result<usize> = async {
+                let packet = encode_packet(Some(target), buf)?;
+                self.w.write_all(&packet).await?;
+                Ok(buf.len())
+            }
+            .await;
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            if let Some(trace) = &self.diagnostic_trace {
+                if trace.is_fixture(target) {
+                    let mut event = trace.event(crate::app::udp_target_diagnostics::WRITE);
+                    event.address_kind = crate::app::udp_target_diagnostics::address_kind(target);
+                    event.matches_fixture = true;
+                    event.bytes = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+                    match &result {
+                        Ok(_) => {
+                            event.result = crate::app::udp_target_diagnostics::Outcome::Accepted
+                        }
+                        Err(error) => {
+                            event.result = crate::app::udp_target_diagnostics::Outcome::Failed;
+                            event.error_kind =
+                                crate::app::udp_target_diagnostics::error_kind(error.kind());
+                        }
+                    }
+                    trace.emit(event);
+                }
+            }
+            result
+        }
     }
 
     async fn close(&mut self) -> io::Result<()> {
-        self.0.shutdown().await
+        self.w.shutdown().await
     }
 }
 

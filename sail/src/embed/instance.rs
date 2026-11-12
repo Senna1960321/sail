@@ -1048,3 +1048,142 @@ mod internal_diagnostics_tests {
         instance.stop().await.unwrap();
     }
 }
+
+#[cfg(all(
+    test,
+    feature = "internal-udp-target-diagnostics",
+    feature = "outbound-direct"
+))]
+mod internal_udp_policy_tests {
+    use super::*;
+    use crate::app::udp_target_diagnostics as diag;
+
+    struct QuietPlatform;
+    impl Platform for QuietPlatform {
+        fn log(&self, _: &str) {}
+    }
+
+    #[tokio::test]
+    async fn diagnostics_none_policy_is_explicit_and_creates_no_trace() {
+        let instance =
+            Instance::new(super::super::Options::new().threads(super::super::Threads::One))
+                .unwrap();
+        instance.start(Config::Json("{}".into())).await.unwrap();
+        let snapshot = instance.internal_diagnostics().unwrap();
+        assert_eq!(snapshot.schema_version, 1);
+        let udp = snapshot.udp_target;
+        assert_eq!(udp.schema_version, 2);
+        assert_eq!(udp.fixture, "fixed-ipv4-policy-v1");
+        assert!(!udp.configured);
+        assert_eq!(udp.epoch, snapshot.epoch);
+        assert_eq!(udp.dropped, 0);
+        assert!(!udp.snapshot_contended);
+        assert!(udp.events.is_empty());
+        assert!(instance
+            .manager()
+            .unwrap()
+            .dispatcher()
+            .unwrap()
+            .udp_target_trace(&crate::session::SocksAddr::Ip(diag::TEST_ADDR.into()))
+            .is_none());
+        instance.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_policy_survives_builders_cow_reload_and_restart() {
+        use super::super::{InternalUdpTargetPolicy, Options, Threads};
+        use crate::session::SocksAddr;
+        let a = diag::TEST_ADDR;
+        let mut b = a;
+        b.set_port(a.port() + 1);
+        let options = Options::new()
+            .internal_udp_target_policy(InternalUdpTargetPolicy::new(b).unwrap())
+            .internal_udp_target_policy(InternalUdpTargetPolicy::new(a).unwrap())
+            .settings_json(r#"{"set":["inbound.max_connections=256"]}"#)
+            .unwrap()
+            .platform(Arc::new(QuietPlatform))
+            .dynamic_tun(false)
+            .threads(Threads::One)
+            .inbound_kind("diagnostic-mock-inbound", |_| {
+                Err("unused mock factory".into())
+            })
+            .unwrap()
+            .outbound_kind("diagnostic-mock-outbound", |_| {
+                Err("unused mock factory".into())
+            })
+            .unwrap();
+        // The real shared HostKinds Arc, without adding Clone to Options.
+        let shared_kinds = options.kinds.clone();
+        let first = Instance::new(options).unwrap();
+        first.start(Config::Json("{}".into())).await.unwrap();
+        let old_epoch = first.internal_diagnostics().unwrap().epoch;
+        let old_dispatcher = first.manager().unwrap().dispatcher().unwrap();
+        let trace = old_dispatcher
+            .udp_target_trace(&SocksAddr::Ip(a.into()))
+            .unwrap();
+        assert!(old_dispatcher
+            .udp_target_trace(&SocksAddr::Ip(b.into()))
+            .is_none());
+        let mut replacement_options = Options::new().threads(Threads::One);
+        replacement_options.kinds = shared_kinds;
+        let second = Instance::new(
+            replacement_options
+                .internal_udp_target_policy(InternalUdpTargetPolicy::new(b).unwrap()),
+        )
+        .unwrap();
+        second.start(Config::Json("{}".into())).await.unwrap();
+        let second_dispatcher = second.manager().unwrap().dispatcher().unwrap();
+        assert!(second_dispatcher
+            .udp_target_trace(&SocksAddr::Ip(b.into()))
+            .is_some());
+        assert!(second_dispatcher
+            .udp_target_trace(&SocksAddr::Ip(a.into()))
+            .is_none());
+        assert!(old_dispatcher
+            .udp_target_trace(&SocksAddr::Ip(a.into()))
+            .is_some());
+        first.reload(Some(Config::Json("{}".into()))).await.unwrap();
+        assert_eq!(first.internal_diagnostics().unwrap().epoch, old_epoch);
+        assert!(old_dispatcher
+            .udp_target_trace(&SocksAddr::Ip(a.into()))
+            .is_some());
+        trace.emit(trace.event(diag::NATIVE));
+        assert_eq!(
+            first
+                .internal_diagnostics()
+                .unwrap()
+                .udp_target
+                .events
+                .len(),
+            1
+        );
+        first.stop().await.unwrap();
+        assert_eq!(
+            first.internal_diagnostics().unwrap_err().kind(),
+            super::super::ErrorKind::NotRunning
+        );
+        first.start(Config::Json("{}".into())).await.unwrap();
+        let current = first.manager().unwrap().dispatcher().unwrap();
+        let fresh = first.internal_diagnostics().unwrap();
+        assert_ne!(fresh.epoch, old_epoch);
+        assert!(fresh.udp_target.configured);
+        assert_eq!(fresh.udp_target.fixture, "fixed-ipv4-policy-v1");
+        assert!(fresh.udp_target.events.is_empty());
+        assert!(current.udp_target_trace(&SocksAddr::Ip(a.into())).is_some());
+        assert!(current.udp_target_trace(&SocksAddr::Ip(b.into())).is_none());
+        assert!(diag::scope(Some(trace.clone()), async {
+            current.udp_target_trace(&SocksAddr::Ip(a.into()))
+        })
+        .await
+        .is_none());
+        trace.emit(trace.event(diag::NATIVE));
+        assert!(first
+            .internal_diagnostics()
+            .unwrap()
+            .udp_target
+            .events
+            .is_empty());
+        first.stop().await.unwrap();
+        second.stop().await.unwrap();
+    }
+}

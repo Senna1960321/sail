@@ -508,6 +508,17 @@ struct Links {
 }
 
 impl Chain {
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    pub(crate) fn diagnostic_visit(&self, mut visit: impl FnMut(&str)) -> Option<bool> {
+        let Ok(links) = self.0.try_lock() else {
+            return None;
+        };
+        for tag in links.tags.iter().take(3) {
+            visit(tag);
+        }
+        Some(links.tags.len() > 3)
+    }
+
     fn links(&self) -> std::sync::MutexGuard<'_, Links> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1356,5 +1367,21 @@ mod tests {
         assert!(domain.as_socket_addr().is_none());
         assert_eq!(domain.clone(), domain);
         assert!(SocksAddr::any_ipv6().as_socket_addr().unwrap().is_ipv6());
+    }
+}
+
+#[cfg(all(test, feature = "internal-udp-target-diagnostics"))]
+mod udp_target_chain_tests {
+    #[test]
+    fn udp_target_chain_try_lock_and_three_member_bound() {
+        let chain = super::Chain::default();
+        for _ in 0..100 {
+            chain.push("sensitive-tag");
+        }
+        let mut visited = 0;
+        assert_eq!(chain.diagnostic_visit(|_| visited += 1), Some(true));
+        assert_eq!(visited, 3);
+        let _guard = chain.0.lock().unwrap();
+        assert_eq!(chain.diagnostic_visit(|_| panic!("must not enter")), None);
     }
 }

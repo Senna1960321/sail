@@ -92,11 +92,31 @@ pub struct HostKinds(Arc<Kinds>, bool);
 
 #[derive(Default)]
 struct Kinds {
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    udp_target_policy: Option<crate::embed::InternalUdpTargetPolicy>,
     inbounds: HashMap<&'static str, InboundKindFactory>,
     outbounds: HashMap<&'static str, OutboundKindFactory>,
 }
 
 impl HostKinds {
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    pub(crate) fn with_internal_udp_target_policy(
+        mut self,
+        policy: crate::embed::InternalUdpTargetPolicy,
+    ) -> Self {
+        let mut kinds = self.copy();
+        kinds.udp_target_policy = Some(policy);
+        self.0 = Arc::new(kinds);
+        self
+    }
+
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    pub(crate) fn internal_udp_target_policy(
+        &self,
+    ) -> Option<&crate::embed::InternalUdpTargetPolicy> {
+        self.0.udp_target_policy.as_ref()
+    }
+
     // Keep the opt-in Rust setting in this sealed per-instance host
     // configuration, without adding a field to public Host struct literals.
     pub(crate) fn with_dynamic_tun(mut self, enabled: bool) -> Self {
@@ -144,6 +164,8 @@ impl HostKinds {
 
     fn copy(&self) -> Kinds {
         Kinds {
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            udp_target_policy: self.0.udp_target_policy.clone(),
             inbounds: self.0.inbounds.clone(),
             outbounds: self.0.outbounds.clone(),
         }

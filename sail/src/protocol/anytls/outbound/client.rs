@@ -131,7 +131,28 @@ impl Client {
             crate::runtime::scope::spawn_essential("anytls idle check", check);
         }
         while let Some((seq, pooled)) = self.take_idle() {
-            match pooled.session.open_stream(first).await {
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            if let Some(trace) = crate::app::udp_target_diagnostics::current() {
+                let mut event = trace.event(crate::app::udp_target_diagnostics::OPEN);
+                event.carrier_reused = true;
+                trace.emit(event);
+            }
+            let opened = pooled.session.open_stream(first).await;
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            if let Some(trace) = crate::app::udp_target_diagnostics::current() {
+                let mut event = trace.event(crate::app::udp_target_diagnostics::OPEN);
+                event.carrier_reused = true;
+                match &opened {
+                    Ok(_) => event.result = crate::app::udp_target_diagnostics::Outcome::Accepted,
+                    Err(error) => {
+                        event.result = crate::app::udp_target_diagnostics::Outcome::Failed;
+                        event.error_kind =
+                            crate::app::udp_target_diagnostics::error_kind(error.kind());
+                    }
+                }
+                trace.emit(event);
+            }
+            match opened {
                 Ok(stream) => {
                     pooled.bound.onto(sess);
                     return Ok(ClientStream {
@@ -141,6 +162,8 @@ impl Client {
                             sess: sess.clone(),
                             first: Bytes::copy_from_slice(first),
                             written: BytesMut::new(),
+                            #[cfg(feature = "internal-udp-target-diagnostics")]
+                            diagnostic_trace: crate::app::udp_target_diagnostics::current(),
                         }),
                     });
                 }
@@ -160,14 +183,43 @@ impl Client {
         sess: &ProxySession,
         first: &[u8],
     ) -> io::Result<Stream> {
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let pooled = self
-            .new_session(sess)
-            .instrument(tracing::Span::current())
-            .await?;
-        debug!("anytls session {} to {}:{}", seq, self.server, self.port);
-        let stream = pooled.session.open_stream(first).await?;
-        Ok(self.lease(seq, pooled, stream))
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        if let Some(trace) = crate::app::udp_target_diagnostics::current() {
+            trace.emit(trace.event(crate::app::udp_target_diagnostics::OPEN));
+        }
+        #[cfg(not(feature = "internal-udp-target-diagnostics"))]
+        {
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let pooled = self
+                .new_session(sess)
+                .instrument(tracing::Span::current())
+                .await?;
+            debug!("anytls session {} to {}:{}", seq, self.server, self.port);
+            let stream = pooled.session.open_stream(first).await?;
+            Ok(self.lease(seq, pooled, stream))
+        }
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        {
+            let opened = async {
+                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let pooled = self
+                    .new_session(sess)
+                    .instrument(tracing::Span::current())
+                    .await?;
+                debug!("anytls session {} to {}:{}", seq, self.server, self.port);
+                let stream = pooled.session.open_stream(first).await?;
+                io::Result::Ok(self.lease(seq, pooled, stream))
+            }
+            .await;
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            if let Some(trace) = crate::app::udp_target_diagnostics::current() {
+                trace.result(
+                    crate::app::udp_target_diagnostics::OPEN,
+                    opened.as_ref().map(|_| ()).map_err(|e| e.kind()),
+                );
+            }
+            opened
+        }
     }
 
     /// Hands `stream` out, to put its session back when it is dropped.
@@ -241,8 +293,27 @@ impl Client {
             .read()
             .map(|p| p.auth_padding())
             .unwrap_or_default();
-        conn.write_all(&auth(&self.password_hash, padding)).await?;
-        conn.flush().await?;
+        #[cfg(not(feature = "internal-udp-target-diagnostics"))]
+        {
+            conn.write_all(&auth(&self.password_hash, padding)).await?;
+            conn.flush().await?;
+        }
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        {
+            let authenticated = async {
+                conn.write_all(&auth(&self.password_hash, padding)).await?;
+                conn.flush().await
+            }
+            .await;
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            if let Some(trace) = crate::app::udp_target_diagnostics::current() {
+                trace.result(
+                    crate::app::udp_target_diagnostics::Stage::Authenticate,
+                    authenticated.as_ref().map(|_| ()).map_err(|e| e.kind()),
+                );
+            }
+            authenticated?;
+        }
         Ok(Pooled {
             session: Session::client(
                 conn,
@@ -272,6 +343,8 @@ struct Retry {
     first: Bytes,
     /// What was written after `first`.
     written: BytesMut,
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    diagnostic_trace: Option<crate::app::udp_target_diagnostics::Trace>,
 }
 
 enum State {
@@ -322,14 +395,16 @@ impl ClientStream {
             "anytls stream got no SYNACK on a reused session, opening it on a new one with {} bytes",
             retry.written.len()
         );
-        self.state = State::Reopening(Mutex::new(
-            async move {
-                let mut stream = client.open_on_new(&retry.sess, &retry.first).await?;
-                stream.write_all(&retry.written).await?;
-                Ok(stream)
-            }
-            .boxed(),
-        ));
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        let diagnostic_trace = retry.diagnostic_trace.clone();
+        let reopening = async move {
+            let mut stream = client.open_on_new(&retry.sess, &retry.first).await?;
+            stream.write_all(&retry.written).await?;
+            Ok(stream)
+        };
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        let reopening = crate::app::udp_target_diagnostics::scope(diagnostic_trace, reopening);
+        self.state = State::Reopening(Mutex::new(reopening.boxed()));
         true
     }
 }
@@ -704,5 +779,89 @@ mod tests {
         let mut idle = pool(&[(1, 1), (2, 1)], now);
         let expired = expire(&mut idle, now, Duration::from_secs(30), 5, |s| *s == 2);
         assert_eq!(expired, vec![2]);
+    }
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    #[tokio::test]
+    async fn udp_target_cold_and_reused_open_results_on_localhost() {
+        use crate::app::udp_target_diagnostics::{self as diag, Outcome, Sink, Stage};
+        let (port, mut streams) = server().await;
+        let client = client(port);
+        let target = SocksAddr::Ip(crate::app::udp_target_diagnostics::TEST_ADDR.into());
+        let sink = Sink::new(101, crate::app::udp_target_diagnostics::test_policy());
+        let trace = sink.begin(&target).unwrap();
+        let sess = ProxySession {
+            network: Network::Udp,
+            destination: target,
+            ..Default::default()
+        };
+        let mut first = diag::scope(Some(trace.clone()), client.open_stream(&sess, b"D"))
+            .await
+            .unwrap();
+        let (conn, mut served) = accept(&mut streams, b"D").await;
+        assert_eq!(conn, 1);
+        served.write_all(b"bye").await.unwrap();
+        served.shutdown().await.unwrap();
+        read_end(&mut first, b"bye").await;
+        drop(first);
+        drop(served);
+        let _second = diag::scope(Some(trace), client.open_stream(&sess, b"D"))
+            .await
+            .unwrap();
+        let (conn, _served) = accept(&mut streams, b"D").await;
+        assert_eq!(conn, 1);
+        let snapshot = sink.snapshot();
+        assert!(snapshot
+            .events
+            .iter()
+            .any(|e| e.stage == Stage::Open && !e.carrier_reused && e.result == Outcome::Accepted));
+        assert!(snapshot
+            .events
+            .iter()
+            .any(|e| e.stage == Stage::Open && e.carrier_reused && e.result == Outcome::Accepted));
+    }
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    #[tokio::test]
+    async fn udp_target_layer_failure_has_its_own_cold_open_error() {
+        use crate::app::udp_target_diagnostics::{self as diag, ErrorCode, Outcome, Sink, Stage};
+        struct Fail;
+        #[async_trait]
+        impl OutboundStreamHandler for Fail {
+            fn connect_addr(&self) -> OutboundConnect {
+                OutboundConnect::Unknown
+            }
+            async fn handle<'a>(
+                &'a self,
+                sess: &'a ProxySession,
+                _: Option<&mut AnyStream>,
+                _: Option<AnyStream>,
+            ) -> io::Result<AnyStream> {
+                assert_eq!(sess.network, Network::Tcp);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "secret-account/raw-TLS-error",
+                ))
+            }
+        }
+        let client = client_over(9, Arc::new(Fail));
+        let target = SocksAddr::Ip(crate::app::udp_target_diagnostics::TEST_ADDR.into());
+        let sink = Sink::new(102, crate::app::udp_target_diagnostics::test_policy());
+        let trace = sink.begin(&target).unwrap();
+        let sess = ProxySession {
+            network: Network::Udp,
+            destination: target,
+            ..Default::default()
+        };
+        assert!(diag::scope(Some(trace), client.open_stream(&sess, b"D"))
+            .await
+            .is_err());
+        let snapshot = sink.snapshot();
+        for stage in [Stage::ConnectLayers, Stage::Open] {
+            assert!(snapshot.events.iter().any(|e| e.stage == stage
+                && e.result == Outcome::Failed
+                && e.error_kind == ErrorCode::PermissionDenied));
+        }
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("secret-account"));
+        assert!(!json.contains("raw-TLS-error"));
     }
 }

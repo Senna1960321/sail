@@ -153,6 +153,8 @@ impl Drop for AdmissionQueueOwner {
 }
 
 struct NatSession {
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    diagnostic_trace: Option<super::udp_target_diagnostics::Trace>,
     uplink: Sender<UdpPacket>,
     abort: oneshot::Sender<bool>,
     last_activity: Instant,
@@ -434,15 +436,52 @@ impl NatManager {
 
     fn _send(&self, guard: &mut MutexGuard<'_, SessionMap>, key: &NatKey, pkt: UdpPacket) {
         if let Some(sess) = guard.get_mut(key) {
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            let diagnostic_trace = self.dispatcher.udp_target_trace(&pkt.dst_addr);
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            let mut diagnostic_event = diagnostic_trace.as_ref().map(|trace| {
+                let mut event = trace.event(super::udp_target_diagnostics::NAT_QUEUE);
+                event.parent_flow_id = sess.diagnostic_trace.as_ref().map_or(0, |t| t.flow_id);
+                event.coverage_missing = sess.diagnostic_trace.is_none();
+                event
+            });
             let reserved = if let Some(queue) = &sess.admissions {
                 if !queue.reserve() {
+                    #[cfg(feature = "internal-udp-target-diagnostics")]
+                    if let (Some(trace), Some(mut event)) =
+                        (&diagnostic_trace, diagnostic_event.take())
+                    {
+                        event.result = super::udp_target_diagnostics::Outcome::Failed;
+                        event.queue_status =
+                            super::udp_target_diagnostics::QueueStatus::ReserveRefused;
+                        trace.emit(event);
+                    }
                     return;
                 }
                 true
             } else {
                 false
             };
-            match sess.uplink.try_send(pkt) {
+            let queued = sess.uplink.try_send(pkt);
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            if let (Some(trace), Some(mut event)) = (diagnostic_trace, diagnostic_event.take()) {
+                event.result = if queued.is_ok() {
+                    super::udp_target_diagnostics::Outcome::Accepted
+                } else {
+                    super::udp_target_diagnostics::Outcome::Failed
+                };
+                event.queue_status = match &queued {
+                    Ok(_) => super::udp_target_diagnostics::QueueStatus::Accepted,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        super::udp_target_diagnostics::QueueStatus::Full
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        super::udp_target_diagnostics::QueueStatus::Closed
+                    }
+                };
+                trace.emit(event);
+            }
+            match queued {
                 Ok(()) => sess.dns_answered = false,
                 Err(err) => {
                     if reserved {
@@ -471,8 +510,22 @@ impl NatManager {
             debug!("drop udp packet from {}: {}", dgram_src, e);
             return;
         }
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        let diagnostic_trace = self.dispatcher.udp_target_trace(&pkt.dst_addr);
         let key = NatKey::new(inbound_tag, dgram_src);
         let mut guard = self.sessions.lock().await;
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        if let Some(trace) = &diagnostic_trace {
+            let entry = guard.get(&key);
+            let mut event = trace.event(super::udp_target_diagnostics::NAT_ENTRY);
+            event.entry_hit = entry.is_some();
+            event.original_is_fixture = entry.map_or(true, |e| e.diagnostic_trace.is_some());
+            event.coverage_missing = entry.is_some_and(|e| e.diagnostic_trace.is_none());
+            event.parent_flow_id = entry
+                .and_then(|e| e.diagnostic_trace.as_ref())
+                .map_or(0, |t| t.flow_id);
+            trace.emit(event);
+        }
 
         if guard.contains_key(&key) {
             self._send(&mut guard, &key, pkt);
@@ -560,11 +613,15 @@ impl NatManager {
             .copied()
             .unwrap_or(crate::config::model::DEFAULT_UDP_TIMEOUT);
         let key = NatKey::new(&sess.inbound_tag, &raddr);
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        let diagnostic_trace = self.dispatcher.udp_target_trace(&sess.destination);
         let generation = PendingAnswers::default();
         let (admissions, admissions_owner) = QueuedAdmissions::new(generation.clone());
         guard.insert(
             key.clone(),
             NatSession {
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                diagnostic_trace: diagnostic_trace.clone(),
                 uplink: target_ch_tx,
                 abort: downlink_abort_tx,
                 last_activity: Instant::now(),
@@ -603,10 +660,25 @@ impl NatManager {
                     }
                 };
                 let mut sniffer = DatagramSniffer::new(&mut target_ch_rx);
-                let socket = dispatcher
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                if let Some(trace) = &diagnostic_trace {
+                    trace.emit(trace.event(super::udp_target_diagnostics::DISPATCH));
+                }
+                let dispatch = dispatcher
                     .dispatch_datagram_tracked(sess, &mut sniffer, generation.clone())
-                    .instrument(tracing::Span::current())
-                    .await;
+                    .instrument(tracing::Span::current());
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                let socket =
+                    super::udp_target_diagnostics::scope(diagnostic_trace.clone(), dispatch).await;
+                #[cfg(not(feature = "internal-udp-target-diagnostics"))]
+                let socket = dispatch.await;
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                if let Some(trace) = &diagnostic_trace {
+                    trace.result(
+                        super::udp_target_diagnostics::DISPATCH,
+                        socket.as_ref().map(|_| ()).map_err(|e| e.kind()),
+                    );
+                }
                 let sniffed = sniffer.into_read();
                 let (socket, listed) = match socket {
                     Ok(((s, udp_timeout, listed), pending)) => {
@@ -963,6 +1035,8 @@ mod tests {
         let sessions = Mutex::new(HashMap::from([(
             key.clone(),
             NatSession {
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                diagnostic_trace: None,
                 uplink,
                 abort,
                 last_activity: Instant::now(),
@@ -1020,6 +1094,8 @@ mod tests {
         pending.add(2);
         let now = Instant::now();
         let mut session = NatSession {
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            diagnostic_trace: None,
             uplink,
             abort,
             last_activity: now,
@@ -1367,5 +1443,111 @@ mod tests {
                 .await;
             assert!(scope.stop(Duration::from_secs(1)).await.clean());
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "internal-udp-target-diagnostics",
+    feature = "outbound-direct"
+))]
+mod udp_target_tests {
+    use super::*;
+    use crate::app::udp_target_diagnostics::{self as diag, QueueStatus, Stage};
+    #[tokio::test]
+    async fn udp_target_existing_nonfixture_entry_queue_reasons_and_packet_gate() {
+        let config = crate::config::Config::from_json("{}").unwrap();
+        let env = Arc::new(diag::test_env());
+        let instance = env
+            .scope
+            .enter(async {
+                crate::app::instance::Instance::build(
+                    &config,
+                    config.route.rules.clone(),
+                    env.clone(),
+                    Arc::default(),
+                )
+                .unwrap()
+            })
+            .await;
+        let nat = NatManager::new(instance.dispatcher.clone(), &config.inbounds);
+        let source = DatagramSource::new("127.0.0.1:50000".parse().unwrap(), None);
+        let key = NatKey::new("test", &source);
+        let (tx, rx) = mpsc::channel(1);
+        let (abort, _) = oneshot::channel();
+        nat.sessions.lock().await.insert(
+            key.clone(),
+            NatSession {
+                diagnostic_trace: None,
+                uplink: tx,
+                abort,
+                last_activity: Instant::now(),
+                idle_timeout: Duration::from_secs(300),
+                dns_answered: false,
+                generation: PendingAnswers::default(),
+                pending: None,
+                admissions: None,
+            },
+        );
+        let (down, _) = mpsc::channel(1);
+        let fixture = SocksAddr::Ip(crate::app::udp_target_diagnostics::TEST_ADDR.into());
+        let packet = |dst: SocksAddr| UdpPacket::new(vec![1], SocksAddr::Ip(source.address), dst);
+        nat.send(None, &source, "test", &down, packet(fixture.clone()))
+            .await;
+        nat.send(None, &source, "test", &down, packet(fixture.clone()))
+            .await;
+        drop(rx);
+        nat.send(None, &source, "test", &down, packet(fixture.clone()))
+            .await;
+        let pending = PendingAnswers::default();
+        let (queue, owner) = QueuedAdmissions::new(pending);
+        drop(owner);
+        nat.sessions.lock().await.get_mut(&key).unwrap().admissions = Some(queue);
+        nat.send(None, &source, "test", &down, packet(fixture.clone()))
+            .await;
+        let before = instance.dispatcher.internal_diagnostics(0).udp_target;
+        let entry = before
+            .events
+            .iter()
+            .find(|e| e.stage == Stage::NatEntry)
+            .unwrap();
+        assert!(entry.entry_hit && !entry.original_is_fixture && entry.coverage_missing);
+        for status in [
+            QueueStatus::Accepted,
+            QueueStatus::Full,
+            QueueStatus::Closed,
+            QueueStatus::ReserveRefused,
+        ] {
+            assert!(before
+                .events
+                .iter()
+                .any(|e| e.stage == Stage::NatQueue && e.queue_status == status));
+        }
+        assert!(!before
+            .events
+            .iter()
+            .any(|e| matches!(e.stage, Stage::Route | Stage::AnyTls | Stage::Open)));
+        for dst in [
+            SocksAddr::Ip(std::net::SocketAddr::new(
+                crate::app::udp_target_diagnostics::TEST_ADDR
+                    .ip()
+                    .to_owned()
+                    .into(),
+                crate::app::udp_target_diagnostics::TEST_ADDR.port() + 1,
+            )),
+            SocksAddr::Domain("secret.example".into(), diag::TEST_ADDR.port()),
+        ] {
+            nat.send(None, &source, "test", &down, packet(dst)).await;
+        }
+        assert_eq!(
+            instance
+                .dispatcher
+                .internal_diagnostics(0)
+                .udp_target
+                .events,
+            before.events
+        );
+        assert!(env.scope.stop(Duration::from_secs(1)).await.clean());
+        assert!(diag::is_fixture(&fixture));
     }
 }

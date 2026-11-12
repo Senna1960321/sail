@@ -1121,10 +1121,46 @@ impl Connector {
         &self,
         sess: &crate::session::Session,
     ) -> std::io::Result<crate::adapter::AnyStream> {
-        let stream =
-            crate::net::connect_stream_outbound(sess, self.dns_client.clone(), &self.layers)
-                .await?;
-        self.layers.stream()?.handle(sess, None, stream).await
+        #[cfg(not(feature = "internal-udp-target-diagnostics"))]
+        {
+            let stream =
+                crate::net::connect_stream_outbound(sess, self.dns_client.clone(), &self.layers)
+                    .await?;
+            self.layers.stream()?.handle(sess, None, stream).await
+        }
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        {
+            let transport =
+                crate::net::connect_stream_outbound(sess, self.dns_client.clone(), &self.layers)
+                    .await;
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            if let Some(trace) = crate::app::udp_target_diagnostics::current() {
+                let mut event =
+                    trace.event(crate::app::udp_target_diagnostics::Stage::ConnectTransport);
+                match &transport {
+                    Ok(stream) => {
+                        event.result = crate::app::udp_target_diagnostics::Outcome::Accepted;
+                        event.transport_present = stream.is_some();
+                    }
+                    Err(error) => {
+                        event.result = crate::app::udp_target_diagnostics::Outcome::Failed;
+                        event.error_kind =
+                            crate::app::udp_target_diagnostics::error_kind(error.kind());
+                    }
+                }
+                trace.emit(event);
+            }
+            let stream = transport?;
+            let result = self.layers.stream()?.handle(sess, None, stream).await;
+            #[cfg(feature = "internal-udp-target-diagnostics")]
+            if let Some(trace) = crate::app::udp_target_diagnostics::current() {
+                trace.result(
+                    crate::app::udp_target_diagnostics::Stage::ConnectLayers,
+                    result.as_ref().map(|_| ()).map_err(|e| e.kind()),
+                );
+            }
+            result
+        }
     }
 
     /// A new connection, as `connect` makes it, and the TCP connection

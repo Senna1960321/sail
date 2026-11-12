@@ -147,6 +147,14 @@ pub struct Options {
 }
 
 impl Options {
+    /// Sets one immutable diagnostic endpoint before instance creation.
+    #[cfg(feature = "internal-udp-target-diagnostics")]
+    #[doc(hidden)]
+    pub fn internal_udp_target_policy(mut self, policy: InternalUdpTargetPolicy) -> Self {
+        self.kinds = self.kinds.with_internal_udp_target_policy(policy);
+        self
+    }
+
     /// Enables explicit attachment transactions; ordinary static TUN and
     /// reload behavior is unchanged. Disabled by default.
     pub fn dynamic_tun(mut self, enabled: bool) -> Self {
@@ -430,6 +438,9 @@ pub const PANICS_ARE_CAUGHT: bool = cfg!(panic = "unwind");
 #[cfg(feature = "internal-diagnostics")]
 #[doc(hidden)]
 pub use crate::app::sessions::diagnostics::{AdmissionDiagnostics, InternalDiagnostics};
+#[cfg(feature = "internal-udp-target-diagnostics")]
+#[doc(hidden)]
+pub use crate::app::udp_target_diagnostics::InternalUdpTargetPolicy;
 pub use crate::control::events::Fault;
 pub use crate::runtime::scope::{StopReport, TaskClass};
 #[doc(hidden)]

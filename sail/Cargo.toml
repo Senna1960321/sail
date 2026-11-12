@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [features]
 # Read-only internal diagnostics, absent from ordinary builds.
 internal-diagnostics = []
+internal-udp-target-diagnostics = ["internal-diagnostics", "sha2"]
 
 default = [
     "all-endpoints",

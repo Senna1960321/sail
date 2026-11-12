@@ -192,9 +192,17 @@ async fn handle_datagrams(
                 let destination = SocksAddr::Ip(datagram.destination);
                 let source = DatagramSource::new(datagram.source, None);
                 let packet = UdpPacket::new(payload, SocksAddr::Ip(datagram.source), destination);
-                nat_manager
-                    .send(None, &source, &inbound_tag, &downlink_tx, packet)
-                    .await;
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                let diagnostic_trace = dispatcher.udp_target_trace(&packet.dst_addr);
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                if let Some(trace) = &diagnostic_trace {
+                    trace.emit(trace.event(crate::app::udp_target_diagnostics::NATIVE));
+                }
+                let send = nat_manager.send(None, &source, &inbound_tag, &downlink_tx, packet);
+                #[cfg(feature = "internal-udp-target-diagnostics")]
+                crate::app::udp_target_diagnostics::scope(diagnostic_trace, send).await;
+                #[cfg(not(feature = "internal-udp-target-diagnostics"))]
+                send.await;
             }
             packet = downlink_rx.recv() => {
                 let Some(packet) = packet else {
