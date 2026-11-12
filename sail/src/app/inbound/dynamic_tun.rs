@@ -93,7 +93,12 @@ impl RuntimeManager {
         inbounds: &[crate::config::Inbound],
     ) -> Result<(), crate::Error> {
         let state = self.dynamic_tun.lock();
-        let Some(entry) = &state.entry else {
+        let tag = state
+            .entry
+            .as_ref()
+            .map(|entry| &entry.tag)
+            .or_else(|| state.retired.first().map(|generation| &generation.tag));
+        let Some(tag) = tag else {
             return Ok(());
         };
         if inbounds.iter().any(|i| i.protocol == "tun") {
@@ -101,10 +106,10 @@ impl RuntimeManager {
                 "a static TUN requires restart; detach the dynamic TUN first".into(),
             ));
         }
-        if inbounds.iter().any(|i| i.tag == entry.tag) {
+        if inbounds.iter().any(|i| &i.tag == tag) {
             return Err(crate::Error::Config(anyhow::anyhow!(
                 "dynamic TUN reserves inbound tag [{}] until detached",
-                entry.tag
+                tag
             )));
         }
         Ok(())
@@ -565,7 +570,7 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     #[cfg(feature = "outbound-direct")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_commit_keeps_the_same_run_reserved_until_its_resources_end() {
         use crate::embed::{Config, Instance, Options, Platform, Runtime};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -615,6 +620,8 @@ mod tests {
         assert_eq!(host.0.load(Ordering::SeqCst), 1);
         let draining = matches!(i.tun_state().unwrap(), TunState::Draining { .. });
         let refused = i.prepare_tun_device(config).await.is_err();
+        let incoming = crate::config::from_string(&format!("{{\"inbounds\":[{config}]}}")).unwrap();
+        let static_refused = manager.check_dynamic_inbounds(&incoming.inbounds).is_err();
         let report = i.detach_tun().await.unwrap();
         // Release before assertions, including when used as a negative control.
         drop(held);
@@ -628,6 +635,10 @@ mod tests {
             "new preparation cannot reuse an unsettled host slot"
         );
         assert!(!report.clean());
+        assert!(
+            static_refused,
+            "failed capture cleanup also reserves static TUN and tag conflicts"
+        );
         assert!(report
             .tasks
             .iter()
