@@ -459,6 +459,7 @@ async fn device_prepare_has_no_os_effect_and_failed_or_panicked_commit_rolls_bac
         assert_eq!(error.kind(), ErrorKind::Failed);
         assert!(error.left().is_empty());
         assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(i.detach_tun().await.unwrap().clean());
         assert_eq!(i.tun_state().unwrap(), TunState::Detached);
         roundtrip(&mut proxy, b"proxy survives failed device transaction").await;
         let (p, _flow) = i.prepare_tun_packets(TUN, 1).await.unwrap();
@@ -1229,7 +1230,9 @@ async fn restart_refuses_an_old_callback_before_its_first_host_slot_read() {
         .unwrap();
     assert!(i.stop().await.is_err());
     assert_eq!(host.observed.load(Ordering::SeqCst), 0);
-    let prior_report = i.stop_report().expect("the prior resource remains reported");
+    let prior_report = i
+        .stop_report()
+        .expect("the prior resource remains reported");
     assert!(!prior_report.clean());
     let restart = i
         .start(Config::Json(config(crate::common::free_port())))

@@ -940,6 +940,11 @@ its own mutable staging slot earlier. The host must keep that slot stable
 until the old callback and owned results end. `TunRequest` currently does
 not bind an immutable host resource generation. Supporting earlier staging
 would require a separate request-bound resource contract and host changes.
+Within one run, failed publication also retains its old generation's owner
+barrier until all tasks and returned resources end; `Draining` and a refused
+new preparation are intentional during that interval. A host can keep its
+old staged device, obtain a new side-effect-free reservation first, and
+only then stage the new resource before consuming `commit`.
 
 Sail's existing C callback layout is unchanged; these are Rust APIs. A
 client C/Swift packet-flow wrapper owns its generation fences, callback

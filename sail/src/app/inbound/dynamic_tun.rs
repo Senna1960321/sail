@@ -21,6 +21,9 @@ struct State {
     closed: bool,
     next: u64,
     entry: Option<Entry>,
+    // Failed publication may finish before its controller's registration.
+    // Keep that generation reserved until every actual owner is gone.
+    retired: Vec<Generation>,
 }
 struct Entry {
     id: u64,
@@ -68,13 +71,19 @@ struct Opened {
 }
 impl DynamicTun {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.retired.retain(|g| !g.owner.is_empty());
+        state
     }
 }
 impl Drop for DynamicTun {
     fn drop(&mut self) {
-        if let Some(entry) = &self.lock().entry {
+        let state = self.lock();
+        if let Some(entry) = &state.entry {
             entry.owner.abort_all();
+        }
+        for generation in &state.retired {
+            generation.owner.abort_all();
         }
     }
 }
@@ -114,7 +123,12 @@ impl RuntimeManager {
     pub(crate) fn dynamic_tun_state(&self) -> TunState {
         let state = self.dynamic_tun.lock();
         let Some(entry) = &state.entry else {
-            return TunState::Detached;
+            return state
+                .retired
+                .first()
+                .map_or(TunState::Detached, |g| TunState::Draining {
+                    tag: g.tag.clone(),
+                });
         };
         let tag = entry.tag.clone();
         match entry.phase {
@@ -178,7 +192,7 @@ impl RuntimeManager {
         if state.closed {
             return Err(Error::not_running());
         }
-        if state.entry.is_some() {
+        if state.entry.is_some() || !state.retired.is_empty() {
             return Err(Error::state("TUN slot is already reserved"));
         }
         Ok(inbound)
@@ -194,7 +208,7 @@ impl RuntimeManager {
         if state.closed {
             return Err(Error::not_running());
         }
-        if state.entry.is_some() {
+        if state.entry.is_some() || !state.retired.is_empty() {
             return Err(Error::state("TUN slot is already reserved"));
         }
         state.next = state
@@ -446,6 +460,7 @@ impl RuntimeManager {
         if state.entry.as_ref().is_some_and(|e| e.id == generation.id) {
             if left.is_empty() {
                 state.entry = None;
+                state.retired.push(generation.clone());
             } else if let Some(entry) = state.entry.as_mut() {
                 entry.phase = Phase::Draining;
             }
@@ -460,6 +475,22 @@ impl RuntimeManager {
     }
 
     async fn drain_capture(&self) -> Result<StopReport, Error> {
+        let within = self
+            .env
+            .host
+            .stop_within
+            .unwrap_or(crate::runtime::scope::STOP_WITHIN);
+        let retired = self.dynamic_tun.lock().retired.clone();
+        if !retired.is_empty() {
+            let mut combined = StopReport::default();
+            for generation in retired {
+                let report = generation.owner.stop(within).await;
+                combined.tasks.extend(report.tasks);
+                combined.left.extend(report.left);
+                combined.waited += report.waited;
+            }
+            return Ok(combined);
+        }
         let (generation, source) = {
             let mut state = self.dynamic_tun.lock();
             let Some(entry) = state.entry.as_mut() else {
@@ -471,11 +502,6 @@ impl RuntimeManager {
         };
         drop(source);
         generation.undo.run_all();
-        let within = self
-            .env
-            .host
-            .stop_within
-            .unwrap_or(crate::runtime::scope::STOP_WITHIN);
         let mut report = generation.owner.stop(within).await;
         if report.tasks.is_empty() {
             generation.undo.check_all();
@@ -537,6 +563,85 @@ fn dispatcher_type(
 mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[cfg(feature = "outbound-direct")]
+    #[tokio::test]
+    async fn a_failed_commit_keeps_the_same_run_reserved_until_its_resources_end() {
+        use crate::embed::{Config, Instance, Options, Platform, Runtime};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Refuse(AtomicUsize);
+        impl Platform for Refuse {
+            fn log(&self, _: &str) {}
+            fn opens_tun(&self) -> bool {
+                true
+            }
+            fn open_tun(&self, _: &crate::embed::TunRequest) -> std::io::Result<i32> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::other("controlled open refusal"))
+            }
+        }
+        let host = Arc::new(Refuse(AtomicUsize::new(0)));
+        let i = Instance::new(
+            Options::new()
+                .dynamic_tun(true)
+                .platform(host.clone())
+                .runtime(Runtime::Host(tokio::runtime::Handle::current()))
+                .stop_within(std::time::Duration::from_millis(20)),
+        )
+        .unwrap();
+        i.start(Config::Json(
+            r#"{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let manager = i.manager().unwrap();
+        let config = r#"{"type":"tun","tag":"capture","address":["10.19.0.1/24"]}"#;
+        let prepared = i.prepare_tun_device(config).await.unwrap();
+        assert_eq!(
+            host.0.load(Ordering::SeqCst),
+            0,
+            "prepare cannot open or duplicate"
+        );
+        let owner = manager
+            .dynamic_tun
+            .lock()
+            .entry
+            .as_ref()
+            .unwrap()
+            .owner
+            .clone();
+        let held = owner.hold_resource("test prior capture resource");
+        assert!(prepared.commit().await.is_err());
+        assert_eq!(host.0.load(Ordering::SeqCst), 1);
+        let draining = matches!(i.tun_state().unwrap(), TunState::Draining { .. });
+        let refused = i.prepare_tun_device(config).await.is_err();
+        let report = i.detach_tun().await.unwrap();
+        // Release before assertions, including when used as a negative control.
+        drop(held);
+        assert!(i.detach_tun().await.unwrap().clean());
+        assert!(
+            draining,
+            "a failed commit must retain a live old resource barrier"
+        );
+        assert!(
+            refused,
+            "new preparation cannot reuse an unsettled host slot"
+        );
+        assert!(!report.clean());
+        assert!(report
+            .tasks
+            .iter()
+            .any(|(name, _)| *name == "test prior capture resource"));
+        let next = i.prepare_tun_device(config).await.unwrap();
+        assert_eq!(
+            host.0.load(Ordering::SeqCst),
+            1,
+            "the next reservation still has no OS effect"
+        );
+        drop(next);
+        assert!(Arc::ptr_eq(&manager, &i.manager().unwrap()));
+        i.stop().await.unwrap();
+    }
 
     #[tokio::test]
     async fn a_completed_unjoined_open_keeps_its_transferred_fd_and_resource_barrier() {
