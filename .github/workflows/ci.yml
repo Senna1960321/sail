@@ -612,7 +612,7 @@ jobs:
           DIAGNOSTICS: ${{ needs.unit-diagnostics.result }}
         run: |
           test "$RECEIPTS" = success
-          [[ "$FINGERPRINT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FINGERPRINT" =~ ^[0-9a-f]{40}$ ]] || exit 1
           if [ "$GREEN" = true ]; then
             test "$CORE" = skipped
             test "$DIAGNOSTICS" = skipped
