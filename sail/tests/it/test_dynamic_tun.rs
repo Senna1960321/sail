@@ -571,6 +571,9 @@ async fn transferred_fd_closes_on_commit_failure_and_detach_but_host_original_su
                 Some(libc::EBADF)
             );
             assert!(unsafe { libc::fcntl(host.original.as_raw_fd(), libc::F_GETFD) } >= 0);
+            // The descriptor must already be closed above. Reconcile any
+            // still-registered failed-commit controller before reusing the slot.
+            assert!(i.detach_tun().await.unwrap().clean());
             assert_eq!(i.tun_state().unwrap(), TunState::Detached);
         }
         if !regular_file {
