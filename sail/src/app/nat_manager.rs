@@ -204,7 +204,7 @@ async fn end_sessions(sessions: &Mutex<SessionMap>, ends: impl Fn(&NatKey) -> bo
 }
 
 pub struct NatManager {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "outbound-direct"))]
     cleanup_ticks: Arc<std::sync::atomic::AtomicUsize>,
     sessions: Arc<Mutex<SessionMap>>,
     dispatcher: Arc<Dispatcher>,
@@ -216,13 +216,13 @@ pub struct NatManager {
 }
 
 impl NatManager {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "outbound-direct"))]
     pub(crate) fn test_cleanup_ticks(&self) -> usize {
         self.cleanup_ticks
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "outbound-direct"))]
     pub(crate) async fn test_next_cleanup(&self) {
         let before = self.test_cleanup_ticks();
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -251,9 +251,9 @@ impl NatManager {
             .collect();
         let sessions: Arc<Mutex<SessionMap>> = Arc::new(Mutex::new(HashMap::new()));
         let sessions2 = sessions.clone();
-        #[cfg(test)]
+        #[cfg(all(test, feature = "outbound-direct"))]
         let cleanup_ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        #[cfg(test)]
+        #[cfg(all(test, feature = "outbound-direct"))]
         let task_ticks = cleanup_ticks.clone();
         let check_interval = dispatcher.env().options.udp.session_check_interval;
 
@@ -283,7 +283,7 @@ impl NatManager {
                 drop(to_be_remove); // drop explicitly
                 let n_remaining = sessions.len();
                 let n_removed = n_total - n_remaining;
-                #[cfg(test)]
+                #[cfg(all(test, feature = "outbound-direct"))]
                 task_ticks.fetch_add(1, std::sync::atomic::Ordering::Release);
                 drop(sessions); // release the lock
                 if n_removed > 0 {
@@ -297,7 +297,7 @@ impl NatManager {
         });
 
         NatManager {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "outbound-direct"))]
             cleanup_ticks,
             sessions,
             dispatcher,

@@ -591,7 +591,7 @@ impl Dispatcher {
         self.env.admission.as_ref()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "outbound-direct", feature = "outbound-socks"))]
     pub(crate) fn test_live_sessions(&self) -> usize {
         self.sessions
             .as_ref()
