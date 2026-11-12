@@ -121,6 +121,74 @@ async fn udp_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     )
 }
 
+#[cfg(feature = "internal-udp-target-diagnostics")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_observe_real_native_udp_and_current_admission_without_os_device() {
+    use sail::embed::InternalUdpTargetPolicy;
+    let (target, echo_task) = udp_echo().await;
+    let SocketAddr::V4(target_v4) = target else {
+        unreachable!()
+    };
+    let instance = Instance::new(
+        Options::new()
+            .dynamic_tun(true)
+            .runtime(Runtime::Host(tokio::runtime::Handle::current()))
+            .settings_json(r#"{"set":["inbound.max_connections=256"]}"#)
+            .unwrap()
+            .internal_udp_target_policy(InternalUdpTargetPolicy::new(target_v4).unwrap()),
+    )
+    .unwrap();
+    start_config(&instance).await;
+    let before = instance.internal_diagnostics().unwrap();
+    assert_eq!(before.sessions.limit, 256);
+    assert_eq!(before.sessions.admitted_total, Some(0));
+    let (prepared, mut flow) = instance.prepare_tun_packets(TUN, 2).await.unwrap();
+    prepared.commit().await.unwrap();
+    let source = "10.19.0.2:41000".parse().unwrap();
+    flow.uplink
+        .send(emit_udp_packet(source, target, b"policy-packet", 64, 1).unwrap())
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), flow.downlink.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parse_udp_datagram(parse_ip_packet(&reply, true).unwrap(), true)
+            .unwrap()
+            .payload,
+        b"policy-packet"
+    );
+    let observed = instance.internal_diagnostics().unwrap();
+    assert_eq!(observed.epoch, before.epoch);
+    assert_eq!(observed.sessions.live, Some(1));
+    assert_eq!(observed.sessions.admitted_total, Some(1));
+    assert!(observed.udp_target.configured);
+    assert_eq!(observed.udp_target.schema_version, 2);
+    assert_eq!(observed.udp_target.fixture, "fixed-ipv4-policy-v1");
+    let json = serde_json::to_value(&observed).unwrap();
+    let events = json["udp_target"]["events"].as_array().unwrap();
+    for stage in 1..=5 {
+        assert!(
+            events.iter().any(|event| event["stage"] == stage),
+            "actual observation stage {stage}"
+        );
+    }
+    let text = json.to_string();
+    assert!(!text.contains("policy-packet"));
+    assert!(!text.contains(&target.to_string()));
+    assert!(instance.detach_tun().await.unwrap().clean());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while instance.internal_diagnostics().unwrap().sessions.live != Some(0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    instance.stop().await.unwrap();
+    echo_task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_authenticated_tcp_http_and_udp_survive_three_tun_generations() {
     let (i, port) = start(true).await;
