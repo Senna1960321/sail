@@ -2071,9 +2071,10 @@ pub(crate) fn dial_defaults(
         defaults.env.auto_interface = Some(
             env.auto_interface
                 .get_or_init(|| {
-                    net::interface::AutoInterface::new(
+                    net::interface::AutoInterface::with_network(
                         own_interfaces,
                         platform::detect_default_interface,
+                        env.network.clone(),
                     )
                 })
                 .clone(),
@@ -3189,3 +3190,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(
+    test,
+    feature = "outbound-direct",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "host_authority_tests.rs"]
+mod host_authority_tests;

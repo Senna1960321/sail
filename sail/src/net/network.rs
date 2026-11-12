@@ -4,6 +4,7 @@
 //! (FFI, the runtime API); without a push, sail detects what the system
 //! tells it. One state and one notice of change for all of sail.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -432,18 +433,67 @@ pub struct Network {
     known: Arc<AtomicBool>,
     /// Whether the host pushes the state, which detection then leaves.
     pushed: Arc<AtomicBool>,
+    /// Exact host input for egress. The public/rule snapshot may filter
+    /// owned interfaces; that must not permanently erase host declarations.
+    host_egress: Arc<arc_swap::ArcSwapOption<NetworkState>>,
     /// When the host last pushed a state, until its word that the network
     /// changed comes: that word is about this state, handled already.
     pushed_at: Arc<Mutex<Option<std::time::Instant>>>,
     /// The interfaces sail makes itself (its TUNs'), never listed as ones
     /// to go out of.
-    own: Arc<std::sync::RwLock<Vec<String>>>,
+    own: Arc<Mutex<OwnedInterfaces>>,
+    /// Static configuration uses the same exact-name leases; replacing it
+    /// cannot clear a still-published dynamic device's registration.
+    configured_own: Arc<Mutex<Vec<OwnedInterfaceLease>>>,
     /// Since when the host says the system sleeps, while it does.
     asleep_since: Arc<Mutex<Option<std::time::SystemTime>>>,
     /// Whether the host tells sail of sleeps, which detection then leaves.
     host_tells_sleep: Arc<AtomicBool>,
     /// How long the system slept before its last wake.
     last_sleep: Arc<Mutex<Option<std::time::Duration>>>,
+}
+
+/// One linearized view for automatic egress; no OS fallback is added to
+/// a host-provided state. Owned names are an exact exclusion, not a prefix.
+pub(crate) struct EgressView {
+    pub host: Option<Arc<NetworkState>>,
+    pub own: Vec<String>,
+}
+
+#[derive(Default)]
+struct OwnedInterfaces {
+    next_id: u64,
+    epoch: u64,
+    names: BTreeMap<u64, String>,
+}
+
+impl OwnedInterfaces {
+    fn advance(&mut self) {
+        self.epoch = self.epoch.checked_add(1).expect("owned-interface epoch");
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.names.values().cloned().collect()
+    }
+}
+
+/// One exact-name registration in one run's network. Not Clone: its owner
+/// keeps it until the published device's resources are really released.
+/// It retains only the small registry and fence, not the runtime or SDK.
+pub(crate) struct OwnedInterfaceLease {
+    own: Arc<Mutex<OwnedInterfaces>>,
+    telling: Arc<Mutex<()>>,
+    id: u64,
+}
+
+impl Drop for OwnedInterfaceLease {
+    fn drop(&mut self) {
+        let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
+        let mut own = self.own.lock().unwrap_or_else(|e| e.into_inner());
+        if own.names.remove(&self.id).is_some() {
+            own.advance();
+        }
+    }
 }
 
 impl Default for Network {
@@ -456,8 +506,10 @@ impl Default for Network {
             telling: Arc::default(),
             known: Arc::default(),
             pushed: Arc::default(),
+            host_egress: Arc::default(),
             pushed_at: Arc::default(),
             own: Arc::default(),
+            configured_own: Arc::default(),
             asleep_since: Arc::default(),
             host_tells_sleep: Arc::default(),
             last_sleep: Arc::default(),
@@ -527,12 +579,36 @@ impl Network {
         (self.state.borrow().clone(), self.events.subscribe())
     }
 
+    pub(crate) fn egress_view(&self) -> EgressView {
+        let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
+        EgressView {
+            host: self.host_egress.load_full(),
+            own: self.own.lock().unwrap_or_else(|e| e.into_inner()).names(),
+        }
+    }
+
+    /// The slow OS lookup has finished; publish only if it still has
+    /// authority. Recheck owned names at publication, not at lookup start.
+    pub(crate) fn publish_automatic<T>(&self, publish: impl FnOnce(&[String]) -> T) -> Option<T> {
+        let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
+        if self.pushed() {
+            return None;
+        }
+        let own = self.own.lock().unwrap_or_else(|e| e.into_inner()).names();
+        Some(publish(&own))
+    }
+
     /// Tells of a change whatever the state says: the host says the network
     /// changed, or the system woke. Returns the generation the change took,
     /// or None when the word folded into a pushed state told already (the
     /// generation to wait on is the state's then, `snapshot_with_generation`).
     pub fn announce(&self, reason: ChangeReason) -> Option<u64> {
         let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
+        // A delayed OS/capture notice cannot reset a host-owned network,
+        // nor consume the folding token for an explicit host notification.
+        if self.pushed() && matches!(reason, ChangeReason::DefaultInterface | ChangeReason::State) {
+            return None;
+        }
         // The host's word right after the state it pushed is about that
         // state, which sail handled as it came: folded into it.
         let pushed_at = self
@@ -543,6 +619,7 @@ impl Network {
         if reason == ChangeReason::HostPush
             && pushed_at.is_some_and(|at| at.elapsed() < FOLDED_WITHIN)
         {
+            drop(_telling);
             tracing::debug!(
                 "network changed: the host's word, after the state it pushed; folded into it"
             );
@@ -667,9 +744,7 @@ impl Network {
     /// The state as the host tells it; what sail detects is left from then
     /// on.
     pub fn push(&self, state: NetworkState) {
-        self.pushed.store(true, Ordering::Relaxed);
         self.set(state, ChangeReason::HostPush);
-        *self.pushed_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     }
 
     /// Settles the state sail starts on, before the instance runs: `state`
@@ -683,11 +758,11 @@ impl Network {
             return;
         }
         let mut state = state.unwrap_or_default();
-        self.leave_own_out(&mut state);
         let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
-        if self.known.swap(true, Ordering::Relaxed) {
+        if self.pushed() || self.known.swap(true, Ordering::Relaxed) {
             return;
         }
+        self.leave_own_out(&mut state);
         let state = Arc::new(state);
         self.state.send_modify(|current| {
             current.state = state;
@@ -706,26 +781,69 @@ impl Network {
     /// as sing-box leaves its own out of the interfaces it picks from
     /// (MyInterfaces). The default interface stays listed whatever it is.
     pub(crate) fn set_own_interfaces(&self, names: Vec<String>) {
-        if let Ok(mut own) = self.own.write() {
-            *own = names;
+        let mut configured = self
+            .configured_own
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Acquire replacements before dropping old leases: overlapping names
+        // never briefly become eligible. This lock only serializes static
+        // updates; egress selection never takes it.
+        let replacement = names
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(|name| self.own_interface(name))
+            .collect();
+        let old = std::mem::replace(&mut *configured, replacement);
+        drop(configured);
+        drop(old);
+    }
+
+    /// Excludes an actual, verified device name. The SDK acquires this only
+    /// while publishing a successful current run/token, never for an open
+    /// attempt or a packet bridge. No reset is announced on acquire/drop.
+    pub(crate) fn own_interface(&self, actual_name: &str) -> OwnedInterfaceLease {
+        assert!(
+            !actual_name.is_empty(),
+            "owned interface name must be verified"
+        );
+        let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
+        let mut own = self.own.lock().unwrap_or_else(|e| e.into_inner());
+        own.next_id = own
+            .next_id
+            .checked_add(1)
+            .expect("owned-interface identity");
+        let id = own.next_id;
+        own.names.insert(id, actual_name.to_owned());
+        own.advance();
+        OwnedInterfaceLease {
+            own: self.own.clone(),
+            telling: self.telling.clone(),
+            id,
         }
     }
 
     /// Leaves sail's own interfaces out of `state`'s, but the default one.
     fn leave_own_out(&self, state: &mut NetworkState) {
-        if let Ok(own) = self.own.read() {
-            let default = state.interface.clone();
-            state
-                .interfaces
-                .retain(|i| default.as_ref() == Some(&i.name) || !own.contains(&i.name));
-        }
+        let own = self.own.lock().unwrap_or_else(|e| e.into_inner());
+        let default = state.interface.clone();
+        state.interfaces.retain(|i| {
+            default.as_ref() == Some(&i.name) || !own.names.values().any(|name| name == &i.name)
+        });
     }
 
     /// Changes the state, telling subscribers only of a change, and of a
     /// move when the connections do not survive it; whether that was told.
     fn set(&self, mut state: NetworkState, reason: ChangeReason) -> bool {
-        self.leave_own_out(&mut state);
         let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
+        if reason == ChangeReason::HostPush {
+            self.host_egress.store(Some(Arc::new(state.clone())));
+            self.pushed.store(true, Ordering::Relaxed);
+            *self.pushed_at.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(std::time::Instant::now());
+        } else if self.pushed() {
+            return false;
+        }
+        self.leave_own_out(&mut state);
         let old = self.snapshot();
         // The first state known, at the start, moves nothing.
         let known = self.known.swap(true, Ordering::Relaxed);
@@ -748,7 +866,14 @@ impl Network {
                 }
             });
         }
-        let captive = self.snapshot().captive;
+        let now = self.snapshot();
+        if let Some(change) = change {
+            self.tell(change);
+        }
+        // Publication is ordered, but host logging must not run under the
+        // authority lock: a log callback may query effective egress.
+        drop(_telling);
+        let captive = now.captive;
         if changed && captive != old.captive {
             if captive {
                 tracing::info!(
@@ -759,11 +884,7 @@ impl Network {
                 tracing::info!("network: the captive portal cleared; the rules apply again");
             }
         }
-        if let Some(change) = change {
-            self.tell(change);
-        }
         if changed {
-            let now = self.snapshot();
             tracing::info!(
                 "network: {} on {} via {}",
                 now.kind
@@ -1356,3 +1477,7 @@ mod tests {
         assert_eq!(pushed.snapshot().interface.as_deref(), Some("wlan0"));
     }
 }
+
+#[cfg(test)]
+#[path = "network_authority_tests.rs"]
+mod authority_tests;

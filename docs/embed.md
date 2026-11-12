@@ -465,6 +465,24 @@ that some connections may not survive (a move), as `Event::Network`:
 - **Settled.** Every change is settled before it is told: sail's detection
   waits until the system has been quiet for 100 ms (1 s at most) before it
   looks. A state the host pushes (`set_network_state`) is taken as given.
+- **Physical egress supplied by the host.** The first `set_network_state`
+  also gives the host authority over automatic interface selection for this
+  run, including dialers created earlier or retained through reload. The
+  default comes from `interface`; target selection uses longest prefix from
+  the default's addresses and explicitly listed `interfaces`. It does not
+  supplement these with OS routes/subnets while the host supplies the state.
+  Exact known self-owned names are excluded; unrelated explicitly listed
+  VPN interfaces remain valid. With no default or matching host subnet,
+  automatic non-loopback dialing has no interface, rather than falling back
+  to a cached capture route. Explicit outbound binds and loopback keep
+  their existing behavior. The host must keep reporting actual physical
+  moves, offline and restoration. Late OS detector results and automatic
+  capture-route notifications cannot replace this authority or issue a
+  same-state reset. Explicit host reset/folding and wake semantics remain;
+  without a push, automatic monitoring continues. The network snapshot
+  remains a state publication, not an acknowledgment that reset handling
+  has finished. Private egress retains the exact host declarations so that
+  ownership exclusions do not permanently erase a supplied interface.
 - **Old and new.** Each event carries the old and the new state, the
   `reason` (default interface, detected, host, wake) and the generation.
   Generations count from 1 in each run.

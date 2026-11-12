@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
+type Subnets = Vec<(IpAddr, u8, String)>;
+
 /// What the interfaces were at the last look.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct State {
@@ -16,7 +18,12 @@ struct State {
     default: Option<String>,
     /// The networks the interfaces are directly on: address, prefix
     /// length, interface.
-    subnets: Vec<(IpAddr, u8, String)>,
+    subnets: Subnets,
+}
+
+enum RefreshWarning {
+    Own(String),
+    Missing(io::Error),
 }
 
 /// Finds the default interface's name.
@@ -27,6 +34,7 @@ pub struct AutoInterface {
     /// Interfaces never to send through: the TUN's own.
     skip: Vec<String>,
     detect: Detect,
+    network: Option<super::network::Network>,
 }
 
 impl std::fmt::Debug for AutoInterface {
@@ -50,10 +58,28 @@ impl AutoInterface {
     /// Looks at the interfaces now; `skip` names those never to send
     /// through.
     pub fn new(skip: Vec<String>, detect: Detect) -> Arc<AutoInterface> {
+        Self::create(skip, detect, None)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+    pub(crate) fn with_network(
+        skip: Vec<String>,
+        detect: Detect,
+        network: super::network::Network,
+    ) -> Arc<Self> {
+        Self::create(skip, detect, Some(network))
+    }
+
+    fn create(
+        skip: Vec<String>,
+        detect: Detect,
+        network: Option<super::network::Network>,
+    ) -> Arc<Self> {
         let this = Arc::new(AutoInterface {
             state: ArcSwap::from_pointee(State::default()),
             skip,
             detect,
+            network,
         });
         this.refresh();
         this
@@ -61,49 +87,132 @@ impl AutoInterface {
 
     /// Looks again, and says whether anything changed.
     pub fn refresh(&self) -> bool {
-        let default = match (self.detect)() {
-            Ok(name) if !self.skip.contains(&name) => Some(name),
-            Ok(name) => {
-                tracing::warn!("the default route goes through {}, sail's own", name);
-                None
-            }
-            Err(e) => {
-                tracing::warn!("no default interface: {}", e);
-                None
-            }
+        self.refresh_from(|| ((self.detect)(), subnets().unwrap_or_default()))
+    }
+
+    fn refresh_from(&self, lookup: impl FnOnce() -> (io::Result<String>, Subnets)) -> bool {
+        if self
+            .network
+            .as_ref()
+            .is_some_and(|network| network.pushed())
+        {
+            return false;
+        }
+        let (default, subnets) = lookup();
+        let result = match &self.network {
+            Some(network) => network.publish_automatic(|own| self.install(default, subnets, own)),
+            None => Some(self.install(default, subnets, &[])),
         };
-        let subnets = subnets()
-            .unwrap_or_default()
+        let Some((changed, warning)) = result else {
+            return false;
+        };
+        // Logging can call a host hook. Keep it outside network authority.
+        match warning {
+            Some(RefreshWarning::Own(name)) => {
+                tracing::warn!("the default route goes through {}, sail's own", name)
+            }
+            Some(RefreshWarning::Missing(error)) => {
+                tracing::warn!("no default interface: {}", error)
+            }
+            None => (),
+        }
+        if changed {
+            tracing::info!(
+                "outbound traffic goes through {}",
+                self.current().as_deref().unwrap_or("no interface")
+            );
+        }
+        changed
+    }
+
+    fn excluded(&self, own: &[String], name: &str) -> bool {
+        self.skip.iter().chain(own).any(|entry| entry == name)
+    }
+
+    fn install(
+        &self,
+        default: io::Result<String>,
+        subnets: Subnets,
+        own: &[String],
+    ) -> (bool, Option<RefreshWarning>) {
+        let (default, warning) = match default {
+            Ok(name) if self.skip.contains(&name) => (None, Some(RefreshWarning::Own(name))),
+            Ok(name) if own.contains(&name) => {
+                (Some(name.clone()), Some(RefreshWarning::Own(name)))
+            }
+            Ok(name) => (Some(name), None),
+            Err(error) => (None, Some(RefreshWarning::Missing(error))),
+        };
+        let subnets = subnets
             .into_iter()
+            // Keep the OS observation behind a dynamic lease mask, so final
+            // release takes effect without waiting for another OS refresh.
             .filter(|(_, _, name)| !self.skip.contains(name))
             .collect();
         let state = State { default, subnets };
         if **self.state.load() == state {
-            return false;
+            return (false, warning);
         }
-        tracing::info!(
-            "outbound traffic goes through {}",
-            state.default.as_deref().unwrap_or("no interface")
-        );
         self.state.store(Arc::new(state));
-        true
+        (true, warning)
     }
 
     /// The interface to send to `target` through.
     pub fn for_target(&self, target: IpAddr) -> Option<String> {
+        let view = self.network.as_ref().map(|network| network.egress_view());
+        let own = view.as_ref().map_or(&[][..], |view| view.own.as_slice());
+        if let Some(host) = view.as_ref().and_then(|view| view.host.as_ref()) {
+            return host
+                .addresses
+                .iter()
+                .filter_map(|inet| host.interface.as_ref().map(|name| (inet, name)))
+                .chain(host.interfaces.iter().flat_map(|interface| {
+                    interface
+                        .addresses
+                        .iter()
+                        .map(move |inet| (inet, &interface.name))
+                }))
+                .filter(|(inet, name)| {
+                    !self.excluded(own, name)
+                        && contains(inet.address(), inet.network_length(), target)
+                })
+                .max_by_key(|(inet, _)| inet.network_length())
+                .map(|(_, name)| name.clone())
+                .or_else(|| {
+                    host.interface
+                        .as_ref()
+                        .filter(|name| !self.excluded(own, name))
+                        .cloned()
+                });
+        }
         let state = self.state.load();
         state
             .subnets
             .iter()
-            .filter(|(network, len, _)| contains(*network, *len, target))
+            .filter(|(network, len, name)| {
+                !self.excluded(own, name) && contains(*network, *len, target)
+            })
             .max_by_key(|(_, len, _)| *len)
             .map(|(_, _, name)| name.clone())
-            .or_else(|| state.default.clone())
+            .or_else(|| {
+                state
+                    .default
+                    .as_ref()
+                    .filter(|name| !self.excluded(own, name))
+                    .cloned()
+            })
     }
 
     /// The default interface now.
     pub fn current(&self) -> Option<String> {
-        self.state.load().default.clone()
+        let view = self.network.as_ref().map(|network| network.egress_view());
+        let own = view.as_ref().map_or(&[][..], |view| view.own.as_slice());
+        let state = self.state.load();
+        let default = match view.as_ref().and_then(|view| view.host.as_ref()) {
+            Some(host) => host.interface.as_ref(),
+            None => state.default.as_ref(),
+        };
+        default.filter(|name| !self.excluded(own, name)).cloned()
     }
 }
 
@@ -675,3 +784,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "interface_authority_tests.rs"]
+mod authority_tests;
