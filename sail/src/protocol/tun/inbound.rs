@@ -1574,7 +1574,7 @@ fn open_device(
     platform: Option<crate::runtime::PlatformRef>,
     context: DeviceContext<'_>,
 ) -> Result<TunRunner> {
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let netstack = &dispatcher.env().options.netstack;
     let mtu = usize::from(settings.mtu);
     let mut cfg = tun::Configuration::default();
@@ -1606,11 +1606,29 @@ fn open_device(
             // SAFETY: open_tun transfers this owned duplicate, never the
             // host's borrowed original. Query failure drops only this owner.
             let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-            verified_name = Some(super::device_identity::verify(
-                owned.as_raw_fd(),
-                &settings.name,
-            )?);
-            cfg.raw_fd(owned.into_raw_fd());
+            let verified = super::device_identity::verify(owned.as_raw_fd(), &settings.name)?;
+            let io = super::packet_io::OwnedHostIo::open(owned, |borrowed| {
+                cfg.raw_fd(borrowed).close_fd_on_drop(false);
+                let device = tun::create_as_async(&cfg).map_err(|error| {
+                    anyhow!(
+                        "[{}] inbound: borrow the host's tun: {}",
+                        inbound.tag,
+                        error
+                    )
+                })?;
+                TunPacketIo::new(device, mtu, netstack.batch_size).map_err(Into::into)
+            })?;
+            let mut opened = run(
+                inbound,
+                dispatcher.clone(),
+                nat_manager,
+                vec![io],
+                mtu,
+                netstack,
+                settings.endpoint_independent_nat,
+            )?;
+            opened.verified_name = Some(verified);
+            return Ok(opened);
         } else {
             cfg.raw_fd(fd);
         }

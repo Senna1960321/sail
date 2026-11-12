@@ -13,6 +13,43 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(not(target_os = "windows"))]
 use crate::net::accept::AcceptBackoff;
 
+/// The tun crate borrows the transferred descriptor (`close_fd_on_drop(false)`).
+/// This is its sole owner through construction, all actual I/O shards and Drop.
+/// Field order matters: I/O releases all its borrowed handles before the FD.
+#[cfg(unix)]
+pub(crate) struct OwnedHostIo<I> {
+    io: I,
+    _descriptor: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl<I> OwnedHostIo<I> {
+    pub(crate) fn open(
+        descriptor: std::os::fd::OwnedFd,
+        build: impl FnOnce(std::os::fd::RawFd) -> anyhow::Result<I>,
+    ) -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let io = build(descriptor.as_raw_fd())?;
+        Ok(Self {
+            io,
+            _descriptor: descriptor,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl<I: PacketIo> PacketIo for OwnedHostIo<I> {
+    async fn recv(&mut self, out: &mut PacketBatch) -> io::Result<usize> {
+        self.io.recv(out).await
+    }
+    async fn send(&mut self, packets: &PacketBatch) -> io::Result<usize> {
+        self.io.send(packets).await
+    }
+    fn capabilities(&self) -> PacketCapabilities {
+        self.io.capabilities()
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 pub(crate) struct TunPacketIo {
     writer: tun::DeviceWriter,
@@ -2754,5 +2791,83 @@ mod tests {
         second_udp_echo.abort();
         process_result?;
         result
+    }
+}
+
+/// These are descriptor-construction failure witnesses, deliberately not
+/// device-identity positives. Production verifies the kernel identity first.
+#[cfg(all(test, target_os = "linux"))]
+mod owned_host_tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    fn duplicate(original: &impl AsRawFd) -> (i32, OwnedFd) {
+        // SAFETY: the live source is borrowed; this creates a separately owned FD.
+        let raw = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10000) };
+        assert!(raw >= 10000);
+        // SAFETY: a successful F_DUPFD_CLOEXEC transfers exactly this new owner.
+        (raw, unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+    fn closed(raw: i32) {
+        // SAFETY: descriptor query only.
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[tokio::test]
+    async fn failed_async_registration_closes_only_the_transferred_duplicate() {
+        let original = std::fs::File::open("/dev/null").unwrap();
+        let (raw, owned) = duplicate(&original);
+        let reached_packet_io = std::cell::Cell::new(false);
+        let result = OwnedHostIo::open(owned, |borrowed| {
+            let mut config = tun::Configuration::default();
+            config.raw_fd(borrowed).close_fd_on_drop(false);
+            // Linux epoll refuses a regular character device. Exercise the
+            // actual tun constructor/AsyncFd failure, not an injected Err.
+            let device = tun::create_as_async(&config)?;
+            reached_packet_io.set(true);
+            TunPacketIo::new(device, 1500, 1).map_err(Into::into)
+        });
+        assert!(result.is_err());
+        assert!(
+            !reached_packet_io.get(),
+            "the real AsyncFd registration must fail"
+        );
+        closed(raw);
+        assert!(unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[tokio::test]
+    async fn failed_packet_io_after_adoption_keeps_the_host_original_alive() {
+        let (original, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let (raw, owned) = duplicate(&original);
+        let registered = std::cell::Cell::new(false);
+        let result = OwnedHostIo::open(owned, |borrowed| {
+            let mut config = tun::Configuration::default();
+            config.raw_fd(borrowed).close_fd_on_drop(false);
+            let device = tun::create_as_async(&config)?;
+            registered.set(true);
+            // The actual next constructor rejects a zero batch. The tun's
+            // borrowed internal handles must drop before the sole FD owner.
+            TunPacketIo::new(device, 1500, 0).map_err(Into::into)
+        });
+        assert!(
+            registered.get(),
+            "the real tun/AsyncFd adoption must succeed first"
+        );
+        let error = match result {
+            Ok(_) => panic!("zero batch was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        closed(raw);
+        assert!(unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) } >= 0);
+        peer.send(b"host original survives").unwrap();
+        let mut buffer = [0; 64];
+        let length = original.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..length], b"host original survives");
     }
 }

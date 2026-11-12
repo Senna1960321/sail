@@ -915,7 +915,10 @@ read-only kernel query and requires it to match the requested nonempty name.
 Configuration hints and the device crate's cached name are not proof. Query
 failure or an unsupported platform refuses the commit; a mismatch returns
 `InvalidArgument`. Failure closes the transferred duplicate, retaining the
-host's original. Packet bridges carry no OS device identity. The real-device
+host's original. The dynamic host path retains one `OwnedFd` throughout
+construction and actual I/O. The tun crate borrows it with descriptor-close
+on drop disabled; every builder and queue-construction failure releases only
+that owner, after all borrowed I/O handles. Packet bridges carry no OS device identity. The real-device
 positive and FD lifecycle platform checks require an isolated capable host;
 UnixDatagram and memory-stack witnesses do not establish that acceptance.
 
@@ -951,9 +954,15 @@ not bind an immutable host resource generation. Supporting earlier staging
 would require a separate request-bound resource contract and host changes.
 Within one run, failed publication also retains its old generation's owner
 barrier until all tasks and returned resources end; `Draining` and a refused
-new preparation are intentional during that interval. A host can keep its
-old staged device, obtain a new side-effect-free reservation first, and
-only then stage the new resource before consuming `commit`.
+new preparation are intentional during that interval. An exclusive host
+broker may be unable to prepare a second device while the old grant exists.
+Keep the old resource until actual native drainage is clean (or a new run
+successfully passes the previous-run barrier), then settle the old broker
+cleanup and release its grant. Prepare the new host device without staging
+it, obtain its actual name, reserve it in Sail, and only then stage it and
+consume `commit`. A refused reservation rolls back that unstaged resource;
+uncertain native or broker cleanup remains quarantined. Host operations
+must remain serialized. No reservation API binds an unknown future name.
 
 Sail's existing C callback layout is unchanged; these are Rust APIs. A
 client C/Swift packet-flow wrapper owns its generation fences, callback
