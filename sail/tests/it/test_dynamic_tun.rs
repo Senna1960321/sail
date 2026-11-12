@@ -1143,3 +1143,116 @@ async fn instance_stop_does_not_wait_for_a_hung_reload_in_any_dynamic_slot_state
         }
     }
 }
+
+/// A callback may not read the host's mutable staged resource until after
+/// native stop has returned. Reusing this instance must wait for that read
+/// and the old owned-resource barrier, not just for the run thread to exit.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_refuses_an_old_callback_before_its_first_host_slot_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct SlotHost {
+        wait: BlockingOpenHost,
+        slot: AtomicUsize,
+        observed: AtomicUsize,
+    }
+    impl sail::embed::Platform for SlotHost {
+        fn log(&self, _: &str) {}
+        fn opens_tun(&self) -> bool {
+            true
+        }
+        fn open_tun(&self, request: &sail::embed::TunRequest) -> std::io::Result<i32> {
+            let _ = sail::embed::Platform::open_tun(&self.wait, request);
+            // This is the first read of the staged host resource, deliberately
+            // after the callback-entry barrier rather than before it.
+            self.observed
+                .store(self.slot.load(Ordering::SeqCst), Ordering::SeqCst);
+            Err(std::io::Error::other(
+                "staged device refused after first read",
+            ))
+        }
+    }
+    struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Release(gate.clone());
+    let host = Arc::new(SlotHost {
+        wait: BlockingOpenHost {
+            started: std::sync::Mutex::new(Some(entered_tx)),
+            gate,
+        },
+        slot: AtomicUsize::new(1),
+        observed: AtomicUsize::new(0),
+    });
+    let i = Instance::new(
+        Options::new()
+            .dynamic_tun(true)
+            .platform(host.clone())
+            .threads(sail::embed::Threads::One)
+            .stop_within(Duration::from_millis(50)),
+    )
+    .unwrap();
+    start_config(&i).await;
+    let prepared = i.prepare_tun_device(TUN).await.unwrap();
+    let commit = tokio::spawn(prepared.commit());
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(i.stop().await.is_err());
+    assert_eq!(host.observed.load(Ordering::SeqCst), 0);
+    let restart = i
+        .start(Config::Json(config(crate::common::free_port())))
+        .await;
+    // Cleanup before asserting so the negative control cannot strand a host
+    // callback or a successfully (but incorrectly) restarted instance.
+    let refused = restart.is_err();
+    drop(release);
+    assert!(tokio::time::timeout(Duration::from_secs(5), commit)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while host.observed.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(host.observed.load(Ordering::SeqCst), 1);
+    if !refused {
+        let _ = i.stop().await;
+    }
+    assert!(
+        refused,
+        "restart must refuse while an old callback can still read a replaced host slot"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match i
+                .start(Config::Json(config(crate::common::free_port())))
+                .await
+            {
+                Ok(()) => break,
+                Err(error) if error.kind() == ErrorKind::State => tokio::task::yield_now().await,
+                Err(error) => panic!("restart after old resource ended: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    host.slot.store(2, Ordering::SeqCst);
+    let (current, mut flow) = i.prepare_tun_packets(TUN, 1).await.unwrap();
+    current.commit().await.unwrap();
+    assert!(i.detach_tun().await.unwrap().clean());
+    assert!(flow.downlink.recv().await.is_none());
+    i.stop().await.unwrap();
+    assert_eq!(host.observed.load(Ordering::SeqCst), 1);
+}
