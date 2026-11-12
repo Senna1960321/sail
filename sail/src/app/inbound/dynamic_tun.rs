@@ -532,3 +532,65 @@ fn dispatcher_type(
         dispatcher.set_inbound_type(tag, kind);
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[tokio::test]
+    async fn a_completed_unjoined_open_keeps_its_transferred_fd_and_resource_barrier() {
+        let scope = TaskScope::default();
+        let (original, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        // A distinct owned transfer, with the host's original retained.
+        let fd = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10000) };
+        assert!(fd >= 10000);
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let (bridge, _flow) = PacketBridge::pair(1).unwrap();
+        let (runtime, _accepted, _datagrams, _reply, control) =
+            crate::net::netstack::NativeRuntimeGroup::new(
+                vec![bridge],
+                sail_netstack::ResourceLedger::new(sail_netstack::BudgetProfile::Mobile.budget())
+                    .unwrap(),
+                sail_netstack::RunnerConfig::default(),
+                8,
+                8,
+                8,
+            )
+            .unwrap();
+        let runner = TunRunner {
+            runner: Box::pin(async move {
+                let _owned = (runtime, owned);
+                std::future::pending::<()>().await;
+            }),
+            control,
+        };
+        let held = scope.hold_resource("dynamic TUN opening resource");
+        let result = scope.spawn_blocking("dynamic TUN open", move || Opened {
+            runner,
+            _held: held,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !result.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = scope.stop(std::time::Duration::from_millis(20)).await;
+        assert_eq!(report.tasks, [("dynamic TUN opening resource", 1)]);
+        assert!(
+            !report.clean(),
+            "completed but unjoined output still owns the descriptor"
+        );
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        drop(result); // Opened drops its runner/FD before its resource registration.
+        assert!(scope.is_empty());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+}
