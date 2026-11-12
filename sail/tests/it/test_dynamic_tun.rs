@@ -981,7 +981,29 @@ async fn instance_stop_is_bounded_and_reports_a_host_open_that_has_not_returned(
         .unwrap()
         .unwrap()
         .is_err());
-    start_config(&i).await;
+    // The cancelled controller's receiver can finish before the blocking
+    // callback and its returned resource. Restart waits for their real end.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match i
+                .start(Config::Json(config(crate::common::free_port())))
+                .await
+            {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == ErrorKind::State
+                        && error
+                            .message()
+                            .contains("previous dynamic TUN run still owns") =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("restart after callback release: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
     let (p, _flow) = i.prepare_tun_packets(TUN, 1).await.unwrap();
     p.commit().await.unwrap();
     assert!(i.detach_tun().await.unwrap().clean());
