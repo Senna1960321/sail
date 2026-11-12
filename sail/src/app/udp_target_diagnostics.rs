@@ -334,7 +334,7 @@ pub(crate) const TEST_ADDR: std::net::SocketAddrV4 =
 pub(crate) fn test_policy() -> InternalUdpTargetPolicy {
     InternalUdpTargetPolicy::new(TEST_ADDR).unwrap()
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "outbound-direct"))]
 pub(crate) fn test_env() -> crate::runtime::RuntimeEnv {
     let mut env = crate::runtime::RuntimeEnv::default();
     env.host.kinds = env

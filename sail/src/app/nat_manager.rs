@@ -1548,6 +1548,6 @@ mod udp_target_tests {
             before.events
         );
         assert!(env.scope.stop(Duration::from_secs(1)).await.clean());
-        assert!(diag::is_fixture(&fixture));
+        assert!(instance.dispatcher.udp_target_trace(&fixture).is_some());
     }
 }
