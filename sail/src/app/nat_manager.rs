@@ -476,7 +476,7 @@ impl NatManager {
 
         let (target_ch_tx, mut target_ch_rx) =
             mpsc::channel(self.dispatcher.env().options.udp.uplink_channel_size);
-        let (downlink_abort_tx, downlink_abort_rx) = oneshot::channel();
+        let (downlink_abort_tx, mut downlink_abort_rx) = oneshot::channel();
 
         let udp_timeout = self
             .udp_timeouts
@@ -538,6 +538,17 @@ impl NatManager {
                             .get_mut(&key)
                             .filter(|entry| entry.generation.same(&generation))
                         else {
+                            // The old entry may have ended while its dial
+                            // awaited. Preserve that entry's already-sent
+                            // reason on its own counter, never the replacement.
+                            if let (Some(listed), Ok(idle)) =
+                                (&listed, downlink_abort_rx.try_recv())
+                            {
+                                listed.ended(match idle {
+                                    true => crate::control::events::End::IdleTimeout,
+                                    false => crate::control::events::End::Finished,
+                                });
+                            }
                             return;
                         };
                         if let Some(timeout) = udp_timeout {
@@ -1007,7 +1018,12 @@ mod tests {
         use tokio::net::{TcpListener, UdpSocket};
         use tokio::time::timeout;
 
-        for outcome in ["success", "error", "eof"] {
+        for (outcome, idle_cleanup) in [
+            ("success", false),
+            ("error", false),
+            ("eof", false),
+            ("success", true),
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1024,6 +1040,7 @@ mod tests {
             .unwrap();
             let instance = instance(&config).await;
             let scope = instance.env.scope.clone();
+            let mut records = instance.env.events.records();
             let nat = NatManager::new(instance.dispatcher.clone(), &config.inbounds);
             scope
                 .enter(async {
@@ -1052,7 +1069,18 @@ mod tests {
                     assert_eq!(&associate[..4], &[5, 3, 0, 1]);
                     let old = nat.sessions.lock().await[&key].generation.clone();
                     assert_eq!(instance.dispatcher.test_live_sessions(), 1);
-                    assert!(nat.end_source("test", &source).await);
+                    if idle_cleanup {
+                        nat.sessions
+                            .lock()
+                            .await
+                            .get_mut(&key)
+                            .unwrap()
+                            .idle_timeout = Duration::ZERO;
+                        nat.test_next_cleanup().await;
+                        assert!(!nat.sessions.lock().await.contains_key(&key));
+                    } else {
+                        assert!(nat.end_source("test", &source).await);
+                    }
                     let mut query = Message::new(7, MessageType::Query, OpCode::Query);
                     query.add_query(Query::query(
                         Name::from_ascii(format!("{outcome}.example.")).unwrap(),
@@ -1117,6 +1145,32 @@ mod tests {
                     })
                     .await
                     .expect("stale dispatch must return its pending and Held place");
+                    if outcome == "success" {
+                        let closed = timeout(Duration::from_secs(2), async {
+                            loop {
+                                let record = records.recv().await.unwrap();
+                                if record.destination.port() == 80
+                                    && matches!(
+                                        record.kind,
+                                        crate::control::events::RecordKind::Closed(_)
+                                    )
+                                {
+                                    break record;
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            closed.kind,
+                            crate::control::events::RecordKind::Closed(if idle_cleanup {
+                                crate::control::events::End::IdleTimeout
+                            } else {
+                                crate::control::events::End::Finished
+                            })
+                        );
+                    }
+
                     {
                         let entries = nat.sessions.lock().await;
                         let entry = &entries[&key];
