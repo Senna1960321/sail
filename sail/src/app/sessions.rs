@@ -39,6 +39,16 @@ pub struct Sessions {
 /// A session's place, given back when it is dropped.
 pub struct Place(#[allow(dead_code)] OwnedSemaphorePermit);
 
+/// One queued admission. Cancellation drops this along with the semaphore
+/// wait, so it cannot permanently consume the bounded waiting budget.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Sessions {
     /// None for 0, no limit.
     pub fn new(limit: usize) -> Option<Self> {
@@ -61,13 +71,14 @@ impl Sessions {
         if let Ok(permit) = self.places.clone().try_acquire_owned() {
             return Some(Place(permit));
         }
-        if self.waiting.fetch_add(1, Ordering::AcqRel) >= self.max_waiting {
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.waiting.fetch_add(1, Ordering::AcqRel);
+        let waiting = Waiting(&self.waiting);
+        if previous >= self.max_waiting {
             self.refused();
             return None;
         }
         let waited = tokio::time::timeout(wait, self.places.clone().acquire_owned()).await;
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        drop(waiting);
         match waited {
             Ok(Ok(permit)) => Some(Place(permit)),
             _ => {
@@ -225,6 +236,105 @@ mod tests {
         drop(held.pop());
         assert!(waiter.await.unwrap());
         assert_eq!(sessions.waiting.load(Ordering::Acquire), 0);
+    }
+
+    // Poll once without yielding: a pending admission has claimed a waiter
+    // slot and registered its semaphore wait, so dropping it cancels that wait.
+    fn pending_wait(future: std::pin::Pin<&mut impl std::future::Future<Output = Option<Place>>>) {
+        use std::task::{Context, Poll, Waker};
+        assert!(matches!(
+            future.poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+    }
+
+    #[tokio::test]
+    async fn canceling_a_full_wait_queue_allows_another_waiter() {
+        let sessions = Sessions::new(4).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(sessions.enter(Duration::ZERO).await.unwrap());
+        }
+        let mut canceled = Box::pin(sessions.enter(Duration::from_secs(10)));
+        pending_wait(canceled.as_mut());
+        assert!(
+            sessions.enter(Duration::from_secs(10)).await.is_none(),
+            "queue is full"
+        );
+        drop(canceled);
+        let mut replacement = Box::pin(sessions.enter(Duration::from_secs(10)));
+        pending_wait(replacement.as_mut());
+        drop(held.pop());
+        let place = replacement
+            .await
+            .expect("replacement gets the released place");
+        assert_eq!(sessions.live(), 4);
+        drop(place);
+        assert!(sessions.enter(Duration::ZERO).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn repeated_and_unpolled_cancellation_keeps_other_waiters() {
+        let sessions = Sessions::new(8).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(sessions.enter(Duration::ZERO).await.unwrap());
+        }
+        let mut survivor = Box::pin(sessions.enter(Duration::from_secs(10)));
+        pending_wait(survivor.as_mut());
+        for _ in 0..32 {
+            // Dropping a future that never started must return no slot.
+            drop(Box::pin(sessions.enter(Duration::from_secs(10))));
+            let mut canceled = Box::pin(sessions.enter(Duration::from_secs(10)));
+            pending_wait(canceled.as_mut());
+            assert!(
+                sessions.enter(Duration::from_secs(10)).await.is_none(),
+                "survivor still occupies its slot"
+            );
+            drop(canceled);
+        }
+        drop(held.pop());
+        held.push(survivor.await.expect("original waiter was not displaced"));
+        let mut next = Box::pin(sessions.enter(Duration::from_secs(10)));
+        pending_wait(next.as_mut());
+        drop(held.pop());
+        assert!(next.await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_after_a_place_is_released_returns_both_budgets() {
+        let sessions = Sessions::new(1).unwrap();
+        let held = sessions.enter(Duration::ZERO).await.unwrap();
+        let mut canceled = Box::pin(sessions.enter(Duration::from_secs(10)));
+        pending_wait(canceled.as_mut());
+        drop(held); // The semaphore has notified this waiter, not polled yet.
+        drop(canceled);
+        let held = sessions
+            .enter(Duration::ZERO)
+            .await
+            .expect("place was returned");
+        let mut next = Box::pin(sessions.enter(Duration::from_secs(10)));
+        pending_wait(next.as_mut());
+        drop(held);
+        assert!(next.await.is_some());
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_the_wait_slot_for_a_later_admission() {
+        let sessions = Sessions::new(1).unwrap();
+        let held = sessions.enter(Duration::ZERO).await.unwrap();
+        assert!(sessions.enter(Duration::from_millis(1)).await.is_none());
+        let mut next = Box::pin(sessions.enter(Duration::from_secs(10)));
+        pending_wait(next.as_mut());
+        drop(held);
+        let held = next.await.expect("admitted after timeout");
+        let mut after_success = Box::pin(sessions.enter(Duration::from_secs(10)));
+        pending_wait(after_success.as_mut());
+        drop(held);
+        assert!(
+            after_success.await.is_some(),
+            "success also returned its wait slot"
+        );
     }
 
     struct Quiet;

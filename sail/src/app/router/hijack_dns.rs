@@ -70,14 +70,73 @@ where
 pub(crate) struct Datagram {
     dns: SyncDnsClient,
     sess: Arc<Session>,
+    pending: PendingAnswers,
+}
+
+/// Queries admitted by the NAT, being answered, or awaiting delivery to
+/// its client queue. A query's answer is finished when the relay asks for
+/// the next datagram, after handing off the previous one. The inbound owns
+/// the handed-off packet independently; this is not a wire-send barrier.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct PendingAnswers(Arc<std::sync::atomic::AtomicUsize>);
+
+impl PendingAnswers {
+    pub(crate) fn add(&self, n: usize) {
+        self.0.fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn finish(&self, n: usize) {
+        self.0.fetch_sub(n, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
+    pub(crate) fn begin(&self) -> PendingAnswer {
+        self.add(1);
+        self.reserved()
+    }
+
+    /// Transfers one unit already reserved by the private admission queue.
+    pub(crate) fn reserved(&self) -> PendingAnswer {
+        PendingAnswer(self.clone())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingAnswer(PendingAnswers);
+
+impl Drop for PendingAnswer {
+    fn drop(&mut self) {
+        self.0.finish(1);
+    }
 }
 
 impl Datagram {
+    #[cfg(test)]
     pub(crate) fn new(dns: SyncDnsClient, sess: Session) -> Self {
         Datagram {
             dns,
             sess: Arc::new(sess),
+            pending: PendingAnswers::default(),
         }
+    }
+
+    pub(crate) fn with_pending(dns: SyncDnsClient, sess: Session, pending: PendingAnswers) -> Self {
+        Self {
+            dns,
+            sess: Arc::new(sess),
+            pending,
+        }
+    }
+
+    pub(crate) fn pending(&self) -> PendingAnswers {
+        self.pending.clone()
     }
 }
 
@@ -90,28 +149,37 @@ impl OutboundDatagram for Datagram {
     ) {
         let (tx, rx) = mpsc::channel(32);
         (
-            Box::new(RecvHalf(rx)),
+            Box::new(RecvHalf {
+                answers: rx,
+                delivering: None,
+            }),
             Box::new(SendHalf {
                 dns: self.dns,
                 sess: self.sess,
                 answers: tx,
+                pending: self.pending,
             }),
         )
     }
 }
 
-struct RecvHalf(mpsc::Receiver<(Vec<u8>, SocksAddr)>);
+struct RecvHalf {
+    answers: mpsc::Receiver<(Vec<u8>, SocksAddr, PendingAnswer)>,
+    delivering: Option<PendingAnswer>,
+}
 
 #[async_trait]
 impl OutboundDatagramRecvHalf for RecvHalf {
     async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocksAddr)> {
-        let (reply, from) = self
-            .0
+        self.delivering = None;
+        let (reply, from, pending) = self
+            .answers
             .recv()
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))?;
         let n = reply.len().min(buf.len());
         buf[..n].copy_from_slice(&reply[..n]);
+        self.delivering = Some(pending);
         Ok((n, from))
     }
 }
@@ -119,7 +187,8 @@ impl OutboundDatagramRecvHalf for RecvHalf {
 struct SendHalf {
     dns: SyncDnsClient,
     sess: Arc<Session>,
-    answers: mpsc::Sender<(Vec<u8>, SocksAddr)>,
+    answers: mpsc::Sender<(Vec<u8>, SocksAddr, PendingAnswer)>,
+    pending: PendingAnswers,
 }
 
 #[async_trait]
@@ -127,10 +196,19 @@ impl OutboundDatagramSendHalf for SendHalf {
     async fn send_to(&mut self, buf: &[u8], target: &SocksAddr) -> io::Result<usize> {
         let (dns, sess, answers) = (self.dns.clone(), self.sess.clone(), self.answers.clone());
         let (query, target) = (buf.to_vec(), target.clone());
+        let pending = self.pending.begin();
         // Answered apart, so that a slow query holds up none after it.
         crate::runtime::scope::spawn("hijacked dns query", async move {
-            if let Some(reply) = answer(&dns, &query, &sess).await {
-                let _ = answers.send((fit_datagram(&query, reply), target)).await;
+            // A detached NAT no longer has an answer receiver. Cancel this
+            // query without cancelling its shared/root-owned carrier.
+            let reply = tokio::select! {
+                reply = answer(&dns, &query, &sess) => reply,
+                () = answers.closed() => None,
+            };
+            if let Some(reply) = reply {
+                let _ = answers
+                    .send((fit_datagram(&query, reply), target, pending))
+                    .await;
             }
         });
         Ok(buf.len())
@@ -328,20 +406,26 @@ mod tests {
 
     #[tokio::test]
     async fn over_udp_answers_come_from_where_queries_went() {
-        let datagram: Box<dyn OutboundDatagram> =
-            Box::new(Datagram::new(dns("prefer_ipv4"), Session::default()));
-        let (mut recv, mut send) = datagram.split();
-        let server = SocksAddr::from(("8.8.8.8".parse::<IpAddr>().unwrap(), 53));
-        send.send_to(&query("test.sail.", RecordType::A), &server)
-            .await
-            .unwrap();
-        let mut buf = [0u8; 512];
-        let (n, from) = recv.recv_from(&mut buf).await.unwrap();
-        assert_eq!(from, server);
-        assert_eq!(
-            addresses(&buf[..n]).1,
-            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
-        );
+        let scope = crate::runtime::scope::TaskScope::default();
+        scope
+            .enter(async {
+                let datagram: Box<dyn OutboundDatagram> =
+                    Box::new(Datagram::new(dns("prefer_ipv4"), Session::default()));
+                let (mut recv, mut send) = datagram.split();
+                let server = SocksAddr::from(("8.8.8.8".parse::<IpAddr>().unwrap(), 53));
+                send.send_to(&query("test.sail.", RecordType::A), &server)
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 512];
+                let (n, from) = recv.recv_from(&mut buf).await.unwrap();
+                assert_eq!(from, server);
+                assert_eq!(
+                    addresses(&buf[..n]).1,
+                    vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+                );
+            })
+            .await;
+        assert!(scope.stop(std::time::Duration::from_secs(1)).await.clean());
     }
 
     fn many(name: &str, n: u16) -> SyncDnsClient {
