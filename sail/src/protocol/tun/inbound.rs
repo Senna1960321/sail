@@ -112,7 +112,13 @@ async fn handle_stream(
         inbound_tag,
         ..Default::default()
     };
-    dispatcher.dispatch_stream(sess, stream).await;
+    // The task itself belongs to the attachment. Outbound code may lazily
+    // create a pooled carrier on any read/write; those shared tasks belong
+    // to the instance, including when the TUN is their first caller.
+    let context = dispatcher.env().scope.clone();
+    context
+        .enter(dispatcher.dispatch_stream(sess, stream))
+        .await;
 }
 
 /// The stack's UDP flows a reply goes back on. A reply names the client
@@ -240,7 +246,7 @@ fn set_receive_window(tcp: &mut sail_netstack::TcpTableConfig, netstack: &Netsta
         .then_some(netstack.receive_window_max << 10);
 }
 
-fn run<I: sail_netstack::PacketIo + 'static>(
+pub(crate) fn run<I: sail_netstack::PacketIo + 'static>(
     inbound: Inbound,
     dispatcher: Arc<Dispatcher>,
     nat_manager: Arc<NatManager>,
@@ -1342,8 +1348,86 @@ pub(crate) fn new(
         platform.is_some(),
     );
     #[cfg(not(target_os = "windows"))]
-    let opened = open_device(inbound, dispatcher, nat_manager, settings, platform);
+    let opened = {
+        let teardown = dispatcher.env().teardown.clone();
+        open_device(
+            inbound,
+            dispatcher,
+            nat_manager,
+            settings,
+            platform,
+            DeviceContext {
+                teardown: &teardown,
+                publish_name: true,
+            },
+        )
+    };
     opened
+}
+
+/// Checks the dynamic device boundary without opening a device or asking
+/// the host to change its network. OS routes and DNS belong to a separate
+/// host transaction; construction must not silently enable auto routing.
+#[cfg(unix)]
+pub(crate) fn dynamic_options(
+    inbound: &Inbound,
+    host: &crate::runtime::Host,
+) -> Result<TunSettings> {
+    if inbound.protocol != "tun" {
+        return Err(anyhow!("dynamic TUN: expected a tun inbound"));
+    }
+    let settings = options(inbound, host)?;
+    if settings.auto_route || settings.auto_redirect.is_some() {
+        return Err(anyhow!(
+            "dynamic TUN: auto_route and auto_redirect require a host network transaction"
+        ));
+    }
+    if !host_opens(host)
+        && (!settings.include_package.is_empty() || !settings.exclude_package.is_empty())
+    {
+        return Err(anyhow!(
+            "dynamic TUN: package selection requires a host that opens the device"
+        ));
+    }
+    Ok(settings)
+}
+
+/// Opens only one attachment's device. The caller enters its child task
+/// scope during construction AND runner polling, and uses an attachment
+/// NAT on the same dispatcher. Device checks go only to `teardown`.
+///
+/// Internal device creation still configures addresses and brings it up;
+/// this is a commit operation, not a side-effect-free prepare. A host's
+/// open_tun transfers its descriptor as in ordinary startup, and must not
+/// install routes or DNS without its own rollback transaction.
+#[cfg(unix)]
+pub(crate) fn new_dynamic(
+    inbound: Inbound,
+    dispatcher: Arc<Dispatcher>,
+    nat_manager: Arc<NatManager>,
+    teardown: crate::runtime::teardown::Teardown,
+) -> Result<TunRunner> {
+    let settings = dynamic_options(&inbound, &dispatcher.env().host)?;
+    for (field, why) in &settings.ignored {
+        warn!("[{}] inbound: {}: ignored: {}", inbound.tag, field, why);
+    }
+    let platform = dispatcher
+        .env()
+        .host
+        .platform
+        .clone()
+        .filter(|platform| platform.opens_tun());
+    open_device(
+        inbound,
+        dispatcher,
+        nat_manager,
+        settings,
+        platform,
+        DeviceContext {
+            teardown: &teardown,
+            publish_name: false,
+        },
+    )
 }
 
 /// The TUN on Windows: a wintun adapter sail sets up itself.
@@ -1441,6 +1525,14 @@ fn adapter_gone(name: &str) -> crate::runtime::teardown::Step {
     ))
 }
 
+/// Where a device registers cleanup checks, and whether a name chosen at
+/// ordinary startup is published to the instance's shared network state.
+#[cfg(not(target_os = "windows"))]
+struct DeviceContext<'a> {
+    teardown: &'a crate::runtime::teardown::Teardown,
+    publish_name: bool,
+}
+
 /// The TUN elsewhere: opened by the host, or through the tun crates.
 #[cfg(not(target_os = "windows"))]
 fn open_device(
@@ -1449,10 +1541,20 @@ fn open_device(
     nat_manager: Arc<NatManager>,
     settings: TunSettings,
     platform: Option<crate::runtime::PlatformRef>,
+    context: DeviceContext<'_>,
 ) -> Result<TunRunner> {
     let netstack = &dispatcher.env().options.netstack;
     let mtu = usize::from(settings.mtu);
     let mut cfg = tun::Configuration::default();
+    if !context.publish_name {
+        cfg.mtu(settings.mtu);
+        #[cfg(target_os = "macos")]
+        cfg.platform_config(|config| {
+            // Device addressing may still add connected routes. Do not
+            // also run tun's explicit route command in the dynamic path.
+            config.enable_routing(false);
+        });
+    }
     let host_opened = platform.is_some();
     if let Some(platform) = platform {
         let fd = platform
@@ -1463,6 +1565,9 @@ fn open_device(
         #[cfg(target_os = "linux")]
         {
             let queues = linux_queues(&settings, netstack)?;
+            if !context.publish_name {
+                context.teardown.push_check(device_gone(&settings.name));
+            }
             return run(
                 inbound,
                 dispatcher.clone(),
@@ -1489,13 +1594,14 @@ fn open_device(
         }
     }
 
-    let chosen = dispatcher
-        .env()
-        .tun_names
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&inbound.tag)
-        .is_some_and(|name| name.chosen);
+    let chosen = context.publish_name
+        && dispatcher
+            .env()
+            .tun_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&inbound.tag)
+            .is_some_and(|name| name.chosen);
     let opened_here = !host_opened;
     let (tun, name) = if opened_here {
         open_named(
@@ -1514,7 +1620,7 @@ fn open_device(
         (tun, settings.name.clone())
     };
     let mut settings = settings;
-    if name != settings.name {
+    if context.publish_name && name != settings.name {
         // What reads the name from here on reads the one the TUN got.
         let names = {
             let mut names = dispatcher
@@ -1533,10 +1639,7 @@ fn open_device(
     info!("[{}] inbound: tun {} is up", inbound.tag, settings.name);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if opened_here {
-        dispatcher
-            .env()
-            .teardown
-            .push_check(device_gone(&settings.name));
+        context.teardown.push_check(device_gone(&settings.name));
     }
     #[cfg(target_os = "macos")]
     if let Some(ipv6) = settings.ipv6.filter(|_| cfg_opened_here(&dispatcher)) {
@@ -1726,6 +1829,49 @@ mod tests {
             udp_fragment: None,
             options: options.as_object().unwrap().clone(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dynamic_device_rejects_routing_before_opening() {
+        let host = crate::runtime::Host::default();
+        for fields in [
+            serde_json::json!({"auto_route": true}),
+            serde_json::json!({"auto_route": true, "auto_redirect": true}),
+        ] {
+            let mut inbound = tun(serde_json::json!({"address": ["172.19.0.1/30"]}));
+            inbound.options.extend(fields.as_object().unwrap().clone());
+            assert!(super::dynamic_options(&inbound, &host).is_err());
+        }
+        // The same ordinary configuration is still accepted by startup.
+        assert!(super::options(
+            &tun(serde_json::json!({
+                "address": ["172.19.0.1/30"], "auto_route": true
+            })),
+            &host,
+        )
+        .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dynamic_device_checks_source_and_accepts_unrouted_settings() {
+        let host = crate::runtime::Host::default();
+        let inbound = tun(serde_json::json!({
+            "address": ["172.19.0.1/30"], "interface_name": "utun77",
+            "mtu": 1500
+        }));
+        let settings = super::dynamic_options(&inbound, &host).unwrap();
+        assert_eq!(settings.name, "utun77");
+        assert!(!settings.auto_route);
+        let mut other = inbound.clone();
+        other.protocol = "socks".into();
+        assert!(super::dynamic_options(&other, &host).is_err());
+        let mut packages = inbound;
+        packages
+            .options
+            .insert("include_package".into(), serde_json::json!(["app"]));
+        assert!(super::dynamic_options(&packages, &host).is_err());
     }
 
     #[test]

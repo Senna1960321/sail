@@ -881,6 +881,63 @@ Use immutable host snapshots; interior mutability is the host's explicit
 synchronization and versioning responsibility. No TTL, tombstone or new
 per-destination meter is introduced.
 
+## Explicit TUN attachment
+
+`Options::dynamic_tun(true)` enables the optional Rust attachment API. It
+is off by default and requires `inbound-tun`. One running `Instance` owns
+at most one reservation or attachment, alongside its existing proxy core.
+Ordinary static TUN startup and reload retain their existing semantics.
+
+`prepare_tun_packets(inbound_json, capacity)` returns a `PreparedTun` and a
+`TunPacketFlow`. The JSON is one named TUN inbound object, not a whole
+configuration. Preparation allocates an unpolled stack and bounded queues;
+it opens no device and changes no OS routes or DNS. Capacity is 1–4096
+packets in each direction; each packet is a whole 1–65535 byte raw IPv4 or
+IPv6 payload, without a Darwin address-family prefix. Netstack budgets and
+host-retained batches remain separate bounds. Move `flow.uplink` and
+`flow.downlink` into independent host tasks. Sending backpressures; ending
+the attachment wakes pending operations and discards its queued output.
+
+On Unix, `prepare_tun_device(inbound_json)` validates and reserves a device
+attachment. The consuming `PreparedTun::commit()` then opens it, calling
+`Platform::open_tun` when the host supplies devices. That callback transfers
+an owned descriptor: duplicate any original the host retains. Internal
+device creation can configure addresses, MTU, interface-up and connected
+routes, and therefore occurs only at commit. Dynamic `auto_route` and
+`auto_redirect` are refused. The host owns the OS route/DNS transaction and
+must verify an explicit interface identity; `tun_names()` describes static
+startup and is not dynamic-device discovery. Device and public packet-flow
+framing are different contracts. Windows offers the packet API, not this
+Unix device method.
+
+Dropping an unused `PreparedTun` releases only its own reservation. A
+stopped/restarted run and later generations reject stale handles. Once a
+commit future has been polled, cancelling its host await does not imply
+that it was rolled back: `tun_state()` reports Prepared, Committing,
+Attached, Failed, Draining or Detached, and `detach_tun()` reconciles an
+uncertain result. A blocked open runs outside the mutation lock on tracked
+blocking work; late results cannot publish or clear another generation.
+
+`detach_tun()` ends only the attachment's packet runtime, captured streams,
+private NAT and per-request DNS work, on the same dispatcher, routing,
+DNS, user quotas and statistics core. Shared lazy carriers are polled and
+registered with the instance, so an existing proxy connection is not owned
+by the attachment that first created its carrier. Root admission, frozen
+record context, UDP parent/run identity, reply-peer leases and pending DNS
+ownership remain in force. A new attachment is refused while a prior one
+has unfinished work or cleanup; inspect the returned `StopReport::clean()`
+and retry detach after the reported owner finishes. Full instance stop
+closes publication and drains the attachment without waiting on a reload
+that still owns the mutation lock.
+
+Sail's existing C callback layout is unchanged; these are Rust APIs. A
+client C/Swift packet-flow wrapper owns its generation fences, callback
+joins, external packetFlow and OS transaction. Clean Sail detach does not
+join a packet already handed to an external host writer. Rebuild and test
+those wrappers against the exact SDK source; older device results do not
+validate a new dependency. Protect physical egress before enabling capture
+and report genuine physical network state, not the capture interface.
+
 ## Dialling
 
 `dial_tcp` and `dial_udp` go through the outbound named, whatever the

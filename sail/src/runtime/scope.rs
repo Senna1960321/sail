@@ -7,8 +7,9 @@
 //!   request or probe. A panic there ends that task alone; it is logged,
 //!   counted and told (`Fault`), and the instance goes on.
 //! - `spawn_essential`: what the instance cannot do its job without, and
-//!   whose loss would degrade it silently. A panic there fails the
-//!   instance.
+//!   whose loss would degrade it silently. A panic there fails its scope.
+//!   The instance monitors its root scope; dynamic TUN attachments have
+//!   an isolated failure domain drained independently.
 //!
 //! In doubt, essential: a stopped instance is visible, a silently dead
 //! updater is not.
@@ -41,6 +42,8 @@ pub const STOP_WITHIN: Duration = Duration::from_secs(2);
 tokio::task_local! {
     /// The scope of the task running: the instance's.
     static CURRENT: TaskScope;
+    /// Transient query ownership, distinct from the shared carrier poll context.
+    static REQUEST_OWNER: TaskScope;
 }
 
 std::thread_local! {
@@ -100,7 +103,7 @@ struct Inner {
     next: AtomicU64,
     shards: [Registry; SHARDS],
     /// Contained panics since the scope was made.
-    faults: AtomicU64,
+    faults: Arc<AtomicU64>,
     /// Why the instance failed: an essential task's panic, or a lock it
     /// poisoned; told once to whoever waits on it.
     failed: tokio::sync::watch::Sender<Option<String>>,
@@ -111,7 +114,9 @@ struct Inner {
     log: std::sync::OnceLock<Arc<crate::app::logger::InstanceLog>>,
     /// What the system's clock is behind the instance's NTP server, in
     /// nanoseconds (`crate::clock`).
-    clock: portable_atomic::AtomicI64,
+    clock: Arc<portable_atomic::AtomicI64>,
+    #[cfg(feature = "inbound-tun")]
+    children: Mutex<Vec<std::sync::Weak<Inner>>>,
 }
 
 /// An instance's tasks. Cheap to clone; every clone the same.
@@ -144,16 +149,63 @@ fn message(panic: &(dyn std::any::Any + Send)) -> String {
 
 impl TaskScope {
     pub fn new(events: crate::control::events::EventHub) -> Self {
+        Self::with_context(
+            events,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(portable_atomic::AtomicI64::new(0)),
+        )
+    }
+
+    fn with_context(
+        events: crate::control::events::EventHub,
+        faults: Arc<AtomicU64>,
+        clock: Arc<portable_atomic::AtomicI64>,
+    ) -> Self {
         TaskScope(Arc::new(Inner {
             next: AtomicU64::new(0),
             shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
-            faults: AtomicU64::new(0),
+            faults,
             failed: tokio::sync::watch::channel(None).0,
             events,
             report: Mutex::new(None),
             log: std::sync::OnceLock::new(),
-            clock: portable_atomic::AtomicI64::new(0),
+            clock,
+            #[cfg(feature = "inbound-tun")]
+            children: Mutex::new(Vec::new()),
         }))
+    }
+
+    /// An independently drainable task registry/failure domain in the same
+    /// instance. Logs, events, NTP clock and fault accounting remain shared.
+    #[cfg(feature = "inbound-tun")]
+    pub(crate) fn isolated(&self) -> Self {
+        let scope = Self::with_context(
+            self.0.events.clone(),
+            self.0.faults.clone(),
+            self.0.clock.clone(),
+        );
+        if let Some(log) = self.log() {
+            scope.set_log(log);
+        }
+        lock(&self.0.children).push(Arc::downgrade(&scope.0));
+        scope
+    }
+
+    // A root stop still owns the complete run, including locally drainable
+    // domains retained by old manager handles. Weak links form no owner cycle.
+    fn children(&self) -> Vec<TaskScope> {
+        #[cfg(feature = "inbound-tun")]
+        {
+            let mut children = lock(&self.0.children);
+            children.retain(|child| child.strong_count() > 0);
+            children
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .map(TaskScope)
+                .collect()
+        }
+        #[cfg(not(feature = "inbound-tun"))]
+        Vec::new()
     }
 
     /// What the system's clock is behind the instance's NTP server, in
@@ -185,6 +237,30 @@ impl TaskScope {
     /// the scope's. For the instance's root tasks.
     pub fn enter<F: Future>(&self, fut: F) -> impl Future<Output = F::Output> {
         CURRENT.scope(self.clone(), fut)
+    }
+
+    /// An attachment's request tasks are local even while outbound I/O
+    /// polls under the instance context to construct shared carriers there.
+    pub(crate) fn own_requests<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        REQUEST_OWNER.scope(self.clone(), future)
+    }
+
+    /// Poll-free construction on a blocking thread still needs this scope's
+    /// task context (the runtime handle is entered separately by its owner).
+    #[cfg(feature = "inbound-tun")]
+    pub(crate) fn enter_sync<T>(&self, f: impl FnOnce() -> T) -> T {
+        CURRENT.sync_scope(self.clone(), f)
+    }
+
+    /// Keeps an owned result counted until its resources actually drop,
+    /// including while a completed blocking task stores an unjoined result.
+    #[cfg(feature = "inbound-tun")]
+    pub(crate) fn hold_resource(&self, name: &'static str) -> TaskResource {
+        let id = self.0.next.fetch_add(1, Ordering::Relaxed);
+        lock(&self.0.shards[(id as usize) % SHARDS]).insert(id, (name, None));
+        TaskResource {
+            _registration: Registered(self.clone(), id),
+        }
     }
 
     /// The scope of the task running, if it is a scoped one; else that of
@@ -244,6 +320,11 @@ impl TaskScope {
         for shard in &self.0.shards {
             for (name, _) in lock(shard).values() {
                 *by_name.entry(name).or_default() += 1;
+            }
+        }
+        for child in self.children() {
+            for (name, count) in child.tasks() {
+                *by_name.entry(name).or_default() += count;
             }
         }
         let mut tasks: Vec<_> = by_name.into_iter().collect();
@@ -419,13 +500,14 @@ impl TaskScope {
                     .fault(crate::control::events::Fault::new(name, class, what, count));
             }
             TaskClass::Essential => {
-                tracing::error!("task [{}] panicked: {}; the instance fails", name, what);
+                tracing::error!("task [{}] panicked: {}; its scope fails", name, what);
                 self.fail(format!("task [{}] panicked: {}", name, what));
             }
         }
     }
 
-    /// Fails the instance: the first reason is kept.
+    /// Fails this scope: the first reason is kept. A root scope fails the
+    /// instance; an isolated attachment scope fails only that attachment.
     pub fn fail(&self, why: String) {
         self.0.failed.send_if_modified(|failed| {
             if failed.is_none() {
@@ -469,18 +551,20 @@ impl TaskScope {
 
     /// Tasks registered now.
     pub fn len(&self) -> usize {
-        self.0.shards.iter().map(|s| lock(s).len()).sum()
+        self.0.shards.iter().map(|s| lock(s).len()).sum::<usize>()
+            + self.children().iter().map(TaskScope::len).sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Ends every task: aborts them, then waits up to `within` for them to
-    /// be gone. What is left (a blocking call, which an abort cannot end)
-    /// is reported, and kept for `report`.
-    pub async fn stop(&self, within: Duration) -> StopReport {
-        let started = Instant::now();
+    /// Emergency cancellation without waiting, for an owner's Drop. Normal
+    /// lifecycle operations use stop() and inspect its resource barrier.
+    pub(crate) fn abort_all(&self) {
+        for child in self.children() {
+            child.abort_all();
+        }
         for shard in &self.0.shards {
             for (_, abort) in lock(shard).values() {
                 if let Some(abort) = abort {
@@ -488,7 +572,17 @@ impl TaskScope {
                 }
             }
         }
+    }
+
+    /// Ends every task: aborts them, then waits up to `within` for them to
+    /// be gone. What is left (a blocking call, which an abort cannot end)
+    /// is reported, and kept for `report`.
+    pub async fn stop(&self, within: Duration) -> StopReport {
+        let started = Instant::now();
+        self.abort_all();
         while !self.is_empty() && started.elapsed() < within {
+            // A running task can register a child just as abort is requested.
+            self.abort_all();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let mut report = lock(&self.0.report);
@@ -510,6 +604,11 @@ impl TaskScope {
     pub fn report(&self) -> Option<StopReport> {
         lock(&self.0.report).clone()
     }
+}
+
+#[cfg(feature = "inbound-tun")]
+pub(crate) struct TaskResource {
+    _registration: Registered,
 }
 
 /// Takes its task out of the registry when it ends.
@@ -793,9 +892,135 @@ pub fn unscoped_count() -> u64 {
     UNSCOPED.load(Ordering::Relaxed)
 }
 
+/// Register a per-request task with an explicit attachment owner, keeping
+/// its I/O poll context at the root. Ordinary requests retain spawn().
+pub(crate) fn spawn_request<F>(name: &'static str, future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match REQUEST_OWNER.try_with(Clone::clone).ok() {
+        None => spawn(name, future),
+        Some(owner) => {
+            let context = TaskScope::current();
+            let requests = owner.clone();
+            owner.spawn(name, async move {
+                requests
+                    .own_requests(async move {
+                        match context {
+                            Some(context) => context.enter(future).await,
+                            None => future.await,
+                        }
+                    })
+                    .await
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "inbound-tun")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_root_stop_reports_resources_owned_by_a_retained_child_scope() {
+        let root = TaskScope::default();
+        let child = root.isolated();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        struct Release(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        let (ready, entered) = tokio::sync::oneshot::channel();
+        let task = child.spawn_blocking("test retained attachment resource", move || {
+            ready.send(()).unwrap();
+            let mut open = gate.0.lock().unwrap();
+            while !*open {
+                open = gate.1.wait(open).unwrap();
+            }
+        });
+        entered.await.unwrap();
+        let report = root.stop(Duration::from_millis(20)).await;
+        drop(release);
+        task.await.unwrap();
+        let final_report = root.stop(Duration::from_secs(1)).await;
+        assert!(
+            !report.clean(),
+            "root must not report a retained child resource as clean"
+        );
+        assert!(report
+            .tasks
+            .iter()
+            .any(|(name, _)| *name == "test retained attachment resource"));
+        assert!(final_report.clean());
+        assert!(child.is_empty());
+    }
+
+    #[cfg(feature = "inbound-tun")]
+    #[tokio::test]
+    async fn an_unjoined_blocking_result_stays_owned_until_its_payload_drops() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        struct Payload(Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+        struct OwnedResult {
+            _payload: Payload,
+            _held: TaskResource,
+        }
+        let scope = TaskScope::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let payload = Payload(dropped.clone());
+        let held = scope.hold_resource("unjoined opening result");
+        let result = scope.spawn_blocking("opening task", move || OwnedResult {
+            _payload: payload,
+            _held: held,
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !result.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!dropped.load(AtomicOrdering::SeqCst));
+        let report = scope.stop(Duration::from_millis(20)).await;
+        assert!(!report.clean());
+        assert_eq!(report.tasks, [("unjoined opening result", 1)]);
+        drop(result);
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        assert!(scope.is_empty());
+    }
+
+    #[cfg(feature = "inbound-tun")]
+    #[tokio::test]
+    async fn an_isolated_registry_keeps_instance_context_but_not_failure_or_tasks() {
+        let parent = TaskScope::default();
+        let child = parent.isolated();
+        parent.set_clock_offset(17);
+        assert_eq!(child.clock_offset(), 17);
+        child.set_clock_offset(23);
+        assert_eq!(parent.clock_offset(), 23);
+        let bad = child.spawn("isolated panic", async { panic!("one attachment") });
+        assert!(bad.await.is_err());
+        assert_eq!(parent.faults(), 1);
+        assert!(parent.failure().is_none());
+        child.fail("attachment failed".to_string());
+        assert!(parent.failure().is_none());
+        assert!(child.failure().is_some());
+        let _task = child.spawn("isolated pending", std::future::pending::<()>());
+        assert!(parent.0.shards.iter().all(|shard| lock(shard).is_empty()));
+        assert_eq!(parent.len(), 1, "whole-run accounting includes the child");
+        assert!(child.stop(Duration::from_secs(1)).await.clean());
+        assert!(parent.is_empty());
+    }
 
     #[tokio::test]
     async fn a_contained_panic_is_counted_and_the_scope_goes_on() {

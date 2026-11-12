@@ -1,5 +1,7 @@
 #[doc(hidden)]
 pub mod admission;
+#[cfg(feature = "inbound-tun")]
+pub(crate) mod dynamic_tun;
 #[cfg(feature = "auto-reload")]
 pub(crate) mod follow;
 pub(crate) mod handshakes;

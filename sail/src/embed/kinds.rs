@@ -88,7 +88,7 @@ impl KindContext<'_> {
 /// reloads and runs.
 #[doc(hidden)]
 #[derive(Clone, Default)]
-pub struct HostKinds(Arc<Kinds>);
+pub struct HostKinds(Arc<Kinds>, bool);
 
 #[derive(Default)]
 struct Kinds {
@@ -97,6 +97,17 @@ struct Kinds {
 }
 
 impl HostKinds {
+    // Keep the opt-in Rust setting in this sealed per-instance host
+    // configuration, without adding a field to public Host struct literals.
+    pub(super) fn with_dynamic_tun(mut self, enabled: bool) -> Self {
+        self.1 = enabled;
+        self
+    }
+
+    pub(crate) fn dynamic_tun_enabled(&self) -> bool {
+        self.1
+    }
+
     /// `kinds` with the inbound kind `name` added.
     pub(super) fn with_inbound(
         &self,
@@ -110,7 +121,7 @@ impl HostKinds {
         if kinds.inbounds.insert(name, factory).is_some() {
             return Err(twice("inbound", name));
         }
-        Ok(HostKinds(Arc::new(kinds)))
+        Ok(HostKinds(Arc::new(kinds), self.1))
     }
 
     /// `kinds` with the outbound kind `name` added.
@@ -128,7 +139,7 @@ impl HostKinds {
         if kinds.outbounds.insert(name, factory).is_some() {
             return Err(twice("outbound", name));
         }
-        Ok(HostKinds(Arc::new(kinds)))
+        Ok(HostKinds(Arc::new(kinds), self.1))
     }
 
     fn copy(&self) -> Kinds {
@@ -175,7 +186,7 @@ impl fmt::Debug for HostKinds {
 /// carry the same kinds.
 impl PartialEq for HostKinds {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0) && self.1 == other.1
     }
 }
 

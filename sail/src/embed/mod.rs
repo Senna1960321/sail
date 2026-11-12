@@ -28,6 +28,10 @@ mod network;
 #[cfg(feature = "rule-set")]
 mod rule_set;
 mod streams;
+#[cfg(feature = "inbound-tun")]
+pub(crate) mod tun;
+#[cfg(feature = "inbound-tun")]
+pub use tun::{PreparedTun, TunPacketFlow, TunPacketReceiver, TunPacketSender, TunState};
 
 pub use crate::app::inbound::AdmissionInfo;
 pub use crate::control::context::RecordContext;
@@ -143,6 +147,13 @@ pub struct Options {
 }
 
 impl Options {
+    /// Enables explicit attachment transactions; ordinary static TUN and
+    /// reload behavior is unchanged. Disabled by default.
+    pub fn dynamic_tun(mut self, enabled: bool) -> Self {
+        self.kinds = self.kinds.with_dynamic_tun(enabled);
+        self
+    }
+
     /// The desktop profile, its threads as sail-cli's, no platform, 3000
     /// lines of log kept.
     pub fn new() -> Self {

@@ -149,6 +149,8 @@ pub struct RuntimeManager {
     /// The TUN inbound's stack, when there is one.
     #[cfg(feature = "inbound-tun")]
     tun_control: Option<net::netstack::NativeRuntimeControl>,
+    #[cfg(feature = "inbound-tun")]
+    dynamic_tun: app::inbound::dynamic_tun::DynamicTun,
     /// The generation of the network the TUN flows belong to.
     #[cfg(feature = "inbound-tun")]
     network_generation: Mutex<u64>,
@@ -240,6 +242,8 @@ impl RuntimeManager {
             network_change_tx,
             #[cfg(feature = "inbound-tun")]
             tun_control: instance.tun_control.clone(),
+            #[cfg(feature = "inbound-tun")]
+            dynamic_tun: Default::default(),
             #[cfg(feature = "inbound-tun")]
             network_generation: Mutex::new(0),
             router: instance.router.clone(),
@@ -455,7 +459,7 @@ impl RuntimeManager {
         // The TUN's flows end with their connections; all of them only
         // with every connection.
         #[cfg(feature = "inbound-tun")]
-        if every && self.tun_control.is_some() {
+        if every && self.current_tun_control().is_some() {
             if let Err(e) = self.reset_tun_flows().await {
                 warn!("network changed: resetting the tun's flows: {}", e);
             }
@@ -835,6 +839,8 @@ impl RuntimeManager {
     /// all that did not change; the changes lock is held. The inbounds it
     /// has are those that run after it: see app/inbound/manager/reload.rs.
     async fn apply(&self, config: config::Config) -> Result<control::ReloadReport, Error> {
+        #[cfg(feature = "inbound-tun")]
+        self.check_dynamic_inbounds(&config.inbounds)?;
         #[cfg(feature = "inbound-tun")]
         let config = {
             let mut config = config;
@@ -1314,6 +1320,8 @@ impl RuntimeManager {
         if inbound.tag.is_empty() {
             inbound.tag = inbound.protocol.clone();
         }
+        #[cfg(feature = "inbound-tun")]
+        self.check_dynamic_inbounds(std::slice::from_ref(&inbound))?;
         #[cfg(feature = "auto-reload")]
         let files = app::inbound::follow::about_to_read(std::slice::from_ref(&inbound), &self.env);
         let mut inbounds = self
@@ -1452,7 +1460,7 @@ impl RuntimeManager {
     /// the log).
     #[cfg(feature = "inbound-tun")]
     pub async fn network_changed(&self, mtu: Option<usize>) -> Result<(), Error> {
-        let Some(mut control) = self.tun_control.clone() else {
+        let Some(mut control) = self.current_tun_control() else {
             return Err(Error::Config(anyhow!("there is no tun inbound")));
         };
         if let Some(mtu) = mtu {
@@ -1482,7 +1490,7 @@ impl RuntimeManager {
     /// Stops serving the TUN inbound's flows of the network before.
     #[cfg(feature = "inbound-tun")]
     async fn reset_tun_flows(&self) -> Result<(), Error> {
-        let Some(mut control) = self.tun_control.clone() else {
+        let Some(mut control) = self.current_tun_control() else {
             return Ok(());
         };
         let generation = {
@@ -2754,6 +2762,8 @@ fn run(rt_id: RuntimeId, opts: StartOptions, start: &Arc<Starting>) -> Result<()
     // in the system (routes, rules, filters, DNS); then the root tasks
     // left, the TUN's among them, which closes the device; the instance;
     // its tasks, within the bound; the runtime, within it too.
+    #[cfg(feature = "inbound-tun")]
+    rt.block_on(runtime_manager.stop_dynamic_tun());
     env.teardown.run_all();
     drop(here);
     for task in &spawned {

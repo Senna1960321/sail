@@ -145,6 +145,13 @@ impl Instance {
             kinds,
             admission,
         } = options;
+        #[cfg(not(feature = "inbound-tun"))]
+        if kinds.dynamic_tun_enabled() {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "dynamic TUN requires inbound-tun",
+            ));
+        }
         if admission.bind.is_some() && lossless_records.is_none() {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -885,4 +892,13 @@ fn expires(
 #[doc(hidden)]
 pub fn ids_held() -> usize {
     lock(&IDS).len()
+}
+
+#[cfg(all(test, not(feature = "inbound-tun")))]
+mod dynamic_feature_tests {
+    #[test]
+    fn an_explicit_dynamic_tun_option_requires_the_feature() {
+        let error = super::Instance::new(super::Options::new().dynamic_tun(true)).unwrap_err();
+        assert_eq!(error.kind(), super::ErrorKind::Unsupported);
+    }
 }

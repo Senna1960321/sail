@@ -827,7 +827,7 @@ impl RuntimeManager {
     /// Whether the instance has a TUN inbound.
     pub fn has_tun(&self) -> bool {
         #[cfg(feature = "inbound-tun")]
-        return self.tun_control.is_some();
+        return self.current_tun_control().is_some();
         #[cfg(not(feature = "inbound-tun"))]
         false
     }

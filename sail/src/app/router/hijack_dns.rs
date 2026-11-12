@@ -198,7 +198,7 @@ impl OutboundDatagramSendHalf for SendHalf {
         let (query, target) = (buf.to_vec(), target.clone());
         let pending = self.pending.begin();
         // Answered apart, so that a slow query holds up none after it.
-        crate::runtime::scope::spawn("hijacked dns query", async move {
+        crate::runtime::scope::spawn_request("hijacked dns query", async move {
             // A detached NAT no longer has an answer receiver. Cancel this
             // query without cancelling its shared/root-owned carrier.
             let reply = tokio::select! {

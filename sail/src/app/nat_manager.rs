@@ -203,7 +203,70 @@ async fn end_sessions(sessions: &Mutex<SessionMap>, ends: impl Fn(&NatKey) -> bo
     keys.len()
 }
 
+/// Ownership of a NAT task differs from the context in which it polls
+/// outbound I/O. Attachment tasks drain locally; lazily created shared
+/// carriers must always be spawned in the instance's root scope.
+#[derive(Clone, Default)]
+enum NatTasks {
+    #[default]
+    Inherited,
+    #[cfg(feature = "inbound-tun")]
+    Attachment {
+        owner: crate::runtime::scope::TaskScope,
+        context: crate::runtime::scope::TaskScope,
+    },
+}
+impl NatTasks {
+    fn spawn<F>(&self, name: &'static str, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_as(crate::runtime::scope::TaskClass::Contained, name, future)
+    }
+    fn spawn_essential<F>(
+        &self,
+        name: &'static str,
+        future: F,
+    ) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_as(crate::runtime::scope::TaskClass::Essential, name, future)
+    }
+    fn spawn_as<F>(
+        &self,
+        class: crate::runtime::scope::TaskClass,
+        name: &'static str,
+        future: F,
+    ) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        use crate::runtime::scope::{self, TaskClass};
+        match self {
+            Self::Inherited => match class {
+                TaskClass::Contained => scope::spawn(name, future),
+                TaskClass::Essential => scope::spawn_essential(name, future),
+            },
+            #[cfg(feature = "inbound-tun")]
+            Self::Attachment { owner, context } => {
+                let context = context.clone();
+                let requests = owner.clone();
+                let future = async move { requests.own_requests(context.enter(future)).await };
+                match class {
+                    TaskClass::Contained => owner.spawn(name, future),
+                    TaskClass::Essential => owner.spawn_essential(name, future),
+                }
+            }
+        }
+    }
+}
+
 pub struct NatManager {
+    tasks: NatTasks,
     #[cfg(all(test, feature = "outbound-direct"))]
     cleanup_ticks: Arc<std::sync::atomic::AtomicUsize>,
     sessions: Arc<Mutex<SessionMap>>,
@@ -297,6 +360,7 @@ impl NatManager {
         });
 
         NatManager {
+            tasks: Default::default(),
             #[cfg(all(test, feature = "outbound-direct"))]
             cleanup_ticks,
             sessions,
@@ -305,6 +369,18 @@ impl NatManager {
             udp_timeouts,
             watched: Default::default(),
         }
+    }
+
+    #[cfg(feature = "inbound-tun")]
+    pub(crate) fn new_scoped(
+        dispatcher: Arc<Dispatcher>,
+        inbounds: &[crate::config::Inbound],
+        owner: crate::runtime::scope::TaskScope,
+    ) -> Self {
+        let context = dispatcher.env().scope.clone();
+        let mut manager = Self::new(dispatcher, inbounds);
+        manager.tasks = NatTasks::Attachment { owner, context };
+        manager
     }
 
     /// Ends the session of `source` through the inbound `inbound_tag`,
@@ -340,7 +416,7 @@ impl NatManager {
         let association = association.clone();
         let sessions = self.sessions.clone();
         let watched = self.watched.clone();
-        crate::runtime::scope::spawn("nat association watch", async move {
+        self.tasks.spawn("nat association watch", async move {
             association.ended().await;
             // Unwatched first: a session added from here on starts its own
             // watch, which finds the association ended at once.
@@ -471,7 +547,7 @@ impl NatManager {
     ) {
         // Runs the lazy task for session cleanup job, this task will run only once.
         if let Some(task) = self.timeout_check_task.lock().await.take() {
-            crate::runtime::scope::spawn_essential("nat cleanup", task);
+            self.tasks.spawn_essential("nat cleanup", task);
         }
 
         let (target_ch_tx, mut target_ch_rx) =
@@ -509,7 +585,8 @@ impl NatManager {
         // TCP stream would block the task.
         let raddr_cloned = raddr.clone();
         let span = sess.span();
-        crate::runtime::scope::spawn(
+        let tasks = self.tasks.clone();
+        self.tasks.spawn(
             "nat dispatch",
             async move {
                 // new socket to communicate with the target. A sniff rule
@@ -623,11 +700,11 @@ impl NatManager {
                 .instrument(tracing::Span::current());
 
                 let (downlink_task, downlink_task_handle) = abortable(downlink_task);
-                crate::runtime::scope::spawn("nat downlink", downlink_task);
+                tasks.spawn("nat downlink", downlink_task);
 
                 // Runs a task to receive the abort signal: the session ended,
                 // standing idle, or by its client.
-                crate::runtime::scope::spawn("nat downlink abort", async move {
+                tasks.spawn("nat downlink abort", async move {
                     if let Ok(idle) = downlink_abort_rx.await {
                         if let Some(listed) = &listed {
                             listed.ended(match idle {
@@ -641,7 +718,7 @@ impl NatManager {
 
                 // uplink
                 let raddr_uplink = raddr_cloned.clone();
-                crate::runtime::scope::spawn(
+                tasks.spawn(
                     "nat uplink",
                     async move {
                         // Authorization is bounded independently of the
@@ -714,6 +791,93 @@ impl NatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Actual hijack query ownership is local; its root poll context must
+    /// neither leak the request nor cancel a shared carrier at detach.
+    #[cfg(all(feature = "inbound-tun", feature = "outbound-direct"))]
+    #[tokio::test]
+    async fn attachment_drain_joins_dns_requests_but_keeps_root_carriers() {
+        use crate::util::DnsMessageExt;
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = crate::config::Config::from_json(
+            &serde_json::json!({
+                "dns":{"servers":[{"type":"udp","server":"127.0.0.1",
+                    "server_port":upstream.local_addr().unwrap().port()}]},
+                "outbounds":[{"type":"direct","tag":"direct"}],
+                "route":{"rules":[{"port":53,"action":"hijack-dns"}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let instance = instance(&config).await;
+        let root = instance.env.scope.clone();
+        let owner = root.isolated();
+        let nat =
+            NatManager::new_scoped(instance.dispatcher.clone(), &config.inbounds, owner.clone());
+        let (answers, _receive) = mpsc::channel(1);
+        let source = DatagramSource::new("192.0.2.1:50000".parse().unwrap(), None);
+        let key = NatKey::new("test", &source);
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("pending.example.").unwrap(),
+            RecordType::A,
+        ));
+        root.enter(nat.send(
+            None,
+            &source,
+            "test",
+            &answers,
+            UdpPacket::new(
+                query.to_vec().unwrap(),
+                SocksAddr::Ip(source.address),
+                SocksAddr::Ip("203.0.113.53:53".parse().unwrap()),
+            ),
+        ))
+        .await;
+        let mut buf = [0; 512];
+        tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = nat.sessions.lock().await[&key].generation.clone();
+        let query_owned = owner
+            .tasks()
+            .iter()
+            .any(|(name, _)| *name == "hijacked dns query");
+        struct Ended(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = Ended(ended.clone());
+        let carrier = root.spawn("test shared carrier", async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        let report = owner.stop(Duration::from_secs(1)).await;
+        let request_released = generation.is_idle();
+        let carrier_alive =
+            !carrier.is_finished() && !ended.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(root.stop(Duration::from_secs(1)).await.clean());
+        assert!(
+            query_owned,
+            "hijacked request must be registered with the attachment"
+        );
+        assert!(report.clean(), "{report:?}");
+        assert!(
+            request_released,
+            "detach must join the pending answer owner"
+        );
+        assert!(
+            carrier_alive,
+            "attachment drain must not own a shared root carrier"
+        );
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn cancelling_queue_owner_drains_only_queued_admissions() {
