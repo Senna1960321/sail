@@ -930,6 +930,12 @@ and retry detach after the reported owner finishes. Full instance stop
 closes publication and drains the attachment without waiting on a reload
 that still owns the mutation lock.
 
+For an instance with dynamic attachment enabled, a new run is also refused
+while a previous run still owns tasks or returned resources. A bounded
+stop cannot cancel an already running host callback. Wait for its actual
+resource barrier to clear before restarting or replacing the host's staged
+device; a stopped run thread alone does not establish that clearance.
+
 Sail's existing C callback layout is unchanged; these are Rust APIs. A
 client C/Swift packet-flow wrapper owns its generation fences, callback
 joins, external packetFlow and OS transaction. Clean Sail detach does not

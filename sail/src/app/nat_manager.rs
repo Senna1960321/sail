@@ -797,7 +797,6 @@ mod tests {
     #[cfg(all(feature = "inbound-tun", feature = "outbound-direct"))]
     #[tokio::test]
     async fn attachment_drain_joins_dns_requests_but_keeps_root_carriers() {
-        use crate::util::DnsMessageExt;
         use hickory_proto::op::{Message, MessageType, OpCode, Query};
         use hickory_proto::rr::{Name, RecordType};
         let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

@@ -542,6 +542,18 @@ impl Inner {
                 life.phase.name()
             )));
         }
+        // A bounded stop may return while a dynamic device callback still
+        // runs. It can read the host's staged device only later, so a new
+        // run must not allow that host slot to be reused before the old
+        // task and its returned-resource guard have both ended.
+        #[cfg(feature = "inbound-tun")]
+        if self.host.kinds.dynamic_tun_enabled()
+            && life.scope.as_ref().is_some_and(|scope| !scope.is_empty())
+        {
+            return Err(Error::state(
+                "the previous dynamic TUN run still owns tasks or resources; wait for them to end before restarting",
+            ));
+        }
         // The last run's thread has ended, or is ending.
         if let Some(thread) = life.thread.take() {
             let _ = thread.join();
