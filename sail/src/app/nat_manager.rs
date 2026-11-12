@@ -519,7 +519,7 @@ impl NatManager {
             let entry = guard.get(&key);
             let mut event = trace.event(super::udp_target_diagnostics::NAT_ENTRY);
             event.entry_hit = entry.is_some();
-            event.original_is_fixture = entry.map_or(true, |e| e.diagnostic_trace.is_some());
+            event.original_is_fixture = entry.is_none_or(|e| e.diagnostic_trace.is_some());
             event.coverage_missing = entry.is_some_and(|e| e.diagnostic_trace.is_none());
             event.parent_flow_id = entry
                 .and_then(|e| e.diagnostic_trace.as_ref())
