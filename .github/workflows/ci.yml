@@ -385,6 +385,9 @@ jobs:
           echo "::endgroup::"
           for features in \
             muxcore \
+            internal-diagnostics \
+            internal-udp-target-diagnostics \
+            internal-udp-target-diagnostics,inbound-tun,inbound-mixed,outbound-direct,outbound-anytls \
             inbound-socks,outbound-direct \
             inbound-shadowsocks,outbound-shadowsocks \
             inbound-trojan,inbound-tls,outbound-trojan,outbound-tls \
@@ -476,6 +479,53 @@ jobs:
       - name: libraries
         run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/plugin,sail/muxcore,sail/inbound-sail,sail/outbound-sail --lib
 
+      - name: internal admission diagnostics
+        run: |
+          set -euo pipefail
+          cargo test --locked -p sail --no-default-features --features internal-diagnostics,outbound-direct \
+            --lib diagnostics -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/diagnostics-base.log"
+          grep -F '7 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/diagnostics-base.log"
+
+      - name: internal UDP policy and observations
+        run: |
+          set -euo pipefail
+          cargo test --locked -p sail --lib \
+            --features internal-udp-target-diagnostics,outbound-anytls,auto-reload,plugin,muxcore \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/diagnostics-udp.log"
+          grep -Eq 'test result: ok[.] [1-9][0-9]* passed; 0 failed;' "$RUNNER_TEMP/diagnostics-udp.log"
+          for diagnostic_case in \
+            app::dispatcher::udp_target_route_tests::udp_target_none_policy_allocates_no_sink_or_ring \
+            app::dispatcher::udp_target_route_tests::udp_target_source_rule_identity_and_final_sentinel \
+            app::nat_manager::udp_target_tests::udp_target_existing_nonfixture_entry_queue_reasons_and_packet_gate \
+            app::sessions::diagnostics_tests::diagnostics_distinguish_wait_overflow_and_closed_from_timeout_or_cancel \
+            app::sessions::diagnostics_tests::diagnostics_do_not_repair_cancelled_waiting_budget \
+            app::sessions::diagnostics_tests::diagnostics_keep_refusal_totals_across_warning_window_resets \
+            app::sessions::diagnostics_tests::diagnostics_preserve_cancel_after_a_permit_is_released \
+            app::udp_target_diagnostics::tests::udp_target_exact_gate_rejects_nearby_domain_and_mapped_v6 \
+            app::udp_target_diagnostics::tests::udp_target_fixed_ring_overflow_and_contention_drop \
+            app::udp_target_diagnostics::tests::udp_target_getter_restart_returns_only_current_owner \
+            app::udp_target_diagnostics::tests::udp_target_json_export_has_a_separate_bounded_budget \
+            app::udp_target_diagnostics::tests::udp_target_opaque_chain_privacy_and_bound \
+            app::udp_target_diagnostics::tests::udp_target_owner_epochs_and_context_are_isolated \
+            app::udp_target_diagnostics::tests::udp_target_policy_validation_and_debug_never_disclose_input \
+            app::udp_target_diagnostics::tests::udp_target_rejects_wrong_epoch_and_flow_events \
+            app::udp_target_diagnostics::tests::udp_target_uot_checks_every_packet_and_redacts_errors \
+            embed::instance::internal_diagnostics_tests::diagnostics_leave_absent_pool_metrics_unobserved \
+            embed::instance::internal_diagnostics_tests::diagnostics_read_the_running_dispatcher_limit_and_serialize_unknowns \
+            embed::instance::internal_diagnostics_tests::diagnostics_select_only_the_current_running_epoch \
+            embed::instance::internal_udp_policy_tests::diagnostics_none_policy_is_explicit_and_creates_no_trace \
+            embed::instance::internal_udp_policy_tests::diagnostics_policy_survives_builders_cow_reload_and_restart \
+            protocol::anytls::outbound::client::tests::udp_target_cold_and_reused_open_results_on_localhost \
+            protocol::anytls::outbound::client::tests::udp_target_layer_failure_has_its_own_cold_open_error \
+            session::udp_target_chain_tests::udp_target_chain_try_lock_and_three_member_bound
+          do
+            grep -F -- "test $diagnostic_case ..." "$RUNNER_TEMP/diagnostics-udp.log"
+            if grep -F -- "test $diagnostic_case ... ignored" "$RUNNER_TEMP/diagnostics-udp.log"; then
+              echo "::error::required diagnostic case was ignored"
+              exit 1
+            fi
+          done
+
       # muxcore's yamux against hashicorp/yamux, the reference
       # (scripts/yamux-peer): ignored in a plain run, and failing here
       # without YAMUX_PEER.
@@ -560,6 +610,15 @@ jobs:
 
       - name: sail's test binaries, this shard's tests
         run: python3 tools/ci/l2-shard.py ${{ matrix.shard }} 3
+
+      - name: internal diagnostics through the native memory bridge
+        if: ${{ !cancelled() && matrix.shard == 0 }}
+        run: |
+          set -euo pipefail
+          cargo test --locked -p sail --features internal-udp-target-diagnostics --test it \
+            test_dynamic_tun::diagnostics_observe_real_native_udp_and_current_admission_without_os_device \
+            -- --exact --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/diagnostics-native.log"
+          grep -F '1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/diagnostics-native.log"
 
       # Run whatever the tests before did, so that one failure hides no other.
       - name: sail-ffi
