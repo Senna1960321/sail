@@ -12,7 +12,8 @@ name: ci
 # - features: sail built and linted one feature set at a time, so that cfg
 #   gates and feature dependencies stay right. Clippy only: running each
 #   set's tests again would repeat L1 and L2, which run the full build's;
-# - L1 unit: the libraries' own tests and sail-netstack's model tests;
+# - L1 unit: the aggregate of the libraries/models and diagnostics jobs,
+#   each with its own 20-minute budget;
 # - L2 integration: sail's test binaries in three shards, split by a hash
 #   of each test's name (tools/ci/l2-shard.py), each shard with one more
 #   suite (sail-ffi's C ABI, sail-cli's lifecycle, a panic in a mobile
@@ -441,8 +442,8 @@ jobs:
   # nothing). sail is built with auto-reload on, as sail-ffi builds it.
   # A task spawned outside any instance's scope aborts the run (E2): one
   # on a task of its own would only panic where tokio catches it.
-  unit:
-    name: L1 unit
+  unit-core:
+    name: L1 core
     needs: receipts
     if: ${{ !cancelled() && needs.receipts.result != 'skipped' && needs.receipts.outputs.l1 != 'true' }}
     runs-on: ubuntu-latest
@@ -480,6 +481,67 @@ jobs:
       # are turned on here, and in L2, for its tests to run.
       - name: libraries
         run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/plugin,sail/muxcore,sail/inbound-sail,sail/outbound-sail --lib
+
+      # muxcore's yamux against hashicorp/yamux, the reference
+      # (scripts/yamux-peer): ignored in a plain run, and failing here
+      # without YAMUX_PEER.
+      - name: install go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+          cache: false
+
+      - name: yamux against hashicorp/yamux
+        run: |
+          (cd scripts/yamux-peer && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/yamux-peer" .)
+          YAMUX_PEER="$RUNNER_TEMP/yamux-peer" cargo test --locked -p sail -p sail-netstack \
+            --features sail/auto-reload,sail/plugin,sail/muxcore --lib yamux_interop -- --ignored
+
+      # The out-of-tree plugin interface's example: the Shadowsocks plugin.
+      - name: the Shadowsocks plugin
+        run: cargo test --locked -p shadowsocks --lib
+
+      - name: sail-netstack's models
+        run: cargo test --locked -p sail-netstack --test '*'
+
+      - name: doc tests
+        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/muxcore --doc
+
+      - name: BoringSSL linked
+        run: scripts/prebuilt-boringssl.sh --check "$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"
+
+  unit-diagnostics:
+    name: L1 diagnostics
+    needs: receipts
+    if: ${{ !cancelled() && needs.receipts.result != 'skipped' && needs.receipts.outputs.l1 != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Line numbers in a failing test's backtrace, without the full debug
+      # info, which only costs compile and link time and cache space here.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      SAIL_SCOPE_STRICT: "1"
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      # The fork's BoringSSL, as the header says.
+      - name: prebuilt BoringSSL
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/prebuilt-boringssl.sh "$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: internal admission diagnostics
         run: |
@@ -530,38 +592,42 @@ jobs:
             fi
           done
 
-      # muxcore's yamux against hashicorp/yamux, the reference
-      # (scripts/yamux-peer): ignored in a plain run, and failing here
-      # without YAMUX_PEER.
-      - name: install go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.0"
-          cache: false
-
-      - name: yamux against hashicorp/yamux
-        run: |
-          (cd scripts/yamux-peer && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/yamux-peer" .)
-          YAMUX_PEER="$RUNNER_TEMP/yamux-peer" cargo test --locked -p sail -p sail-netstack \
-            --features sail/auto-reload,sail/plugin,sail/muxcore --lib yamux_interop -- --ignored
-
-      # The out-of-tree plugin interface's example: the Shadowsocks plugin.
-      - name: the Shadowsocks plugin
-        run: cargo test --locked -p shadowsocks --lib
-
-      - name: sail-netstack's models
-        run: cargo test --locked -p sail-netstack --test '*'
-
-      - name: doc tests
-        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/muxcore --doc
-
       - name: BoringSSL linked
         run: scripts/prebuilt-boringssl.sh --check "$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"
 
+  # L1 passes only when both jobs did, or a receipt from this DAG exists.
+  unit:
+    name: L1 unit
+    if: ${{ always() && needs.receipts.result != 'skipped' }}
+    needs: [receipts, unit-core, unit-diagnostics]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: every L1 job
+        env:
+          RECEIPTS: ${{ needs.receipts.result }}
+          FINGERPRINT: ${{ needs.receipts.outputs.fingerprint }}
+          GREEN: ${{ needs.receipts.outputs.l1 }}
+          CORE: ${{ needs.unit-core.result }}
+          DIAGNOSTICS: ${{ needs.unit-diagnostics.result }}
+        run: |
+          test "$RECEIPTS" = success
+          [[ "$FINGERPRINT" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$GREEN" = true ]; then
+            test "$CORE" = skipped
+            test "$DIAGNOSTICS" = skipped
+            echo "passed before on this tree"
+          else
+            test "$CORE" = success
+            test "$DIAGNOSTICS" = success
+          fi
+
       - name: receipt
+        if: ${{ needs.receipts.outputs.l1 != 'true' }}
         run: echo "$GITHUB_SHA" >"$RUNNER_TEMP/receipt"
 
       - name: upload receipt
+        if: ${{ needs.receipts.outputs.l1 != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: green-l1-${{ needs.receipts.outputs.fingerprint }}
