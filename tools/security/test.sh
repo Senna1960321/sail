@@ -85,6 +85,18 @@ write_mock_cargo 'failed to download: Could not resolve host'
 expect_exit 3 env PATH="$mock_bin:/usr/bin:/bin" \
   SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit
 
+# Actual fixed-version scanner transport diagnostics must remain unavailable,
+# not be mistaken for source or dependency policy findings.
+cat >"$mock_bin/cargo" <<'MOCK'
+#!/usr/bin/env bash
+echo "error: couldn't fetch advisory database: git operation failed: failed to prepare fetch" >&2
+echo 'Caused by: error sending request for url (https://github.com/RustSec/advisory-db.git/git-upload-pack)' >&2
+exit 1
+MOCK
+chmod +x "$mock_bin/cargo"
+expect_exit 3 env PATH="$mock_bin:/usr/bin:/bin" \
+  SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit
+
 write_mock_cargo 'RUSTSEC-2026-0001: vulnerability found'
 expect_exit 1 env PATH="$mock_bin:/usr/bin:/bin" \
   SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit

@@ -41,7 +41,7 @@ classify_failure() {
     echo "security-check: ERROR: $scanner was blocked by filesystem permissions" >&2
     return "$EXIT_ERROR"
   fi
-  if grep -Eiq 'could not resolve|failed to (fetch|download)|network failure|timed? out|unable to access|could not connect|connection refused' "$log"; then
+  if grep -Eiq 'could not resolve|failed to (fetch|download)|network failure|timed? out|unable to access|could not connect|connection refused|couldn.t fetch advisory database|error sending request|allotted timeframe' "$log"; then
     echo "security-check: UNAVAILABLE: $scanner could not reach a required service" >&2
     return "$EXIT_UNAVAILABLE"
   fi
