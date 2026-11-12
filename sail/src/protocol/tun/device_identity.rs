@@ -62,7 +62,7 @@ fn decode_name(bytes: &[libc::c_char]) -> std::io::Result<String> {
     })?;
     let bytes = bytes[..length]
         .iter()
-        .map(|byte| *byte as u8)
+        .map(|byte| byte.to_ne_bytes()[0])
         .collect::<Vec<_>>();
     String::from_utf8(bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
@@ -120,6 +120,25 @@ fn kernel_name(_: RawFd) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn kernel_name_decoding_preserves_bytes_on_signed_and_unsigned_char_targets() {
+        let chars = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| libc::c_char::from_ne_bytes([*byte]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(decode_name(&chars(b"tunA\0ignored")).unwrap(), "tunA");
+        assert_eq!(
+            decode_name(&chars(&[0xff, 0])).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            decode_name(&chars(b"tunA")).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
     #[test]
     fn verified_identity_requires_a_nonempty_exact_kernel_name() {
         assert!(checked_name("", String::new()).is_err());
