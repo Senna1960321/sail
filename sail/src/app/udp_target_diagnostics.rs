@@ -61,14 +61,18 @@ numeric_enum!(ErrorCode { NotFound=1, PermissionDenied=2, ConnectionRefused=3,
     AddrNotAvailable=8, BrokenPipe=9, WouldBlock=10, InvalidInput=11,
     InvalidData=12, TimedOut=13, WriteZero=14, Interrupted=15,
     UnexpectedEof=16, OutOfMemory=17, Other=18, Unclassified=255 });
+#[cfg(any(feature = "inbound-tun", test))]
 pub(crate) const NATIVE: Stage = Stage::Native;
 pub(crate) const NAT_ENTRY: Stage = Stage::NatEntry;
 pub(crate) const NAT_QUEUE: Stage = Stage::NatQueue;
 pub(crate) const DISPATCH: Stage = Stage::Dispatch;
 pub(crate) const ROUTE: Stage = Stage::Route;
 pub(crate) const CHAIN: Stage = Stage::Chain;
+#[cfg(feature = "outbound-anytls")]
 pub(crate) const ANYTLS: Stage = Stage::AnyTls;
+#[cfg(feature = "outbound-anytls")]
 pub(crate) const OPEN: Stage = Stage::Open;
+#[cfg(feature = "outbound-anytls")]
 pub(crate) const REQUEST: Stage = Stage::Request;
 pub(crate) const WRITE: Stage = Stage::Write;
 
@@ -280,6 +284,7 @@ impl Trace {
         }
         self.emit(event);
     }
+    #[cfg(feature = "outbound-anytls")]
     pub(crate) fn address(&self, stage: Stage, addr: &SocksAddr) {
         let mut event = self.event(stage);
         event.address_kind = address_kind(addr);

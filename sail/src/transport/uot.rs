@@ -293,7 +293,10 @@ pub struct OutboundDatagram<S> {
 }
 
 impl<S> OutboundDatagram<S> {
-    #[cfg(feature = "internal-udp-target-diagnostics")]
+    #[cfg(all(
+        feature = "internal-udp-target-diagnostics",
+        any(feature = "outbound-anytls", test)
+    ))]
     pub(crate) fn with_diagnostic_trace(
         mut self,
         trace: Option<crate::app::udp_target_diagnostics::Trace>,
