@@ -4,6 +4,8 @@ pub(crate) mod auto_redirect;
 pub(crate) mod auto_route;
 #[cfg(unix)]
 pub(crate) mod device_identity;
+#[cfg(unix)]
+pub(crate) mod device_registration;
 pub mod inbound;
 mod packet_io;
 #[cfg(all(target_os = "linux", feature = "fuzzing"))]

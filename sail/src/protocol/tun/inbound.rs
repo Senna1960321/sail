@@ -87,6 +87,8 @@ pub(crate) struct TunRunner {
     pub control: NativeRuntimeControl,
     #[cfg(unix)]
     pub verified_name: Option<super::device_identity::VerifiedDeviceName>,
+    #[cfg(unix)]
+    pub registration: Option<std::sync::Weak<super::device_registration::Registration>>,
 }
 
 const fn budget_profile(budget: NetstackBudget) -> BudgetProfile {
@@ -365,6 +367,8 @@ pub(crate) fn run<I: sail_netstack::PacketIo + 'static>(
         control: runtime_control,
         #[cfg(unix)]
         verified_name: None,
+        #[cfg(unix)]
+        registration: None,
     })
 }
 
@@ -1618,16 +1622,18 @@ fn open_device(
                 })?;
                 TunPacketIo::new(device, mtu, netstack.batch_size).map_err(Into::into)
             })?;
+            let (queues, registration) = super::device_registration::track(vec![io]);
             let mut opened = run(
                 inbound,
                 dispatcher.clone(),
                 nat_manager,
-                vec![io],
+                queues,
                 mtu,
                 netstack,
                 settings.endpoint_independent_nat,
             )?;
             opened.verified_name = Some(verified);
+            opened.registration = Some(registration);
             return Ok(opened);
         } else {
             cfg.raw_fd(fd);
@@ -1639,7 +1645,22 @@ fn open_device(
             if !context.publish_name {
                 context.teardown.push_check(device_gone(&settings.name));
             }
-            let mut opened = run(
+            if let Some(name) = name {
+                let (queues, registration) = super::device_registration::track(queues);
+                let mut opened = run(
+                    inbound,
+                    dispatcher.clone(),
+                    nat_manager,
+                    queues,
+                    mtu,
+                    netstack,
+                    settings.endpoint_independent_nat,
+                )?;
+                opened.verified_name = Some(name);
+                opened.registration = Some(registration);
+                return Ok(opened);
+            }
+            return run(
                 inbound,
                 dispatcher.clone(),
                 nat_manager,
@@ -1647,9 +1668,7 @@ fn open_device(
                 mtu,
                 netstack,
                 settings.endpoint_independent_nat,
-            )?;
-            opened.verified_name = name;
-            return Ok(opened);
+            );
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1726,7 +1745,22 @@ fn open_device(
         )?;
     }
     let io = TunPacketIo::new(tun, mtu, netstack.batch_size)?;
-    let mut opened = run(
+    if let Some(name) = verified_name {
+        let (queues, registration) = super::device_registration::track(vec![io]);
+        let mut opened = run(
+            inbound,
+            dispatcher.clone(),
+            nat_manager,
+            queues,
+            mtu,
+            netstack,
+            settings.endpoint_independent_nat,
+        )?;
+        opened.verified_name = Some(name);
+        opened.registration = Some(registration);
+        return Ok(opened);
+    }
+    run(
         inbound,
         dispatcher.clone(),
         nat_manager,
@@ -1734,9 +1768,7 @@ fn open_device(
         mtu,
         netstack,
         settings.endpoint_independent_nat,
-    )?;
-    opened.verified_name = verified_name;
-    Ok(opened)
+    )
 }
 
 /// The check that the TUN `name` went with its runner. The kernel

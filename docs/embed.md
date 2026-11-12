@@ -940,6 +940,14 @@ that owner, after all borrowed I/O handles. Packet bridges carry no OS device id
 positive and FD lifecycle platform checks require an isolated capable host;
 UnixDatagram and memory-stack witnesses do not establish that acceptance.
 
+Only successful publication of the current run and token registers a
+kernel-verified device as an owned interface. Preparation, failed or late
+opens and packet bridges do not register one. The registration belongs to
+the actual queue I/O: with multiple queues it lasts until the final queue's
+I/O and descriptor drop. A retained manager, control handle or packet-flow
+endpoint does not extend it. A missing queue owner refuses publication;
+registering or releasing ownership does not reset existing connections.
+
 Dropping an unused `PreparedTun` releases only its own reservation. A
 stopped/restarted run and later generations reject stale handles. Once a
 commit future has been polled, cancelling its host await does not imply

@@ -422,7 +422,12 @@ impl RuntimeManager {
                     .as_ref()
                     .is_some_and(|e| e.id == id && e.phase == Phase::Committing)
             {
-                Some(opened)
+                Some((
+                    opened,
+                    Error::new(ErrorKind::Cancelled, "stale TUN open result"),
+                ))
+            } else if let Err(error) = self.publish_device_registration(&opened.runner) {
+                Some((opened, error))
             } else {
                 let Opened { runner, _held } = opened;
                 let entry = state.entry.as_mut().expect("current entry checked");
@@ -441,16 +446,35 @@ impl RuntimeManager {
             }
         };
         drop(update);
-        if let Some(opened) = rejected {
+        if let Some((opened, error)) = rejected {
             drop(opened);
-            return self
-                .rollback_capture(
-                    &generation,
-                    Error::new(ErrorKind::Cancelled, "stale TUN open result"),
-                )
-                .await;
+            return self.rollback_capture(&generation, error).await;
         }
         Ok(())
+    }
+
+    /// The caller holds the publication fence. This never touches slot state
+    /// or awaits; network registration belongs only to the actual queue I/O.
+    fn publish_device_registration(&self, runner: &TunRunner) -> Result<(), Error> {
+        #[cfg(unix)]
+        match (&runner.verified_name, &runner.registration) {
+            (None, None) => Ok(()), // Public packet bridge, no OS device.
+            (Some(name), Some(registration)) => {
+                crate::protocol::tun::device_registration::publish(registration, || {
+                    self.env.network.own_interface(name.as_str())
+                })
+                .map_err(|error| Error::new(ErrorKind::Failed, error.to_string()))
+            }
+            _ => Err(Error::new(
+                ErrorKind::Failed,
+                "dynamic device identity and I/O ownership must both be verified",
+            )),
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = runner;
+            Ok(())
+        }
     }
 
     async fn rollback_capture(&self, generation: &Generation, error: Error) -> Result<(), Error> {
@@ -583,6 +607,158 @@ mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    #[cfg(feature = "outbound-direct")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_packet_capture_never_registers_an_os_interface() {
+        use crate::embed::{Config, Instance, Options, Runtime};
+        let i = Instance::new(
+            Options::new()
+                .dynamic_tun(true)
+                .runtime(Runtime::Host(tokio::runtime::Handle::current())),
+        )
+        .unwrap();
+        i.start(Config::Json(
+            r#"{"outbounds":[{"type":"direct","tag":"direct"}]}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let retained = i.manager().unwrap();
+        let (prepared, retained_flow) = i
+            .prepare_tun_packets(
+                r#"{"type":"tun","tag":"capture","address":["10.19.0.1/24"]}"#,
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(retained.env.network.egress_view().own.is_empty());
+        prepared.commit().await.unwrap();
+        assert!(retained.env.network.egress_view().own.is_empty());
+        assert!(i.detach_tun().await.unwrap().clean());
+        assert!(retained.env.network.egress_view().own.is_empty());
+        i.stop().await.unwrap();
+        drop(retained_flow);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "outbound-direct"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires isolated network namespace, CAP_NET_ADMIN and /dev/net/tun"]
+    async fn a_real_device_lease_follows_its_io_with_retained_manager_and_control() {
+        use crate::embed::{Config, Instance, Options, Platform, Runtime};
+        use std::sync::atomic::{AtomicI32, Ordering};
+        struct Host {
+            original: OwnedFd,
+            name: String,
+            last: AtomicI32,
+        }
+        impl Platform for Host {
+            fn log(&self, _: &str) {}
+            fn opens_tun(&self) -> bool {
+                true
+            }
+            fn open_tun(&self, request: &crate::embed::TunRequest) -> std::io::Result<i32> {
+                if request.name != self.name {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+                let raw =
+                    unsafe { libc::fcntl(self.original.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10000) };
+                if raw < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                self.last.store(raw, Ordering::SeqCst);
+                Ok(raw)
+            }
+        }
+        let name = format!("slr{}", std::process::id());
+        let original = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .unwrap();
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (to, from) in request.ifr_name.iter_mut().zip(name.bytes()) {
+            *to = from as libc::c_char;
+        }
+        request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+        assert_eq!(
+            unsafe { libc::ioctl(original.as_raw_fd(), libc::TUNSETIFF, &request) },
+            0
+        );
+        let host = Arc::new(Host {
+            original: original.into(),
+            name: name.clone(),
+            last: AtomicI32::new(-1),
+        });
+        let i = Instance::new(
+            Options::new()
+                .dynamic_tun(true)
+                .platform(host.clone())
+                .runtime(Runtime::Host(tokio::runtime::Handle::current())),
+        )
+        .unwrap();
+        i.start(Config::Json(
+            r#"{"outbounds":[{"type":"direct","tag":"direct"}]}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let retained = i.manager().unwrap();
+        let json = serde_json::json!({"type":"tun","tag":"capture","interface_name":name,
+            "address":["10.66.0.1/24"],"mtu":1500})
+        .to_string();
+        let prepared = i.prepare_tun_device(&json).await.unwrap();
+        assert_eq!(host.last.load(Ordering::SeqCst), -1);
+        assert!(retained.env.network.egress_view().own.is_empty());
+        prepared.commit().await.unwrap();
+        let retained_control = retained.current_tun_control().unwrap();
+        assert_eq!(retained.env.network.egress_view().own, [name.as_str()]);
+        assert!(i.detach_tun().await.unwrap().clean());
+        let transferred = host.last.load(Ordering::SeqCst);
+        assert_eq!(unsafe { libc::fcntl(transferred, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(unsafe { libc::fcntl(host.original.as_raw_fd(), libc::F_GETFD) } >= 0);
+        assert!(
+            retained.env.network.egress_view().own.is_empty(),
+            "manager/control retention must not retain the device registration"
+        );
+
+        // A real verified device whose I/O has gone cannot be published from
+        // its remaining metadata. No synthetic name or registration fallback.
+        let inbound = crate::config::from_string(&format!("{{\"inbounds\":[{json}]}}"))
+            .unwrap()
+            .inbounds
+            .remove(0);
+        let owner = retained.env.scope.isolated();
+        let dispatcher = retained.dispatcher.upgrade().unwrap();
+        let nat = Arc::new(crate::app::nat_manager::NatManager::new_scoped(
+            dispatcher.clone(),
+            std::slice::from_ref(&inbound),
+            owner,
+        ));
+        let mut lost = crate::protocol::tun::inbound::new_dynamic(
+            inbound,
+            dispatcher,
+            nat,
+            Teardown::default(),
+        )
+        .unwrap();
+        let actual_io = std::mem::replace(&mut lost.runner, Box::pin(std::future::pending()));
+        drop(actual_io);
+        assert!(retained.publish_device_registration(&lost).is_err());
+        assert!(retained.env.network.egress_view().own.is_empty());
+        assert!(matches!(i.tun_state().unwrap(), TunState::Detached));
+        drop(lost);
+        i.stop().await.unwrap();
+        assert!(retained.env.network.egress_view().own.is_empty());
+        drop(retained_control);
+        drop(retained);
+        drop(i);
+        drop(host);
+        let name = std::ffi::CString::new(name).unwrap();
+        assert_eq!(unsafe { libc::if_nametoindex(name.as_ptr()) }, 0);
+    }
+
     #[test]
     fn device_identity_errors_keep_their_public_error_category() {
         use crate::protocol::tun::device_identity::DeviceIdentityError;
@@ -713,6 +889,7 @@ mod tests {
             .unwrap();
         let runner = TunRunner {
             verified_name: None,
+            registration: None,
             runner: Box::pin(async move {
                 let _owned = (runtime, owned);
                 std::future::pending::<()>().await;
