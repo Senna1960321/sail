@@ -179,6 +179,7 @@ impl Out {
 
 struct State {
     streams: HashMap<u32, Slot>,
+    ever_opened: bool,
     /// Control frames, written first.
     control: Out,
     /// What the streams send: opening, data, finishing and resetting, in
@@ -334,7 +335,8 @@ impl Shared {
                     return self.control(state, self.codec.refuse(id));
                 }
                 state.streams.insert(id, Slot::new(self.flow));
-                self.counters.stream_opened();
+                self.counters.stream_opened(state.ever_opened);
+                state.ever_opened = true;
                 if let Some(frame) = self.codec.ack(id) {
                     self.control(state, frame)?;
                 }
@@ -614,19 +616,38 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
+        let counters = stats::counters(codec.name());
+        Self::start_counted(conn, codec, server, tuning, label, counters)
+    }
+
+    fn start_counted<S>(
+        conn: S,
+        codec: Arc<dyn Codec>,
+        server: bool,
+        tuning: Tuning,
+        label: impl Into<Arc<str>>,
+        counters: Arc<Counters>,
+    ) -> (
+        Self,
+        Option<mpsc::UnboundedReceiver<Stream>>,
+        impl std::future::Future<Output = ()> + Send + 'static,
+    )
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
         let (accept_tx, accept_rx) = if server {
             let (tx, rx) = mpsc::unbounded_channel();
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
-        let counters = stats::counters(codec.name());
         counters.session_opened();
         let shared = Arc::new(Shared {
             flow: codec.flow(),
             closing: codec.closing(),
             state: Mutex::new(State {
                 streams: HashMap::new(),
+                ever_opened: false,
                 control: Out::default(),
                 data: Out::default(),
                 error: None,
@@ -750,7 +771,8 @@ impl Session {
             state.unacked += 1;
         }
         state.streams.insert(id, slot);
-        self.shared.counters.stream_opened();
+        self.shared.counters.stream_opened(state.ever_opened);
+        state.ever_opened = true;
         state.data.push(self.shared.codec.open(id, first));
         drop(state);
         self.shared.wake_writer();
@@ -1319,5 +1341,60 @@ impl Drop for Stream {
         if last {
             shared.fail("retired, and its last stream is done".to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+    use crate::transport::muxcore::yamux::Yamux;
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn reuse_after_idle_counts_a_stream_without_creating_a_carrier() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (left, right) = tokio::io::duplex(65536);
+                let client_counters = Arc::new(Counters::default());
+                let server_counters = Arc::new(Counters::default());
+                let (client, _, client_driver) = Session::start_counted(
+                    left,
+                    Arc::new(Yamux),
+                    false,
+                    Tuning::default(),
+                    "metrics",
+                    client_counters.clone(),
+                );
+                let (server, incoming, server_driver) = Session::start_counted(
+                    right,
+                    Arc::new(Yamux),
+                    true,
+                    Tuning::default(),
+                    "metrics",
+                    server_counters.clone(),
+                );
+                let client_driver = tokio::spawn(client_driver);
+                let server_driver = tokio::spawn(server_driver);
+                let mut incoming = incoming.unwrap();
+                for _ in 0..2 {
+                    let ours = client.open().await.unwrap();
+                    let theirs = incoming.recv().await.unwrap();
+                    drop((ours, theirs));
+                }
+                for counters in [client_counters, server_counters] {
+                    let sample = counters.snapshot();
+                    assert_eq!(sample.sessions_created, 1);
+                    assert_eq!(sample.streams_opened, 2);
+                    assert_eq!(sample.streams_reused, 1);
+                    assert_eq!(sample.streams, 0);
+                }
+                client.close();
+                server.close();
+                client_driver.abort();
+                server_driver.abort();
+            });
     }
 }

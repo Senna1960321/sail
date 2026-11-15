@@ -132,6 +132,8 @@ impl Codec for AnyTls {
         Box::new(AnyTlsDecoder {
             proto: self.0.clone(),
             settings_received: false,
+            padding_left: 0,
+            counters: crate::transport::muxcore::stats::counters("anytls"),
             framing: Framing::default(),
             events: VecDeque::new(),
         })
@@ -152,6 +154,8 @@ impl Codec for AnyTls {
 struct AnyTlsDecoder {
     proto: Arc<Proto>,
     settings_received: bool,
+    padding_left: usize,
+    counters: Arc<crate::transport::muxcore::stats::Counters>,
     framing: Framing,
     /// Events a frame gave beyond the first.
     events: VecDeque<Event>,
@@ -225,6 +229,15 @@ impl AnyTlsDecoder {
 impl Decoder for AnyTlsDecoder {
     fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Event>> {
         loop {
+            if self.padding_left > 0 {
+                let consumed = buf.len().min(self.padding_left);
+                self.counters.padding_received(consumed);
+                buf.advance(consumed);
+                self.padding_left -= consumed;
+                if self.padding_left > 0 {
+                    return Ok(None);
+                }
+            }
             if let Some(event) = self.events.pop_front() {
                 return Ok(Some(event));
             }
@@ -256,7 +269,8 @@ impl Decoder for AnyTlsDecoder {
                 }
                 CMD_WASTE => {
                     buf.advance(HEADER_LEN);
-                    self.framing.skip(len);
+                    self.counters.padding_received(HEADER_LEN);
+                    self.padding_left = len;
                 }
                 CMD_SYN => {
                     buf.advance(HEADER_LEN);
@@ -600,10 +614,24 @@ pub const AUTH_HASH_LEN: usize = 32;
 /// Reads the rest of the authentication a client starts with, after the
 /// password's SHA-256: the padding's length, and the padding.
 pub async fn read_auth_padding<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<()> {
+    read_auth_padding_metered(r, &crate::transport::muxcore::stats::counters("anytls")).await
+}
+
+async fn read_auth_padding_metered<R: AsyncRead + Unpin>(
+    r: &mut R,
+    counters: &crate::transport::muxcore::stats::Counters,
+) -> io::Result<()> {
     let len = r.read_u16().await? as u64;
-    let skipped = tokio::io::copy(&mut r.take(len), &mut tokio::io::sink()).await?;
-    if skipped != len {
-        return Err(io::ErrorKind::UnexpectedEof.into());
+    let mut left = len as usize;
+    let mut buffer = [0u8; 4096];
+    while left > 0 {
+        let want = left.min(buffer.len());
+        let read = r.read(&mut buffer[..want]).await?;
+        if read == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        counters.padding_received(read);
+        left -= read;
     }
     Ok(())
 }
@@ -712,6 +740,62 @@ mod tests {
             settings: Mutex::new(None),
         }))
         .decoder(server)
+    }
+
+    #[test]
+    fn padding_counts_only_consumed_bytes_across_fragmented_frames() {
+        let counters = Arc::new(crate::transport::muxcore::stats::Counters::default());
+        let proto = Arc::new(Proto {
+            role: Role::Server {
+                padding: Arc::new(PaddingScheme::default_scheme()),
+            },
+            peer_version: AtomicU8::new(0),
+            synack_generation: AtomicU64::new(0),
+            synack_missed: AtomicU32::new(0),
+            settings: Mutex::new(None),
+        });
+        let mut decoder = AnyTlsDecoder {
+            proto,
+            counters: counters.clone(),
+            settings_received: true,
+            padding_left: 0,
+            framing: Framing::default(),
+            events: VecDeque::new(),
+        };
+        let wire = frame::waste(10);
+        let mut buf = BytesMut::from(&wire[..HEADER_LEN + 3]);
+        assert!(decoder.decode(&mut buf).unwrap().is_none());
+        assert_eq!(
+            counters.snapshot().padding_received_bytes,
+            (HEADER_LEN + 3) as u64
+        );
+        // A repeated poll with no new input must not count the advertised
+        // body again, and the ordinary payload after it is not padding.
+        assert!(decoder.decode(&mut buf).unwrap().is_none());
+        assert_eq!(
+            counters.snapshot().padding_received_bytes,
+            (HEADER_LEN + 3) as u64
+        );
+        buf.extend_from_slice(&wire[HEADER_LEN + 3..]);
+        buf.extend_from_slice(&frame::encode(CMD_PSH, 1, b"payload"));
+        assert!(decoder.decode(&mut buf).unwrap().is_some());
+        assert_eq!(
+            counters.snapshot().padding_received_bytes,
+            (HEADER_LEN + 10) as u64
+        );
+    }
+
+    #[test]
+    fn truncated_auth_padding_counts_received_body_without_length_field() {
+        runtime().block_on(async {
+            let counters = crate::transport::muxcore::stats::Counters::default();
+            let mut wire = &[0u8, 5, 0, 0][..];
+            let error = read_auth_padding_metered(&mut wire, &counters)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(counters.snapshot().padding_received_bytes, 2);
+        });
     }
 
     /// What a decoder makes of `wire`, up to its first error.

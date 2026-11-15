@@ -991,6 +991,22 @@ stream.write_all(&request).await?;
   no more streams; a stream's reads and writes fail once it is reset or
   its session ends. Neither retries: the host makes a new session.
 
+
+`sail::muxcore::stats()` returns process-wide, per-protocol monitoring
+snapshots, including AnyTLS. `sessions_created` and `streams_opened` are
+lifetime counters; `streams_reused` counts every stream after the first on
+a carrier, even if it became idle between streams. Closing a stream or
+carrier changes the live gauges but never subtracts from these counters.
+The host must attach its own process identity before combining samples
+across restarts. These snapshots do not participate in admission or billing.
+
+`padding_received_bytes` counts authentication padding actually read and
+AnyTLS waste frames, including their headers. It excludes application data,
+ordinary protocol framing and TLS overhead. A partial waste body counts only
+the bytes consumed so far, rather than its advertised length. This is a
+receive-side measurement; it does not infer a remote client's reconnect
+reason or treat all of a TLS record as padding.
+
 ## Host kinds
 
 A host registers inbound and outbound kinds of its own on `Options`, each
