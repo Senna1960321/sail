@@ -180,6 +180,10 @@ impl Session {
     }
 }
 
+/// Process-wide multiplex transport counters, including AnyTLS. These are
+/// monitoring snapshots; they never participate in routing or admission.
+pub use crate::transport::muxcore::stats::{snapshot as stats, Snapshot as Stats};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,7 +215,3 @@ mod tests {
         assert_eq!(config.tuning.stall_timeout, Duration::from_secs(1));
     }
 }
-
-/// Process-wide multiplex transport counters, including AnyTLS. These are
-/// monitoring snapshots; they never participate in routing or admission.
-pub use crate::transport::muxcore::stats::{snapshot as stats, Snapshot as Stats};

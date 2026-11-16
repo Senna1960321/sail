@@ -52,6 +52,7 @@ impl Counters {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(any(feature = "inbound-anytls", feature = "outbound-anytls", test))]
     pub(crate) fn padding_received(&self, bytes: usize) {
         self.padding_received
             .fetch_add(bytes as u64, Ordering::Relaxed);
