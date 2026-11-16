@@ -1344,7 +1344,7 @@ impl Drop for Stream {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "mux", feature = "muxcore")))]
 mod counter_tests {
     use super::*;
     use crate::transport::muxcore::yamux::Yamux;
