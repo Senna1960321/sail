@@ -737,6 +737,10 @@ impl NatManager {
 
                 let (mut target_sock_recv, mut target_sock_send) = socket.split();
 
+                let sessions_uplink = sessions.clone();
+                let key_uplink = key.clone();
+                let generation_uplink = generation.clone();
+
                 // downlink
                 let raddr_downlink = raddr_cloned.clone();
                 let key_downlink = key.clone();
@@ -864,7 +868,17 @@ impl NatManager {
                                     "Failed to send uplink packets on session {} to {}: {:?}",
                                     &raddr_uplink, &pkt.dst_addr, e
                                 );
-                                break;
+                                // This sender is terminal. Remove only its own NAT
+                                // generation, waking the downlink abort task and
+                                // dropping both Held halves rather than waiting
+                                // for idle cleanup. Do not await close on a failed
+                                // sender: that could retain its session place.
+                                remove_current(
+                                    &mut *sessions_uplink.lock().await,
+                                    &key_uplink,
+                                    &generation_uplink,
+                                );
+                                return;
                             }
                         }
                         if let Err(e) = target_sock_send.close().await {

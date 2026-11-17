@@ -1500,3 +1500,14 @@ mod parent_tests {
         }
     }
 }
+
+// Exercises the real NAT dispatcher and Held ownership through a registered
+// host outbound. No production admission or transport hook is added.
+#[cfg(all(
+    test,
+    feature = "outbound-direct",
+    feature = "outbound-socks",
+    feature = "inbound-tun"
+))]
+#[path = "nat_uplink_terminal_tests.rs"]
+mod nat_uplink_terminal_tests;
