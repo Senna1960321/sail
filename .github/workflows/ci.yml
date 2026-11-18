@@ -393,6 +393,9 @@ jobs:
             outbound-hysteria2 \
             outbound-vless,outbound-grpc \
             inbound-tuic,outbound-tuic \
+            inbound-sail \
+            outbound-sail \
+            inbound-sail,outbound-sail \
             inbound-mptp,outbound-direct \
             outbound-mptp,inbound-socks \
             inbound-tun,outbound-direct \
@@ -468,8 +471,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
+      # Sail/1 (sail#60) is experimental and off by default: its features
+      # are turned on here, and in L2, for its tests to run.
       - name: libraries
-        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/plugin,sail/muxcore --lib
+        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/plugin,sail/muxcore,sail/inbound-sail,sail/outbound-sail --lib
 
       # muxcore's yamux against hashicorp/yamux, the reference
       # (scripts/yamux-peer): ignored in a plain run, and failing here

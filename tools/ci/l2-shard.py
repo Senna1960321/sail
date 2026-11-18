@@ -5,9 +5,9 @@ docs/testing.md).
     python3 tools/ci/l2-shard.py INDEX COUNT
 
 Builds every test binary under sail/tests (`cargo test -p sail --features
-auto-reload --test '*' --no-run`), lists each one's tests, and runs those
-whose `<binary>::<test>` name hashes (CRC-32) to INDEX modulo COUNT, by
-exact name. The split depends on the names alone: the same tree gives the
+auto-reload,inbound-sail,outbound-sail --test '*' --no-run`), lists each
+one's tests, and runs those whose `<binary>::<test>` name hashes
+(CRC-32) to INDEX modulo COUNT, by exact name. The split depends on the names alone: the same tree gives the
 same shards on every run and every machine, and a new test lands in one
 shard without moving the others. `0 1` runs all of them.
 
@@ -25,8 +25,17 @@ import subprocess
 import sys
 import zlib
 
-# What sail-ffi turns on, as the tests have always run with it.
-CARGO_TEST = ["cargo", "test", "--locked", "-p", "sail", "--features", "auto-reload"]
+# What sail-ffi turns on, as the tests have always run with it; and Sail/1
+# (sail#60), experimental and off by default, for its tests to run.
+CARGO_TEST = [
+    "cargo",
+    "test",
+    "--locked",
+    "-p",
+    "sail",
+    "--features",
+    "auto-reload,inbound-sail,outbound-sail",
+]
 BUILD = CARGO_TEST + ["--test", "*", "--no-run", "--message-format=json-render-diagnostics"]
 
 

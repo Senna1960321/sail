@@ -60,10 +60,16 @@ pub(crate) fn register(registry: &mut InboundRegistry) {
     registry.register("sail", InboundFactory::standalone(build));
 }
 
+/// Sail/1, sail's own protocol: experimental (sail#60), its wire format
+/// not yet stable. Built only with the `inbound-sail` feature, which no
+/// default build turns on.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Options {
-    users: Vec<User>,
+struct SailInboundOptions {
+    /// Who may connect, by token. Sail/1 is experimental (sail#60): its
+    /// wire format is not yet stable, and it is built only with the
+    /// `inbound-sail` feature, which no default build turns on.
+    users: Vec<SailUser>,
     /// The padding scheme, as lines, AnyTLS's syntax. Unset, the default.
     #[serde(default)]
     padding_scheme: Option<Listable>,
@@ -75,9 +81,12 @@ struct Options {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct User {
+struct SailUser {
+    /// Who the user is to routing (`auth_user`), statistics and logs.
     #[serde(default)]
     name: Option<String>,
+    /// 32 random bytes as unpadded base64url (43 characters), each user's
+    /// own.
     token: Secret<String>,
 }
 
@@ -88,7 +97,7 @@ fn build(ctx: &InboundContext<'_>) -> Result<AnyInboundHandler> {
     if !blocks.tls.as_ref().is_some_and(|t| t.enabled) {
         return Err(anyhow!("[{}] inbound: tls: sail needs it enabled", tag));
     }
-    let options: Options = parse_options("inbound", tag, &protocol)?;
+    let options: SailInboundOptions = parse_options("inbound", tag, &protocol)?;
     if options.users.len() > MAX_USERS {
         return Err(anyhow!("[{}] inbound: users: at most {}", tag, MAX_USERS));
     }

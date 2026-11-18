@@ -36,7 +36,9 @@ cargo test -p sail -p sail-netstack --features sail/auto-reload --doc
 ```
 
 `auto-reload` is on as sail-ffi builds sail, so that the tests run the
-code the mobile and desktop libraries ship.
+code the mobile and desktop libraries ship. CI turns on `inbound-sail`
+and `outbound-sail` too, in L1 and L2: Sail/1 (sail#60) is experimental
+and in no default build, and its tests run only with them.
 
 ## L2: integration
 

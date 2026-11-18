@@ -33,7 +33,7 @@ Rust 定义：[`MultiplexBrutal`](https://github.com/peakpassvpn/sail/blob/maste
 
 ## `client_subnet`
 
-所在位置：`dns.servers[h3, https, quic, tcp, tls, udp].client_subnet`, `outbounds[redirect].domain_resolver.client_subnet`
+所在位置：`dns.servers[h3, https, quic, tcp, tls, udp].client_subnet`, `outbounds[redirect, sail].domain_resolver.client_subnet`
 
 Rust 定义：[`Prefix`](https://github.com/peakpassvpn/sail/blob/master/sail/src/config/model.rs) · **sail 扩展**
 
@@ -73,6 +73,24 @@ Rust 定义：[`Prefix`](https://github.com/peakpassvpn/sail/blob/master/sail/sr
 | `disable_optimistic_cache` | bool | — | 支持 | — |
 | `rewrite_ttl` | number | — | 支持 | — |
 | `client_subnet` | string | — | 支持 | — |
+
+<a id="domain-resolver-outbounds"></a>
+
+## `domain_resolver` — outbounds
+
+所在位置：`outbounds[redirect, sail].domain_resolver`
+
+Rust 定义：[`DomainResolver`](https://github.com/peakpassvpn/sail/blob/master/sail/src/config/model.rs) · **sail 扩展**
+
+| 字段 | 类型 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `server` | string | 必填 | sail 扩展 | — |
+| `strategy` | string, 取值 `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | 未设置 | sail 扩展 | — |
+| `timeout` | duration | 未设置 | sail 扩展 | — |
+| `disable_cache` | bool | `false` | sail 扩展 | — |
+| `disable_optimistic_cache` | bool | `false` | sail 扩展 | — |
+| `rewrite_ttl` | number | 未设置 | sail 扩展 | — |
+| `client_subnet` | 对象 → [对象](#client-subnet) | 未设置 | sail 扩展 | — |
 
 <a id="domain-resolver-default-domain-resolver"></a>
 
@@ -181,7 +199,7 @@ Rust 定义：[`OutboundEch`](https://github.com/peakpassvpn/sail/blob/master/sa
 
 ## `fallback / fallback_for_alpn`
 
-所在位置：`inbounds[anytls, vless].fallback`, `inbounds[anytls, vless].fallback_for_alpn`
+所在位置：`inbounds[anytls, sail, vless].fallback`, `inbounds[anytls, sail, vless].fallback_for_alpn`
 
 Rust 定义：[`FallbackServer`](https://github.com/peakpassvpn/sail/blob/master/sail/src/protocol/fallback.rs) · 构建条件：`any (feature = "inbound-anytls" , feature = "inbound-trojan" , feature = "inbound-vless" , feature = "inbound-shadowtls")` · **sail 扩展**
 

@@ -502,6 +502,39 @@ Rust 定义：[`RedirectInboundOptions`](https://github.com/peakpassvpn/sail/blo
 | `udp_timeout` | number\|duration | 未设置 | 支持 | How long a UDP session through this inbound lives without traffic; 5m when unset, as in sing-box. A number is of seconds. |
 | `detour` | string | — | 报错：Handing an inbound's connections to another inbound | — |
 
+<a id="inbounds-sail"></a>
+
+## `inbounds[sail]`
+
+Rust 定义：[`SailInboundOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/src/protocol/sail/inbound.rs) · 构建条件：`feature = "inbound-sail"` · **sail 扩展**
+
+| 字段 | 类型 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `tag` | string | `""` | sail 扩展 | Defaults to the type. |
+| `listen` | string | 未设置 | sail 扩展 | The address to listen on; defaults to `127.0.0.1`. |
+| `listen_port` | number | 未设置 | sail 扩展 | The port to listen on. An inbound without one does not listen, and is only useful as a part of another inbound. |
+| `udp_timeout` | 时长，或秒数 | 未设置 | sail 扩展 | How long a UDP session through this inbound lives without traffic; 5m when unset, as in sing-box. A number is of seconds. |
+| `tcp_keep_alive` | duration | 未设置 | sail 扩展 | How long an accepted TCP connection is idle before keepalive probes it; 5m when unset. |
+| `tcp_keep_alive_interval` | duration | 未设置 | sail 扩展 | Between keepalive probes; 75s when unset. |
+| `disable_tcp_keep_alive` | bool | `false` | sail 扩展 | — |
+| `tcp_fast_open` | bool | `false` | sail 扩展 | TCP Fast Open on the TCP port it listens on: what a client that has the server's cookie sends with its SYN is taken at once. On Linux, only with the server bit of `net.ipv4.tcp_fastopen` (2; 3 for client and server), which the default (1) leaves off. |
+| `udp_fragment` | bool | 未设置 | sail 扩展 | Whether the datagrams it sends from its UDP sockets may be fragmented on the way: where not, they carry don't-fragment, and one larger than the path takes is refused rather than sent in pieces. Unset, as sing-box: they may for direct and hysteria2, and may not for the others. |
+| `users` | 数组，元素为 对象 → [[]](#inbounds-sail-users) | 必填 | sail 扩展 | Who may connect, by token. Sail/1 is experimental (sail#60): its wire format is not yet stable, and it is built only with the `inbound-sail` feature, which no default build turns on. |
+| `padding_scheme` | string 或 数组，元素为 string | 未设置 | sail 扩展 | The padding scheme, as lines, AnyTLS's syntax. Unset, the default. |
+| `fallback` | 对象 → [对象](/sail/zh/reference/shared/#fallback-fallback-for-alpn) | 未设置 | sail 扩展 | — |
+| `fallback_for_alpn` | 对象，值为 对象 → [对象](/sail/zh/reference/shared/#fallback-fallback-for-alpn) | `{}` | sail 扩展 | — |
+
+<a id="inbounds-sail-users"></a>
+
+### `inbounds[sail].users[]`
+
+Rust 定义：[`SailUser`](https://github.com/peakpassvpn/sail/blob/master/sail/src/protocol/sail/inbound.rs) · 构建条件：`feature = "inbound-sail"` · **sail 扩展**
+
+| 字段 | 类型 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `name` | string | 未设置 | sail 扩展 | Who the user is to routing (`auth_user`), statistics and logs. |
+| `token` | string | 必填 | sail 扩展 | 32 random bytes as unpadded base64url (43 characters), each user's own. |
+
 <a id="inbounds-shadowsocks"></a>
 
 ## `inbounds[shadowsocks]`

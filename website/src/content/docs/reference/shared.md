@@ -33,7 +33,7 @@ Rust: [`MultiplexBrutal`](https://github.com/peakpassvpn/sail/blob/master/sail/s
 
 ## `client_subnet`
 
-Used at: `dns.servers[h3, https, quic, tcp, tls, udp].client_subnet`, `outbounds[redirect].domain_resolver.client_subnet`
+Used at: `dns.servers[h3, https, quic, tcp, tls, udp].client_subnet`, `outbounds[redirect, sail].domain_resolver.client_subnet`
 
 Rust: [`Prefix`](https://github.com/peakpassvpn/sail/blob/master/sail/src/config/model.rs) · **sail extension**
 
@@ -73,6 +73,24 @@ Used at: `inbounds[anytls].tls.reality.handshake.domain_resolver`, `route.rule_s
 | `disable_optimistic_cache` | bool | — | Supported | — |
 | `rewrite_ttl` | number | — | Supported | — |
 | `client_subnet` | string | — | Supported | — |
+
+<a id="domain-resolver-outbounds"></a>
+
+## `domain_resolver` — outbounds
+
+Used at: `outbounds[redirect, sail].domain_resolver`
+
+Rust: [`DomainResolver`](https://github.com/peakpassvpn/sail/blob/master/sail/src/config/model.rs) · **sail extension**
+
+| Field | Type | Default | Status | Description |
+| --- | --- | --- | --- | --- |
+| `server` | string | required | sail extension | — |
+| `strategy` | string, one of `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | unset | sail extension | — |
+| `timeout` | duration | unset | sail extension | — |
+| `disable_cache` | bool | `false` | sail extension | — |
+| `disable_optimistic_cache` | bool | `false` | sail extension | — |
+| `rewrite_ttl` | number | unset | sail extension | — |
+| `client_subnet` | object → [object](#client-subnet) | unset | sail extension | — |
 
 <a id="domain-resolver-default-domain-resolver"></a>
 
@@ -181,7 +199,7 @@ Rust: [`OutboundEch`](https://github.com/peakpassvpn/sail/blob/master/sail/src/t
 
 ## `fallback / fallback_for_alpn`
 
-Used at: `inbounds[anytls, vless].fallback`, `inbounds[anytls, vless].fallback_for_alpn`
+Used at: `inbounds[anytls, sail, vless].fallback`, `inbounds[anytls, sail, vless].fallback_for_alpn`
 
 Rust: [`FallbackServer`](https://github.com/peakpassvpn/sail/blob/master/sail/src/protocol/fallback.rs) · Build: `any (feature = "inbound-anytls" , feature = "inbound-trojan" , feature = "inbound-vless" , feature = "inbound-shadowtls")` · **sail extension**
 

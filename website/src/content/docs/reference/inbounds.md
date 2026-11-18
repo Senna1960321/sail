@@ -502,6 +502,39 @@ Rust: [`RedirectInboundOptions`](https://github.com/peakpassvpn/sail/blob/master
 | `udp_timeout` | number\|duration | unset | Supported | How long a UDP session through this inbound lives without traffic; 5m when unset, as in sing-box. A number is of seconds. |
 | `detour` | string | — | Error: Handing an inbound's connections to another inbound | — |
 
+<a id="inbounds-sail"></a>
+
+## `inbounds[sail]`
+
+Rust: [`SailInboundOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/src/protocol/sail/inbound.rs) · Build: `feature = "inbound-sail"` · **sail extension**
+
+| Field | Type | Default | Status | Description |
+| --- | --- | --- | --- | --- |
+| `tag` | string | `""` | sail extension | Defaults to the type. |
+| `listen` | string | unset | sail extension | The address to listen on; defaults to `127.0.0.1`. |
+| `listen_port` | number | unset | sail extension | The port to listen on. An inbound without one does not listen, and is only useful as a part of another inbound. |
+| `udp_timeout` | duration, or a number of seconds | unset | sail extension | How long a UDP session through this inbound lives without traffic; 5m when unset, as in sing-box. A number is of seconds. |
+| `tcp_keep_alive` | duration | unset | sail extension | How long an accepted TCP connection is idle before keepalive probes it; 5m when unset. |
+| `tcp_keep_alive_interval` | duration | unset | sail extension | Between keepalive probes; 75s when unset. |
+| `disable_tcp_keep_alive` | bool | `false` | sail extension | — |
+| `tcp_fast_open` | bool | `false` | sail extension | TCP Fast Open on the TCP port it listens on: what a client that has the server's cookie sends with its SYN is taken at once. On Linux, only with the server bit of `net.ipv4.tcp_fastopen` (2; 3 for client and server), which the default (1) leaves off. |
+| `udp_fragment` | bool | unset | sail extension | Whether the datagrams it sends from its UDP sockets may be fragmented on the way: where not, they carry don't-fragment, and one larger than the path takes is refused rather than sent in pieces. Unset, as sing-box: they may for direct and hysteria2, and may not for the others. |
+| `users` | array of object → [[]](#inbounds-sail-users) | required | sail extension | Who may connect, by token. Sail/1 is experimental (sail#60): its wire format is not yet stable, and it is built only with the `inbound-sail` feature, which no default build turns on. |
+| `padding_scheme` | string or array of string | unset | sail extension | The padding scheme, as lines, AnyTLS's syntax. Unset, the default. |
+| `fallback` | object → [object](/sail/reference/shared/#fallback-fallback-for-alpn) | unset | sail extension | — |
+| `fallback_for_alpn` | object of object → [object](/sail/reference/shared/#fallback-fallback-for-alpn) | `{}` | sail extension | — |
+
+<a id="inbounds-sail-users"></a>
+
+### `inbounds[sail].users[]`
+
+Rust: [`SailUser`](https://github.com/peakpassvpn/sail/blob/master/sail/src/protocol/sail/inbound.rs) · Build: `feature = "inbound-sail"` · **sail extension**
+
+| Field | Type | Default | Status | Description |
+| --- | --- | --- | --- | --- |
+| `name` | string | unset | sail extension | Who the user is to routing (`auth_user`), statistics and logs. |
+| `token` | string | required | sail extension | 32 random bytes as unpadded base64url (43 characters), each user's own. |
+
 <a id="inbounds-shadowsocks"></a>
 
 ## `inbounds[shadowsocks]`

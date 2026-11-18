@@ -432,7 +432,7 @@ Rust 定义：[`RedirectOptions`](https://github.com/peakpassvpn/sail/blob/maste
 | `tcp_keep_alive` | duration | 未设置 | sail 扩展 | How long a TCP connection is idle before keepalive probes it; 5m when unset. |
 | `tcp_keep_alive_interval` | duration | 未设置 | sail 扩展 | Between keepalive probes; 75s when unset. |
 | `udp_fragment` | bool | 未设置 | sail 扩展 | Whether UDP datagrams may be fragmented on the way; unset, as the place says, see `udp_fragment_default`. |
-| `domain_resolver` | 对象 → [对象](#outbounds-redirect-domain-resolver) | 未设置 | sail 扩展 | The DNS server that resolves the names dialled. |
+| `domain_resolver` | 对象 → [对象](/sail/zh/reference/shared/#domain-resolver-outbounds) | 未设置 | sail 扩展 | The DNS server that resolves the names dialled. |
 | `skip_default_domain_resolver` | bool | `false` | sail 扩展 | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
 | `tcp_concurrent` | bool | `false` | sail 扩展 | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
 | `domain_strategy` | string, 取值 `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | 未设置 | sail 扩展 | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
@@ -456,7 +456,7 @@ Rust 定义：[`RedirectOptions`](https://github.com/peakpassvpn/sail/blob/maste
 | `tcp_keep_alive` | duration | 未设置 | sail 扩展 | How long a TCP connection is idle before keepalive probes it; 5m when unset. |
 | `tcp_keep_alive_interval` | duration | 未设置 | sail 扩展 | Between keepalive probes; 75s when unset. |
 | `udp_fragment` | bool | 未设置 | sail 扩展 | Whether UDP datagrams may be fragmented on the way; unset, as the place says, see `udp_fragment_default`. |
-| `domain_resolver` | 对象 → [对象](#outbounds-redirect-domain-resolver) | 未设置 | sail 扩展 | The DNS server that resolves the names dialled. |
+| `domain_resolver` | 对象 → [对象](/sail/zh/reference/shared/#domain-resolver-outbounds) | 未设置 | sail 扩展 | The DNS server that resolves the names dialled. |
 | `skip_default_domain_resolver` | bool | `false` | sail 扩展 | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
 | `tcp_concurrent` | bool | `false` | sail 扩展 | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
 | `domain_strategy` | string, 取值 `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | 未设置 | sail 扩展 | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
@@ -467,21 +467,132 @@ Rust 定义：[`RedirectOptions`](https://github.com/peakpassvpn/sail/blob/maste
 | `server` | string | 必填 | sail 扩展 | — |
 | `server_port` | number | 必填 | sail 扩展 | — |
 
-<a id="outbounds-redirect-domain-resolver"></a>
+<a id="outbounds-sail"></a>
 
-### `outbounds[redirect].domain_resolver`
+## `outbounds[sail]`
 
-Rust 定义：[`DomainResolver`](https://github.com/peakpassvpn/sail/blob/master/sail/src/config/model.rs) · **sail 扩展**
+Rust 定义：[`SailOutboundOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/src/protocol/sail/outbound.rs) · 构建条件：`feature = "outbound-sail"` · **sail 扩展**
 
 | 字段 | 类型 | 默认 | 状态 | 说明 |
 | --- | --- | --- | --- | --- |
-| `server` | string | 必填 | sail 扩展 | — |
-| `strategy` | string, 取值 `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | 未设置 | sail 扩展 | — |
-| `timeout` | duration | 未设置 | sail 扩展 | — |
-| `disable_cache` | bool | `false` | sail 扩展 | — |
-| `disable_optimistic_cache` | bool | `false` | sail 扩展 | — |
-| `rewrite_ttl` | number | 未设置 | sail 扩展 | — |
-| `client_subnet` | 对象 → [对象](/sail/zh/reference/shared/#client-subnet) | 未设置 | sail 扩展 | — |
+| `tag` | string | `""` | sail 扩展 | Defaults to the type. |
+| `detour` | string | 未设置 | sail 扩展 | The outbound to dial through, in place of a socket of its own. |
+| `bind_interface` | string | 未设置 | sail 扩展 | The interface to send through, by name. Loopback destinations still go over loopback, where sing-box applies the bind to them as well. |
+| `inet4_bind_address` | string | 未设置 | sail 扩展 | The local address for IPv4 destinations, loopback ones aside: as `bind_interface`. |
+| `inet6_bind_address` | string | 未设置 | sail 扩展 | The local address for IPv6 destinations, loopback ones aside: as `bind_interface`. |
+| `bind_address_no_port` | bool | `false` | sail 扩展 | `IP_BIND_ADDRESS_NO_PORT` on TCP sockets bound to an address, so that the port is picked at connect: Linux only. |
+| `protect_path` | string | 未设置 | sail 扩展 | A Unix socket each socket's descriptor is handed to, with `SCM_RIGHTS`, before it binds or connects, for the process there to protect it (from its VPN, say); it answers one byte. Besides what the host protects. Unix only. |
+| `routing_mark` | number | 未设置 | sail 扩展 | `SO_MARK`, Linux only. |
+| `reuse_addr` | bool | `false` | sail 扩展 | `SO_REUSEADDR`, and `SO_REUSEPORT` on Unix, on UDP sockets. |
+| `netns` | 任意 JSON | 未设置 | sail 扩展 | Not implemented yet. |
+| `connect_timeout` | duration | 未设置 | sail 扩展 | How long a TCP connect to one address may take; 5s when unset. |
+| `tcp_fast_open` | bool | `false` | sail 扩展 | TCP Fast Open: the first data written goes with the SYN. Its addresses are then tried one by one, not raced. |
+| `tcp_multi_path` | 任意 JSON | 未设置 | sail 扩展 | Not implemented yet. |
+| `disable_tcp_keep_alive` | bool | `false` | sail 扩展 | No TCP keepalive at all. |
+| `tcp_keep_alive` | duration | 未设置 | sail 扩展 | How long a TCP connection is idle before keepalive probes it; 5m when unset. |
+| `tcp_keep_alive_interval` | duration | 未设置 | sail 扩展 | Between keepalive probes; 75s when unset. |
+| `udp_fragment` | bool | 未设置 | sail 扩展 | Whether UDP datagrams may be fragmented on the way; unset, as the place says, see `udp_fragment_default`. |
+| `domain_resolver` | 对象 → [对象](/sail/zh/reference/shared/#domain-resolver-outbounds) | 未设置 | sail 扩展 | The DNS server that resolves the names dialled. |
+| `skip_default_domain_resolver` | bool | `false` | sail 扩展 | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
+| `tcp_concurrent` | bool | `false` | sail 扩展 | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
+| `domain_strategy` | string, 取值 `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | 未设置 | sail 扩展 | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
+| `network_strategy` | string, 取值 `default`, `hybrid`, `fallback` | 未设置 | sail 扩展 | Which of the host's interfaces a connection goes out of, and how they race; `default` where only types are given. Only where the host lists its interfaces (`NetworkState::interfaces`). |
+| `network_type` | string, 取值 `wifi`, `cellular`, `ethernet`, `other` 或 数组，元素为 string, 取值 `wifi`, `cellular`, `ethernet`, `other` | `[]` | sail 扩展 | The types of interface the strategy goes out of first. |
+| `fallback_network_type` | string, 取值 `wifi`, `cellular`, `ethernet`, `other` 或 数组，元素为 string, 取值 `wifi`, `cellular`, `ethernet`, `other` | `[]` | sail 扩展 | The types it falls back to, with `fallback`. |
+| `fallback_delay` | duration | 未设置 | sail 扩展 | How long the addresses of one family are tried before those of the other are raced against them (Happy Eyeballs), and the first interfaces before the fallback ones; 300ms when unset. |
+| `detour` | string | 未设置 | sail 扩展 | The outbound to dial through, in place of a socket of its own. |
+| `bind_interface` | string | 未设置 | sail 扩展 | The interface to send through, by name. Loopback destinations still go over loopback, where sing-box applies the bind to them as well. |
+| `inet4_bind_address` | string | 未设置 | sail 扩展 | The local address for IPv4 destinations, loopback ones aside: as `bind_interface`. |
+| `inet6_bind_address` | string | 未设置 | sail 扩展 | The local address for IPv6 destinations, loopback ones aside: as `bind_interface`. |
+| `bind_address_no_port` | bool | `false` | sail 扩展 | `IP_BIND_ADDRESS_NO_PORT` on TCP sockets bound to an address, so that the port is picked at connect: Linux only. |
+| `protect_path` | string | 未设置 | sail 扩展 | A Unix socket each socket's descriptor is handed to, with `SCM_RIGHTS`, before it binds or connects, for the process there to protect it (from its VPN, say); it answers one byte. Besides what the host protects. Unix only. |
+| `routing_mark` | number | 未设置 | sail 扩展 | `SO_MARK`, Linux only. |
+| `reuse_addr` | bool | `false` | sail 扩展 | `SO_REUSEADDR`, and `SO_REUSEPORT` on Unix, on UDP sockets. |
+| `netns` | 任意 JSON | 未设置 | sail 扩展 | Not implemented yet. |
+| `connect_timeout` | duration | 未设置 | sail 扩展 | How long a TCP connect to one address may take; 5s when unset. |
+| `tcp_fast_open` | bool | `false` | sail 扩展 | TCP Fast Open: the first data written goes with the SYN. Its addresses are then tried one by one, not raced. |
+| `tcp_multi_path` | 任意 JSON | 未设置 | sail 扩展 | Not implemented yet. |
+| `disable_tcp_keep_alive` | bool | `false` | sail 扩展 | No TCP keepalive at all. |
+| `tcp_keep_alive` | duration | 未设置 | sail 扩展 | How long a TCP connection is idle before keepalive probes it; 5m when unset. |
+| `tcp_keep_alive_interval` | duration | 未设置 | sail 扩展 | Between keepalive probes; 75s when unset. |
+| `udp_fragment` | bool | 未设置 | sail 扩展 | Whether UDP datagrams may be fragmented on the way; unset, as the place says, see `udp_fragment_default`. |
+| `domain_resolver` | 对象 → [对象](/sail/zh/reference/shared/#domain-resolver-outbounds) | 未设置 | sail 扩展 | The DNS server that resolves the names dialled. |
+| `skip_default_domain_resolver` | bool | `false` | sail 扩展 | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
+| `tcp_concurrent` | bool | `false` | sail 扩展 | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
+| `domain_strategy` | string, 取值 `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | 未设置 | sail 扩展 | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
+| `network_strategy` | string, 取值 `default`, `hybrid`, `fallback` | 未设置 | sail 扩展 | Which of the host's interfaces a connection goes out of, and how they race; `default` where only types are given. Only where the host lists its interfaces (`NetworkState::interfaces`). |
+| `network_type` | string, 取值 `wifi`, `cellular`, `ethernet`, `other` 或 数组，元素为 string, 取值 `wifi`, `cellular`, `ethernet`, `other` | `[]` | sail 扩展 | The types of interface the strategy goes out of first. |
+| `fallback_network_type` | string, 取值 `wifi`, `cellular`, `ethernet`, `other` 或 数组，元素为 string, 取值 `wifi`, `cellular`, `ethernet`, `other` | `[]` | sail 扩展 | The types it falls back to, with `fallback`. |
+| `fallback_delay` | duration | 未设置 | sail 扩展 | How long the addresses of one family are tried before those of the other are raced against them (Happy Eyeballs), and the first interfaces before the fallback ones; 300ms when unset. |
+| `tls` | 对象 → [对象](#outbounds-sail-tls) | 未设置 | sail 扩展 | — |
+| `server` | string | 未设置 | sail 扩展 | May be left out, with `server_port`, by an outbound with a `detour` that dials its own server. |
+| `server_port` | number | 未设置 | sail 扩展 | — |
+| `token` | string | 必填 | sail 扩展 | The user's token: 32 random bytes as unpadded base64url (43 characters). Sail/1 is experimental (sail#60): its wire format is not yet stable, and it is built only with the `outbound-sail` feature, which no default build turns on. |
+
+<a id="outbounds-sail-tls"></a>
+
+### `outbounds[sail].tls`
+
+Rust 定义：[`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs) · **sail 扩展**
+
+| 字段 | 类型 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | sail 扩展 | — |
+| `server_name` | string | 未设置 | sail 扩展 | Defaults to the server's address. |
+| `disable_sni` | bool | `false` | sail 扩展 | Sends no SNI. The certificate is still verified against `server_name`, unless `insecure`. |
+| `insecure` | bool | `false` | sail 扩展 | — |
+| `alpn` | string 或 数组，元素为 string | 未设置 | sail 扩展 | — |
+| `min_version` | string | 未设置 | sail 扩展 | The lowest TLS version to negotiate, `1.0` to `1.3`; unset, 1.2. |
+| `max_version` | string | 未设置 | sail 扩展 | The highest; unset, 1.3. |
+| `certificate` | string 或 数组，元素为 string | 未设置 | sail 扩展 | An inline PEM certificate to trust. |
+| `certificate_path` | string | 未设置 | sail 扩展 | A PEM certificate to trust, by path. |
+| `certificate_public_key_sha256` | string 或 数组，元素为 string | 未设置 | sail 扩展 | The SHA-256 hashes, base64, of the public keys to take a server's certificate by, in place of the certificates trusted, the name and `insecure`. |
+| `certificate_sha256` | string 或 数组，元素为 string | 未设置 | sail 扩展 | sing-box 1.15's, with Mihomo's `fingerprint` semantics beyond it: the SHA-256 hashes, hex or base64, of whole certificates (DER) to take a server by, in place of the certificates trusted and `insecure`. A hash of the server's own certificate takes it outright: no CA and no name are checked, so that exact certificate is trusted for any server name. A hash of a certificate sent after it, an intermediate or a root, is the only CA the server's certificate is verified by, with the server name. With `certificate_public_key_sha256`, either passing is enough. |
+| `client_certificate` | string 或 数组，元素为 string | 未设置 | sail 扩展 | An inline PEM certificate, its chain after it, presented when the server asks for one; with `client_key`. |
+| `client_certificate_path` | string | 未设置 | sail 扩展 | `client_certificate`, by path. |
+| `client_key` | string 或 数组，元素为 string | 未设置 | sail 扩展 | The inline PEM key of the client certificate. |
+| `client_key_path` | string | 未设置 | sail 扩展 | `client_key`, by path. |
+| `ech` | 对象 → [对象](#outbounds-sail-tls-ech) | 未设置 | sail 扩展 | — |
+| `reality` | 对象 → [对象](#outbounds-sail-tls-reality) | 未设置 | sail 扩展 | — |
+| `utls` | 对象 → [对象](#outbounds-sail-tls-utls) | 未设置 | sail 扩展 | The browser the ClientHello imitates. Unset, it is Chrome's. |
+| `fragment` | bool | `false` | sail 扩展 | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | 未设置 | sail 扩展 | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | `false` | sail 扩展 | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
+
+<a id="outbounds-sail-tls-ech"></a>
+
+### `outbounds[sail].tls.ech`
+
+Rust 定义：[`OutboundEch`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs) · **sail 扩展**
+
+| 字段 | 类型 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | sail 扩展 | — |
+| `config` | string 或 数组，元素为 string | 未设置 | sail 扩展 | An ECHConfigList, base64 or PEM. Looked up in DNS when not set. |
+| `disable_dns_lookup` | bool | `false` | sail 扩展 | Never look the ECHConfigList up in DNS: `config` is then required. |
+
+<a id="outbounds-sail-tls-reality"></a>
+
+### `outbounds[sail].tls.reality`
+
+Rust 定义：[`OutboundReality`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs) · **sail 扩展**
+
+| 字段 | 类型 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | sail 扩展 | — |
+| `public_key` | string | 必填 | sail 扩展 | — |
+| `short_id` | string | `""` | sail 扩展 | — |
+
+<a id="outbounds-sail-tls-utls"></a>
+
+### `outbounds[sail].tls.utls`
+
+Rust 定义：[`OutboundUtls`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs) · **sail 扩展**
+
+| 字段 | 类型 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `true` | sail 扩展 | — |
+| `fingerprint` | string | `"chrome"` | sail 扩展 | — |
 
 <a id="outbounds-selector"></a>
 

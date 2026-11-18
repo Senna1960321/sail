@@ -432,7 +432,7 @@ Rust: [`RedirectOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/s
 | `tcp_keep_alive` | duration | unset | sail extension | How long a TCP connection is idle before keepalive probes it; 5m when unset. |
 | `tcp_keep_alive_interval` | duration | unset | sail extension | Between keepalive probes; 75s when unset. |
 | `udp_fragment` | bool | unset | sail extension | Whether UDP datagrams may be fragmented on the way; unset, as the place says, see `udp_fragment_default`. |
-| `domain_resolver` | object → [object](#outbounds-redirect-domain-resolver) | unset | sail extension | The DNS server that resolves the names dialled. |
+| `domain_resolver` | object → [object](/sail/reference/shared/#domain-resolver-outbounds) | unset | sail extension | The DNS server that resolves the names dialled. |
 | `skip_default_domain_resolver` | bool | `false` | sail extension | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
 | `tcp_concurrent` | bool | `false` | sail extension | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
 | `domain_strategy` | string, one of `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | unset | sail extension | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
@@ -456,7 +456,7 @@ Rust: [`RedirectOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/s
 | `tcp_keep_alive` | duration | unset | sail extension | How long a TCP connection is idle before keepalive probes it; 5m when unset. |
 | `tcp_keep_alive_interval` | duration | unset | sail extension | Between keepalive probes; 75s when unset. |
 | `udp_fragment` | bool | unset | sail extension | Whether UDP datagrams may be fragmented on the way; unset, as the place says, see `udp_fragment_default`. |
-| `domain_resolver` | object → [object](#outbounds-redirect-domain-resolver) | unset | sail extension | The DNS server that resolves the names dialled. |
+| `domain_resolver` | object → [object](/sail/reference/shared/#domain-resolver-outbounds) | unset | sail extension | The DNS server that resolves the names dialled. |
 | `skip_default_domain_resolver` | bool | `false` | sail extension | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
 | `tcp_concurrent` | bool | `false` | sail extension | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
 | `domain_strategy` | string, one of `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | unset | sail extension | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
@@ -467,21 +467,132 @@ Rust: [`RedirectOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/s
 | `server` | string | required | sail extension | — |
 | `server_port` | number | required | sail extension | — |
 
-<a id="outbounds-redirect-domain-resolver"></a>
+<a id="outbounds-sail"></a>
 
-### `outbounds[redirect].domain_resolver`
+## `outbounds[sail]`
 
-Rust: [`DomainResolver`](https://github.com/peakpassvpn/sail/blob/master/sail/src/config/model.rs) · **sail extension**
+Rust: [`SailOutboundOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/src/protocol/sail/outbound.rs) · Build: `feature = "outbound-sail"` · **sail extension**
 
 | Field | Type | Default | Status | Description |
 | --- | --- | --- | --- | --- |
-| `server` | string | required | sail extension | — |
-| `strategy` | string, one of `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | unset | sail extension | — |
-| `timeout` | duration | unset | sail extension | — |
-| `disable_cache` | bool | `false` | sail extension | — |
-| `disable_optimistic_cache` | bool | `false` | sail extension | — |
-| `rewrite_ttl` | number | unset | sail extension | — |
-| `client_subnet` | object → [object](/sail/reference/shared/#client-subnet) | unset | sail extension | — |
+| `tag` | string | `""` | sail extension | Defaults to the type. |
+| `detour` | string | unset | sail extension | The outbound to dial through, in place of a socket of its own. |
+| `bind_interface` | string | unset | sail extension | The interface to send through, by name. Loopback destinations still go over loopback, where sing-box applies the bind to them as well. |
+| `inet4_bind_address` | string | unset | sail extension | The local address for IPv4 destinations, loopback ones aside: as `bind_interface`. |
+| `inet6_bind_address` | string | unset | sail extension | The local address for IPv6 destinations, loopback ones aside: as `bind_interface`. |
+| `bind_address_no_port` | bool | `false` | sail extension | `IP_BIND_ADDRESS_NO_PORT` on TCP sockets bound to an address, so that the port is picked at connect: Linux only. |
+| `protect_path` | string | unset | sail extension | A Unix socket each socket's descriptor is handed to, with `SCM_RIGHTS`, before it binds or connects, for the process there to protect it (from its VPN, say); it answers one byte. Besides what the host protects. Unix only. |
+| `routing_mark` | number | unset | sail extension | `SO_MARK`, Linux only. |
+| `reuse_addr` | bool | `false` | sail extension | `SO_REUSEADDR`, and `SO_REUSEPORT` on Unix, on UDP sockets. |
+| `netns` | any JSON | unset | sail extension | Not implemented yet. |
+| `connect_timeout` | duration | unset | sail extension | How long a TCP connect to one address may take; 5s when unset. |
+| `tcp_fast_open` | bool | `false` | sail extension | TCP Fast Open: the first data written goes with the SYN. Its addresses are then tried one by one, not raced. |
+| `tcp_multi_path` | any JSON | unset | sail extension | Not implemented yet. |
+| `disable_tcp_keep_alive` | bool | `false` | sail extension | No TCP keepalive at all. |
+| `tcp_keep_alive` | duration | unset | sail extension | How long a TCP connection is idle before keepalive probes it; 5m when unset. |
+| `tcp_keep_alive_interval` | duration | unset | sail extension | Between keepalive probes; 75s when unset. |
+| `udp_fragment` | bool | unset | sail extension | Whether UDP datagrams may be fragmented on the way; unset, as the place says, see `udp_fragment_default`. |
+| `domain_resolver` | object → [object](/sail/reference/shared/#domain-resolver-outbounds) | unset | sail extension | The DNS server that resolves the names dialled. |
+| `skip_default_domain_resolver` | bool | `false` | sail extension | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
+| `tcp_concurrent` | bool | `false` | sail extension | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
+| `domain_strategy` | string, one of `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | unset | sail extension | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
+| `network_strategy` | string, one of `default`, `hybrid`, `fallback` | unset | sail extension | Which of the host's interfaces a connection goes out of, and how they race; `default` where only types are given. Only where the host lists its interfaces (`NetworkState::interfaces`). |
+| `network_type` | string, one of `wifi`, `cellular`, `ethernet`, `other` or array of string, one of `wifi`, `cellular`, `ethernet`, `other` | `[]` | sail extension | The types of interface the strategy goes out of first. |
+| `fallback_network_type` | string, one of `wifi`, `cellular`, `ethernet`, `other` or array of string, one of `wifi`, `cellular`, `ethernet`, `other` | `[]` | sail extension | The types it falls back to, with `fallback`. |
+| `fallback_delay` | duration | unset | sail extension | How long the addresses of one family are tried before those of the other are raced against them (Happy Eyeballs), and the first interfaces before the fallback ones; 300ms when unset. |
+| `detour` | string | unset | sail extension | The outbound to dial through, in place of a socket of its own. |
+| `bind_interface` | string | unset | sail extension | The interface to send through, by name. Loopback destinations still go over loopback, where sing-box applies the bind to them as well. |
+| `inet4_bind_address` | string | unset | sail extension | The local address for IPv4 destinations, loopback ones aside: as `bind_interface`. |
+| `inet6_bind_address` | string | unset | sail extension | The local address for IPv6 destinations, loopback ones aside: as `bind_interface`. |
+| `bind_address_no_port` | bool | `false` | sail extension | `IP_BIND_ADDRESS_NO_PORT` on TCP sockets bound to an address, so that the port is picked at connect: Linux only. |
+| `protect_path` | string | unset | sail extension | A Unix socket each socket's descriptor is handed to, with `SCM_RIGHTS`, before it binds or connects, for the process there to protect it (from its VPN, say); it answers one byte. Besides what the host protects. Unix only. |
+| `routing_mark` | number | unset | sail extension | `SO_MARK`, Linux only. |
+| `reuse_addr` | bool | `false` | sail extension | `SO_REUSEADDR`, and `SO_REUSEPORT` on Unix, on UDP sockets. |
+| `netns` | any JSON | unset | sail extension | Not implemented yet. |
+| `connect_timeout` | duration | unset | sail extension | How long a TCP connect to one address may take; 5s when unset. |
+| `tcp_fast_open` | bool | `false` | sail extension | TCP Fast Open: the first data written goes with the SYN. Its addresses are then tried one by one, not raced. |
+| `tcp_multi_path` | any JSON | unset | sail extension | Not implemented yet. |
+| `disable_tcp_keep_alive` | bool | `false` | sail extension | No TCP keepalive at all. |
+| `tcp_keep_alive` | duration | unset | sail extension | How long a TCP connection is idle before keepalive probes it; 5m when unset. |
+| `tcp_keep_alive_interval` | duration | unset | sail extension | Between keepalive probes; 75s when unset. |
+| `udp_fragment` | bool | unset | sail extension | Whether UDP datagrams may be fragmented on the way; unset, as the place says, see `udp_fragment_default`. |
+| `domain_resolver` | object → [object](/sail/reference/shared/#domain-resolver-outbounds) | unset | sail extension | The DNS server that resolves the names dialled. |
+| `skip_default_domain_resolver` | bool | `false` | sail extension | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
+| `tcp_concurrent` | bool | `false` | sail extension | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
+| `domain_strategy` | string, one of `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only` | unset | sail extension | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
+| `network_strategy` | string, one of `default`, `hybrid`, `fallback` | unset | sail extension | Which of the host's interfaces a connection goes out of, and how they race; `default` where only types are given. Only where the host lists its interfaces (`NetworkState::interfaces`). |
+| `network_type` | string, one of `wifi`, `cellular`, `ethernet`, `other` or array of string, one of `wifi`, `cellular`, `ethernet`, `other` | `[]` | sail extension | The types of interface the strategy goes out of first. |
+| `fallback_network_type` | string, one of `wifi`, `cellular`, `ethernet`, `other` or array of string, one of `wifi`, `cellular`, `ethernet`, `other` | `[]` | sail extension | The types it falls back to, with `fallback`. |
+| `fallback_delay` | duration | unset | sail extension | How long the addresses of one family are tried before those of the other are raced against them (Happy Eyeballs), and the first interfaces before the fallback ones; 300ms when unset. |
+| `tls` | object → [object](#outbounds-sail-tls) | unset | sail extension | — |
+| `server` | string | unset | sail extension | May be left out, with `server_port`, by an outbound with a `detour` that dials its own server. |
+| `server_port` | number | unset | sail extension | — |
+| `token` | string | required | sail extension | The user's token: 32 random bytes as unpadded base64url (43 characters). Sail/1 is experimental (sail#60): its wire format is not yet stable, and it is built only with the `outbound-sail` feature, which no default build turns on. |
+
+<a id="outbounds-sail-tls"></a>
+
+### `outbounds[sail].tls`
+
+Rust: [`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs) · **sail extension**
+
+| Field | Type | Default | Status | Description |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | sail extension | — |
+| `server_name` | string | unset | sail extension | Defaults to the server's address. |
+| `disable_sni` | bool | `false` | sail extension | Sends no SNI. The certificate is still verified against `server_name`, unless `insecure`. |
+| `insecure` | bool | `false` | sail extension | — |
+| `alpn` | string or array of string | unset | sail extension | — |
+| `min_version` | string | unset | sail extension | The lowest TLS version to negotiate, `1.0` to `1.3`; unset, 1.2. |
+| `max_version` | string | unset | sail extension | The highest; unset, 1.3. |
+| `certificate` | string or array of string | unset | sail extension | An inline PEM certificate to trust. |
+| `certificate_path` | string | unset | sail extension | A PEM certificate to trust, by path. |
+| `certificate_public_key_sha256` | string or array of string | unset | sail extension | The SHA-256 hashes, base64, of the public keys to take a server's certificate by, in place of the certificates trusted, the name and `insecure`. |
+| `certificate_sha256` | string or array of string | unset | sail extension | sing-box 1.15's, with Mihomo's `fingerprint` semantics beyond it: the SHA-256 hashes, hex or base64, of whole certificates (DER) to take a server by, in place of the certificates trusted and `insecure`. A hash of the server's own certificate takes it outright: no CA and no name are checked, so that exact certificate is trusted for any server name. A hash of a certificate sent after it, an intermediate or a root, is the only CA the server's certificate is verified by, with the server name. With `certificate_public_key_sha256`, either passing is enough. |
+| `client_certificate` | string or array of string | unset | sail extension | An inline PEM certificate, its chain after it, presented when the server asks for one; with `client_key`. |
+| `client_certificate_path` | string | unset | sail extension | `client_certificate`, by path. |
+| `client_key` | string or array of string | unset | sail extension | The inline PEM key of the client certificate. |
+| `client_key_path` | string | unset | sail extension | `client_key`, by path. |
+| `ech` | object → [object](#outbounds-sail-tls-ech) | unset | sail extension | — |
+| `reality` | object → [object](#outbounds-sail-tls-reality) | unset | sail extension | — |
+| `utls` | object → [object](#outbounds-sail-tls-utls) | unset | sail extension | The browser the ClientHello imitates. Unset, it is Chrome's. |
+| `fragment` | bool | `false` | sail extension | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | unset | sail extension | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | `false` | sail extension | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
+
+<a id="outbounds-sail-tls-ech"></a>
+
+### `outbounds[sail].tls.ech`
+
+Rust: [`OutboundEch`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs) · **sail extension**
+
+| Field | Type | Default | Status | Description |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | sail extension | — |
+| `config` | string or array of string | unset | sail extension | An ECHConfigList, base64 or PEM. Looked up in DNS when not set. |
+| `disable_dns_lookup` | bool | `false` | sail extension | Never look the ECHConfigList up in DNS: `config` is then required. |
+
+<a id="outbounds-sail-tls-reality"></a>
+
+### `outbounds[sail].tls.reality`
+
+Rust: [`OutboundReality`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs) · **sail extension**
+
+| Field | Type | Default | Status | Description |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | sail extension | — |
+| `public_key` | string | required | sail extension | — |
+| `short_id` | string | `""` | sail extension | — |
+
+<a id="outbounds-sail-tls-utls"></a>
+
+### `outbounds[sail].tls.utls`
+
+Rust: [`OutboundUtls`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs) · **sail extension**
+
+| Field | Type | Default | Status | Description |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `true` | sail extension | — |
+| `fingerprint` | string | `"chrome"` | sail extension | — |
 
 <a id="outbounds-selector"></a>
 

@@ -61,15 +61,22 @@ pub(crate) fn register(registry: &mut OutboundRegistry) {
     );
 }
 
+/// Sail/1, sail's own protocol: experimental (sail#60), its wire format
+/// not yet stable. Built only with the `outbound-sail` feature, which no
+/// default build turns on.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Options {
+struct SailOutboundOptions {
     /// May be left out, with `server_port`, by an outbound with a
     /// `detour` that dials its own server.
     #[serde(default)]
     server: Option<String>,
     #[serde(default)]
     server_port: Option<u16>,
+    /// The user's token: 32 random bytes as unpadded base64url (43
+    /// characters). Sail/1 is experimental (sail#60): its wire format is
+    /// not yet stable, and it is built only with the `outbound-sail`
+    /// feature, which no default build turns on.
     token: Secret<String>,
 }
 
@@ -79,7 +86,7 @@ fn build(ctx: &mut OutboundContext<'_>) -> Result<AnyOutboundHandler> {
     if !connector.tls() {
         return Err(anyhow!("[{}] outbound: tls: sail needs it enabled", tag));
     }
-    let options: Options = ctx.options()?;
+    let options: SailOutboundOptions = ctx.options()?;
     let token =
         super::token(&options.token).map_err(|e| anyhow!("[{}] outbound: token: {}", tag, e))?;
     let (server, server_port) = ctx.server(options.server, options.server_port)?;
