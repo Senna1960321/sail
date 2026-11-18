@@ -52,6 +52,8 @@ pub mod protocol;
 pub mod runtime;
 pub mod session;
 pub mod sniff;
+#[cfg(test)]
+pub(crate) mod test_ports;
 pub mod transport;
 pub mod user;
 pub mod util;
@@ -3175,12 +3177,9 @@ mod tests {
 
     #[test]
     fn test_restart() {
-        // A port of the system's choosing, so parallel test runs do not
-        // clash.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .unwrap()
-            .port();
+        // Not one the system hands out (`127.0.0.1:0`): another test may be
+        // given that between its being let go and the restart binding it.
+        let port = crate::test_ports::free_port();
         let conf = serde_json::json!({
             "log": { "level": "trace" },
             "inbounds": [{ "type": "socks", "listen": "127.0.0.1", "listen_port": port }],
