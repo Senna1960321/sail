@@ -133,9 +133,9 @@ Rust 定义：[`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sa
 | `client_certificate_path` | string | 未设置 | 支持 | `client_certificate`, by path. |
 | `client_key` | listable-string | 未设置 | 支持 | The inline PEM key of the client certificate. |
 | `client_key_path` | string | 未设置 | 支持 | `client_key`, by path. |
-| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
-| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do | — |
-| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
+| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
 | `spoof` | string | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `spoof_method` | string, 取值 `wrong-sequence`, `wrong-checksum`, `wrong-ack`, `wrong-md5`, `wrong-timestamp` | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `kernel_tx` | bool | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |
@@ -235,9 +235,9 @@ Rust 定义：[`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sa
 | `client_certificate_path` | string | 未设置 | 支持 | `client_certificate`, by path. |
 | `client_key` | listable-string | 未设置 | 支持 | The inline PEM key of the client certificate. |
 | `client_key_path` | string | 未设置 | 支持 | `client_key`, by path. |
-| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
-| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do | — |
-| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
+| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
 | `spoof` | string | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `spoof_method` | string, 取值 `wrong-sequence`, `wrong-checksum`, `wrong-ack`, `wrong-md5`, `wrong-timestamp` | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `kernel_tx` | bool | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |
@@ -409,9 +409,9 @@ Rust 定义：[`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sa
 | `client_certificate_path` | string | 未设置 | 支持 | `client_certificate`, by path. |
 | `client_key` | listable-string | 未设置 | 支持 | The inline PEM key of the client certificate. |
 | `client_key_path` | string | 未设置 | 支持 | `client_key`, by path. |
-| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
-| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do | — |
-| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
+| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
 | `spoof` | string | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `spoof_method` | string, 取值 `wrong-sequence`, `wrong-checksum`, `wrong-ack`, `wrong-md5`, `wrong-timestamp` | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `kernel_tx` | bool | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |
@@ -556,9 +556,9 @@ Rust 定义：[`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sa
 | `client_certificate_path` | string | 未设置 | 支持 | `client_certificate`, by path. |
 | `client_key` | listable-string | 未设置 | 支持 | The inline PEM key of the client certificate. |
 | `client_key_path` | string | 未设置 | 支持 | `client_key`, by path. |
-| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
-| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do | — |
-| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
+| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
 | `spoof` | string | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `spoof_method` | string, 取值 `wrong-sequence`, `wrong-checksum`, `wrong-ack`, `wrong-md5`, `wrong-timestamp` | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `kernel_tx` | bool | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |

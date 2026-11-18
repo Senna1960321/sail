@@ -921,7 +921,7 @@ impl Dispatcher {
                     reply.succeeded();
                 }
                 if let Some(how) = sess.route.tls_fragment {
-                    rhs = Box::new(super::router::fragment::FragmentStream::new(rhs, how));
+                    rhs = Box::new(crate::transport::fragment::FragmentStream::new(rhs, how));
                 }
                 let elapsed = tokio::time::Instant::now().duration_since(handshake_start);
 

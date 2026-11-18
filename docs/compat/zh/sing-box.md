@@ -26,6 +26,8 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 
 出站保留的承载连接（Hysteria2 连接、quic 与 grpc 传输层池中的连接、HTTP 代理的 HTTP/2 连接、mux 与 amux 会话）在 60 秒内没有任何打开的流或 UDP 会话时关闭，下一个连接重新拨号。分组当前选中的成员也是如此；sing-box 1.14.3 起保留它，只关闭没有任何规则或分组选择引用的出站。
 
+`fragment` 或 `record_fragment`（出站的 `tls`，或路由选项 `tls_fragment` 与 `tls_record_fragment`）切分 ClientHello 时，同 sing-box 在服务器名第一个标签内随机切分，但切点不落在名字首字节之前：sing-box 的切点可能落在那里，第二段仍含完整的名字。两者可以同时设置，此时每个 record 各占一个分段，同 sing-box；分段之间总是等待 `fragment_fallback_delay`，sing-box 在能判断的平台上等待该分段的 ACK。
+
 ## 汇总
 
 | 部分 | 字段数 | 支持 | 警告 | 报错 |
@@ -40,11 +42,11 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `network_namespaces` | 6 | 0 | 0 | 6 |
 | `endpoints` | 433 | 48 | 13 | 372 |
 | `inbounds` | 1367 | 651 | 116 | 600 |
-| `outbounds` | 1228 | 685 | 75 | 468 |
+| `outbounds` | 1228 | 700 | 78 | 450 |
 | `route` | 268 | 177 | 38 | 53 |
 | `services` | 751 | 1 | 166 | 584 |
 | `experimental` | 34 | 16 | 17 | 1 |
-| **全部** | **5003** | **2024** | **500** | **2479** |
+| **全部** | **5003** | **2039** | **503** | **2461** |
 
 ## `$schema`
 
@@ -1929,9 +1931,9 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `tls.client_certificate_path` | 支持 |  |
 | `tls.client_key` | 支持 |  |
 | `tls.client_key_path` | 支持 |  |
-| `tls.fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.fragment_fallback_delay` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.record_fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
+| `tls.fragment` | 支持 |  |
+| `tls.fragment_fallback_delay` | 支持 |  |
+| `tls.record_fragment` | 支持 |  |
 | `tls.spoof` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.spoof_method` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.kernel_tx` | 警告 | The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them |
@@ -2052,9 +2054,9 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `tls.client_certificate_path` | 支持 |  |
 | `tls.client_key` | 支持 |  |
 | `tls.client_key_path` | 支持 |  |
-| `tls.fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.fragment_fallback_delay` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.record_fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
+| `tls.fragment` | 支持 |  |
+| `tls.fragment_fallback_delay` | 支持 |  |
+| `tls.record_fragment` | 支持 |  |
 | `tls.spoof` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.spoof_method` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.kernel_tx` | 警告 | The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them |
@@ -2142,9 +2144,9 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `tls.client_certificate_path` | 支持 |  |
 | `tls.client_key` | 支持 |  |
 | `tls.client_key_path` | 支持 |  |
-| `tls.fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.fragment_fallback_delay` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.record_fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
+| `tls.fragment` | 报错 | Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello |
+| `tls.fragment_fallback_delay` | 警告 | Only for fragmenting the TLS handshake, which sail does not do here |
+| `tls.record_fragment` | 报错 | Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello |
 | `tls.spoof` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.spoof_method` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.kernel_tx` | 警告 | The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them |
@@ -2293,9 +2295,9 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `tls.client_certificate_path` | 支持 |  |
 | `tls.client_key` | 支持 |  |
 | `tls.client_key_path` | 支持 |  |
-| `tls.fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.fragment_fallback_delay` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.record_fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
+| `tls.fragment` | 报错 | Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello |
+| `tls.fragment_fallback_delay` | 警告 | Only for fragmenting the TLS handshake, which sail does not do here |
+| `tls.record_fragment` | 报错 | Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello |
 | `tls.spoof` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.spoof_method` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.kernel_tx` | 警告 | The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them |
@@ -2414,9 +2416,9 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `tls.client_certificate_path` | 支持 |  |
 | `tls.client_key` | 支持 |  |
 | `tls.client_key_path` | 支持 |  |
-| `tls.fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.fragment_fallback_delay` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.record_fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
+| `tls.fragment` | 支持 |  |
+| `tls.fragment_fallback_delay` | 支持 |  |
+| `tls.record_fragment` | 支持 |  |
 | `tls.spoof` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.spoof_method` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.kernel_tx` | 警告 | The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them |
@@ -2527,9 +2529,9 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `tls.client_certificate_path` | 支持 |  |
 | `tls.client_key` | 支持 |  |
 | `tls.client_key_path` | 支持 |  |
-| `tls.fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.fragment_fallback_delay` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.record_fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
+| `tls.fragment` | 报错 | Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello |
+| `tls.fragment_fallback_delay` | 警告 | Only for fragmenting the TLS handshake, which sail does not do here |
+| `tls.record_fragment` | 报错 | Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello |
 | `tls.spoof` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.spoof_method` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.kernel_tx` | 警告 | The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them |
@@ -2622,9 +2624,9 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `tls.client_certificate_path` | 支持 |  |
 | `tls.client_key` | 支持 |  |
 | `tls.client_key_path` | 支持 |  |
-| `tls.fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.fragment_fallback_delay` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.record_fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
+| `tls.fragment` | 支持 |  |
+| `tls.fragment_fallback_delay` | 支持 |  |
+| `tls.record_fragment` | 支持 |  |
 | `tls.spoof` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.spoof_method` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.kernel_tx` | 警告 | The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them |
@@ -2734,9 +2736,9 @@ Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_
 | `tls.client_certificate_path` | 支持 |  |
 | `tls.client_key` | 支持 |  |
 | `tls.client_key_path` | 支持 |  |
-| `tls.fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.fragment_fallback_delay` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
-| `tls.record_fragment` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
+| `tls.fragment` | 支持 |  |
+| `tls.fragment_fallback_delay` | 支持 |  |
+| `tls.record_fragment` | 支持 |  |
 | `tls.spoof` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.spoof_method` | 报错 | Fragmenting or spoofing the TLS handshake against censorship |
 | `tls.kernel_tx` | 警告 | The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them |

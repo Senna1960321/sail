@@ -431,13 +431,19 @@ pub const GROUPS: &[Group] = &[
     g(
         TLS_FRAGMENT,
         Unsupported,
-        &[
-            "outbounds.*.tls.fragment",
-            "outbounds.*.tls.fragment_fallback_delay",
-            "outbounds.*.tls.record_fragment",
-            "outbounds.*.tls.spoof",
-            "outbounds.*.tls.spoof_method",
-        ],
+        &["outbounds.*.tls.spoof", "outbounds.*.tls.spoof_method"],
+    ),
+    t(
+        "Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello",
+        Unsupported,
+        &["hysteria2", "tuic", "shadowtls"],
+        &["outbounds.*.tls.fragment", "outbounds.*.tls.record_fragment"],
+    ),
+    t(
+        "Only for fragmenting the TLS handshake, which sail does not do here",
+        Ignored,
+        &["hysteria2", "tuic", "shadowtls"],
+        &["outbounds.*.tls.fragment_fallback_delay"],
     ),
     // TUN.
     g(

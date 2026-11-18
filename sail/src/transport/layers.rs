@@ -203,6 +203,20 @@ pub struct OutboundTls {
     /// The browser the ClientHello imitates. Unset, it is Chrome's.
     #[serde(default)]
     pub utls: Option<OutboundUtls>,
+    /// sing-box 1.12's: the ClientHello goes out in TCP segments, cut in
+    /// its server name, `fragment_fallback_delay` apart.
+    #[serde(default)]
+    pub fragment: bool,
+    /// The wait between those segments; unset (or zero), 500ms. sing-box
+    /// waits for the segment's ACK where it can tell, which sail does not
+    /// yet.
+    #[serde(default, with = "crate::config::model::duration")]
+    pub fragment_fallback_delay: Option<std::time::Duration>,
+    /// sing-box 1.12's: the ClientHello goes out as TLS records, cut in its
+    /// server name, in one write; with `fragment`, each record a segment of
+    /// its own.
+    #[serde(default)]
+    pub record_fragment: bool,
 }
 
 /// Unlike sing-box, a browser fingerprint is on by default: set
@@ -225,6 +239,19 @@ fn default_fingerprint() -> String {
 }
 
 impl OutboundTls {
+    /// How the ClientHello is cut, as `fragment` and `record_fragment` say;
+    /// None when it is not.
+    #[cfg(any(feature = "outbound-tls", feature = "outbound-reality"))]
+    pub(crate) fn hello_fragment(&self) -> Option<crate::session::TlsFragment> {
+        crate::session::TlsFragment::of(
+            self.fragment,
+            self.record_fragment,
+            self.fragment_fallback_delay
+                .filter(|d| !d.is_zero())
+                .unwrap_or(crate::transport::fragment::FALLBACK_DELAY),
+        )
+    }
+
     /// The ClientHello fingerprint, or None for BoringSSL's own.
     #[cfg(any(
         feature = "outbound-tls",
@@ -1382,7 +1409,8 @@ fn tls_outbound(
                         )
                     })?,
                 )
-                .map_err(|e| anyhow!("[{}] outbound: tls.reality: {}", tag, e))?,
+                .map_err(|e| anyhow!("[{}] outbound: tls.reality: {}", tag, e))?
+                .with_fragment(tls.hello_fragment()),
             ))
             .build());
         #[cfg(not(feature = "outbound-reality"))]
@@ -1467,6 +1495,7 @@ fn tls_stream_handler(
         &env.tls_roots.get()?,
         &options,
     )
+    .map(|handler| handler.with_fragment(tls.hello_fragment()))
 }
 
 /// An ECHConfigList as the TLS handler takes it: base64, from base64 or from
@@ -2645,6 +2674,54 @@ mod tests {
 
     fn tls(json: &str) -> OutboundTls {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// sing-box's `fragment`, `record_fragment` and
+    /// `fragment_fallback_delay`, alone or together; off by default.
+    #[test]
+    #[cfg(any(feature = "outbound-tls", feature = "outbound-reality"))]
+    fn hello_fragment_is_as_the_fields_say() {
+        use crate::session::TlsFragment;
+        use std::time::Duration;
+        let default = crate::transport::fragment::FALLBACK_DELAY;
+        assert_eq!(tls(r#"{"enabled": true}"#).hello_fragment(), None);
+        assert_eq!(
+            tls(r#"{"enabled": true, "fragment_fallback_delay": "1s"}"#).hello_fragment(),
+            None
+        );
+        assert_eq!(
+            tls(r#"{"enabled": true, "record_fragment": true}"#).hello_fragment(),
+            Some(TlsFragment {
+                records: true,
+                segments: None
+            })
+        );
+        assert_eq!(
+            tls(r#"{"enabled": true, "fragment": true}"#).hello_fragment(),
+            Some(TlsFragment {
+                records: false,
+                segments: Some(default)
+            })
+        );
+        assert_eq!(
+            tls(r#"{"enabled": true, "fragment": true, "fragment_fallback_delay": "0s"}"#)
+                .hello_fragment(),
+            Some(TlsFragment {
+                records: false,
+                segments: Some(default)
+            })
+        );
+        assert_eq!(
+            tls(
+                r#"{"enabled": true, "fragment": true, "record_fragment": true,
+                    "fragment_fallback_delay": "20ms"}"#
+            )
+            .hello_fragment(),
+            Some(TlsFragment {
+                records: true,
+                segments: Some(Duration::from_millis(20))
+            })
+        );
     }
 
     #[test]

@@ -81,6 +81,13 @@ fn build(ctx: &mut OutboundContext<'_>) -> Result<AnyOutboundHandler> {
             tag
         ));
     }
+    if tls.fragment || tls.record_fragment {
+        return Err(anyhow!(
+            "[{}] outbound: tls.fragment, tls.record_fragment: not with ShadowTLS, whose \
+             ClientHello the server reads",
+            tag
+        ));
+    }
     let identity = tls
         .client_identity(ctx.env)
         .map_err(|e| anyhow!("[{}] outbound: tls.{}", tag, e))?;

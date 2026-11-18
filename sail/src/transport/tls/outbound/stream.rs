@@ -17,6 +17,8 @@ pub struct Handler {
     client: TlsClient,
     ech: Option<Ech>,
     dns_client: SyncDnsClient,
+    /// How the ClientHello is cut, if it is.
+    fragment: Option<crate::session::TlsFragment>,
 }
 
 struct Ech {
@@ -66,7 +68,15 @@ impl Handler {
                 disable_dns_lookup: ech_disable_dns_lookup,
             }),
             dns_client,
+            fragment: None,
         })
+    }
+
+    /// The ClientHello cut as `fragment` says (`tls.fragment`,
+    /// `tls.record_fragment`).
+    pub fn with_fragment(mut self, fragment: Option<crate::session::TlsFragment>) -> Self {
+        self.fragment = fragment;
+        self
     }
 
     /// TLS over `stream` for `sess`, as `handle` makes it, the stream as it
@@ -83,6 +93,10 @@ impl Handler {
             sess.destination.host()
         };
         let ech_config_list = self.select_ech_config_list(&name, sess).await?;
+        let stream: AnyStream = match self.fragment {
+            Some(how) => Box::new(crate::transport::fragment::FragmentStream::new(stream, how)),
+            None => stream,
+        };
         trace!(
             "handling TLS {}, ech_enabled={}, ech_config_selected={}",
             &name,
@@ -271,6 +285,188 @@ mod tests {
             .unwrap();
         assert_eq!(list, None);
         assert_eq!(queries.load(Ordering::SeqCst), 0, "DNS was asked");
+    }
+
+    /// A transport that keeps what each write handed it, apart.
+    struct Tap {
+        inner: tokio::io::DuplexStream,
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl tokio::io::AsyncRead for Tap {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Tap {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = &mut *self;
+            let n = futures::ready!(std::pin::Pin::new(&mut this.inner).poll_write(cx, buf))?;
+            this.writes.lock().unwrap().push(buf[..n].to_vec());
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// The TLS records `bytes` begins with, type and body each, as far as
+    /// they are whole.
+    fn records(mut bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut records = Vec::new();
+        while bytes.len() >= 5 {
+            let len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+            if bytes.len() < 5 + len {
+                break;
+            }
+            records.push((bytes[0], bytes[5..5 + len].to_vec()));
+            bytes = &bytes[5 + len..];
+        }
+        records
+    }
+
+    /// The writes a real TLS client made with `fragment`, against a real
+    /// server, after the handshake and a round trip.
+    async fn handshake_cut(fragment: crate::session::TlsFragment) -> Vec<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (acceptor, pem) =
+            crate::transport::tls::tests::acceptor_picking(b"h2", Default::default());
+        let handler = Handler::new(
+            "localhost".to_string(),
+            vec![],
+            Some(pem),
+            false,
+            Some(crate::transport::tls::Fingerprint::Chrome),
+            false,
+            None,
+            false,
+            false,
+            None,
+            new_test_dns_client(),
+            &crate::transport::tls::tests::test_roots(),
+            &Default::default(),
+        )
+        .unwrap()
+        .with_fragment(Some(fragment));
+        let (c, s) = tokio::io::duplex(64 * 1024);
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tap = Tap {
+            inner: c,
+            writes: writes.clone(),
+        };
+        let sess = Session::default();
+        let (client, server) = tokio::join!(
+            handler.connect_tls(&sess, Box::new(tap)),
+            crate::transport::tls::tests::accept(&acceptor, s),
+        );
+        let (mut client, mut server) = (client.unwrap(), server.unwrap());
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        let mut buf = [0; 4];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        let mut made = Vec::new();
+        made.extend(writes.lock().unwrap().iter().cloned());
+        made
+    }
+
+    /// The ClientHello the handshake records of `bytes` carry, checked to
+    /// name `localhost` whole while no record does.
+    fn assert_hello_cut(records: &[(u8, Vec<u8>)]) {
+        assert!(records.len() >= 2, "{} records", records.len());
+        let mut handshake = Vec::new();
+        for (kind, body) in records {
+            assert_eq!(*kind, 22, "a handshake record");
+            assert!(
+                !body.windows(9).any(|w| w == b"localhost"),
+                "a record holds the whole name"
+            );
+            handshake.extend_from_slice(body);
+        }
+        assert_eq!(handshake[0], 1, "a ClientHello");
+        let len =
+            (handshake[1] as usize) << 16 | (handshake[2] as usize) << 8 | handshake[3] as usize;
+        assert_eq!(
+            handshake.len(),
+            4 + len,
+            "the whole ClientHello and no more"
+        );
+        assert!(handshake.windows(9).any(|w| w == b"localhost"));
+    }
+
+    /// `record_fragment`: the ClientHello goes out as two TLS records in one
+    /// write, and the handshake completes.
+    #[tokio::test]
+    async fn record_fragment_sends_the_hello_as_records_in_one_write() {
+        let writes = handshake_cut(crate::session::TlsFragment {
+            records: true,
+            segments: None,
+        })
+        .await;
+        let first = records(&writes[0]);
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            first.iter().map(|(_, b)| 5 + b.len()).sum::<usize>(),
+            writes[0].len(),
+            "the first write is the two records and nothing else"
+        );
+        assert_hello_cut(&first);
+    }
+
+    /// `fragment` with `record_fragment`: each record a write of its own.
+    #[tokio::test]
+    async fn fragment_and_record_fragment_send_a_record_a_write() {
+        let writes = handshake_cut(crate::session::TlsFragment {
+            records: true,
+            segments: Some(std::time::Duration::from_millis(10)),
+        })
+        .await;
+        let mut cut = Vec::new();
+        for write in &writes[..2] {
+            let records = records(write);
+            assert_eq!(records.len(), 1);
+            assert_eq!(5 + records[0].1.len(), write.len());
+            cut.extend(records);
+        }
+        assert_hello_cut(&cut);
+    }
+
+    /// `fragment` alone: one record, cut across two writes.
+    #[tokio::test]
+    async fn fragment_sends_one_record_in_two_writes() {
+        let writes = handshake_cut(crate::session::TlsFragment {
+            records: false,
+            segments: Some(std::time::Duration::from_millis(10)),
+        })
+        .await;
+        for write in &writes[..2] {
+            assert!(!write.windows(9).any(|w| w == b"localhost"));
+        }
+        let joined = [writes[0].clone(), writes[1].clone()].concat();
+        let hello = records(&joined);
+        assert_eq!(hello.len(), 1);
+        assert_eq!(5 + hello[0].1.len(), joined.len());
+        assert!(hello[0].1.windows(9).any(|w| w == b"localhost"));
     }
 
     #[test]

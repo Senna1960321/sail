@@ -220,12 +220,15 @@ pub fn present(crypto: &mut quinn_btls::ClientConfig, identity: &Identity) -> Re
     Ok(())
 }
 
-/// The first of `tls.reality` and `tls.utls` that the block enables:
-/// neither works over QUIC.
+/// The first of `tls.reality`, `tls.utls`, `tls.fragment` and
+/// `tls.record_fragment` that the block enables: none works over QUIC,
+/// whose ClientHello goes in Initial packets, not TCP.
 pub fn unsupported(tls: &OutboundTls) -> Option<&'static str> {
     [
         ("reality", tls.reality.as_ref().is_some_and(|r| r.enabled)),
         ("utls", tls.utls.as_ref().is_some_and(|u| u.enabled)),
+        ("fragment", tls.fragment),
+        ("record_fragment", tls.record_fragment),
     ]
     .into_iter()
     .find_map(|(field, on)| on.then_some(field))

@@ -3362,7 +3362,7 @@
     "fragment_fallback_delay": {
      "type": "string",
      "deprecated": true,
-     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do"
+     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do. The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
      "not": {},
@@ -3845,7 +3845,7 @@
     "fragment_fallback_delay": {
      "type": "string",
      "deprecated": true,
-     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do"
+     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do. The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
      "not": {},
@@ -4701,7 +4701,7 @@
     "fragment_fallback_delay": {
      "type": "string",
      "deprecated": true,
-     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do"
+     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do. The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
      "not": {},
@@ -5388,7 +5388,7 @@
     "fragment_fallback_delay": {
      "type": "string",
      "deprecated": true,
-     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do"
+     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do. The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
      "not": {},
@@ -14813,16 +14813,16 @@
      "description": "`client_key`, by path."
     },
     "fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart."
     },
     "fragment_fallback_delay": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "string",
+     "description": "The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own."
     },
     "spoof": {
      "not": {},
@@ -15746,16 +15746,16 @@
      "description": "`client_key`, by path."
     },
     "fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart."
     },
     "fragment_fallback_delay": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "string",
+     "description": "The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own."
     },
     "spoof": {
      "not": {},
@@ -16853,15 +16853,16 @@
     },
     "fragment": {
      "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "description": "sail refuses this field: Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello"
     },
     "fragment_fallback_delay": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "string",
+     "deprecated": true,
+     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do here. The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
      "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "description": "sail refuses this field: Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello"
     },
     "spoof": {
      "not": {},
@@ -18342,15 +18343,16 @@
     },
     "fragment": {
      "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "description": "sail refuses this field: Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello"
     },
     "fragment_fallback_delay": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "string",
+     "deprecated": true,
+     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do here. The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
      "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "description": "sail refuses this field: Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello"
     },
     "spoof": {
      "not": {},
@@ -19449,16 +19451,16 @@
      "description": "`client_key`, by path."
     },
     "fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart."
     },
     "fragment_fallback_delay": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "string",
+     "description": "The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own."
     },
     "spoof": {
      "not": {},
@@ -20173,15 +20175,16 @@
     },
     "fragment": {
      "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "description": "sail refuses this field: Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello"
     },
     "fragment_fallback_delay": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "string",
+     "deprecated": true,
+     "description": "sail ignores this field, with a warning: Only for fragmenting the TLS handshake, which sail does not do here. The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
      "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "description": "sail refuses this field: Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello"
     },
     "spoof": {
      "not": {},
@@ -20956,16 +20959,16 @@
      "description": "`client_key`, by path."
     },
     "fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart."
     },
     "fragment_fallback_delay": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "string",
+     "description": "The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own."
     },
     "spoof": {
      "not": {},
@@ -21759,16 +21762,16 @@
      "description": "`client_key`, by path."
     },
     "fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart."
     },
     "fragment_fallback_delay": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "string",
+     "description": "The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet."
     },
     "record_fragment": {
-     "not": {},
-     "description": "sail refuses this field: Fragmenting or spoofing the TLS handshake against censorship"
+     "type": "boolean",
+     "description": "sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own."
     },
     "spoof": {
      "not": {},

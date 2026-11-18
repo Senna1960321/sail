@@ -335,6 +335,11 @@ impl Upstream {
             if tls.ech.is_some() {
                 return Err(anyhow!("tls.ech: not for a dns server"));
             }
+            if tls.fragment || tls.record_fragment {
+                return Err(anyhow!(
+                    "tls.fragment, tls.record_fragment: not for a dns server"
+                ));
+            }
             if tls.disable_sni && matches!(protocol, Protocol::Quic | Protocol::H3) {
                 // As for QUIC outbounds: quinn-btls sends the SNI of every
                 // name but an IP address.
@@ -781,6 +786,24 @@ impl super::DnsClient {
 #[cfg(all(test, any(feature = "dns-doh", feature = "dns-h3")))]
 mod tests {
     use super::*;
+
+    /// A DNS server's TLS takes neither ClientHello cut (sail#61): only
+    /// outbounds' do.
+    #[test]
+    fn a_dns_servers_tls_takes_no_fragment() {
+        for field in ["fragment", "record_fragment"] {
+            let json = format!(
+                r#"{{"dns": {{"servers": [{{"type": "tls", "tag": "t", "server": "1.1.1.1",
+                    "tls": {{"enabled": true, "{}": true}}}}]}}}}"#,
+                field
+            );
+            let err = match crate::config::Config::from_json(&json) {
+                Ok(_) => panic!("tls.{} was taken for a dns server", field),
+                Err(e) => format!("{:#}", e),
+            };
+            assert!(err.contains(field), "{}", err);
+        }
+    }
 
     /// A connection given up by its pool goes on while a query holds it,
     /// and stops when the last lets go, or at once when stopped.

@@ -81,7 +81,6 @@ pub(crate) mod rule_set {
     }
 }
 
-pub(crate) mod fragment;
 pub(crate) mod hijack_dns;
 
 use std::collections::VecDeque;
@@ -235,7 +234,7 @@ struct OptionsSet {
 
 /// How long apart the pieces of a fragmented ClientHello go when the rule
 /// does not say, as in sing-box.
-const TLS_FRAGMENT_DELAY: Duration = Duration::from_millis(500);
+const TLS_FRAGMENT_DELAY: Duration = crate::transport::fragment::FALLBACK_DELAY;
 
 impl Options {
     fn new(rule: &model::Rule, path: &str) -> Result<Self> {
@@ -257,16 +256,12 @@ impl Options {
                 )
             })?),
         };
-        let tls_fragment = if rule.tls_fragment {
-            Some(TlsFragment::Segments(
-                rule.tls_fragment_fallback_delay
-                    .unwrap_or(TLS_FRAGMENT_DELAY),
-            ))
-        } else if rule.tls_record_fragment {
-            Some(TlsFragment::Records)
-        } else {
-            None
-        };
+        let tls_fragment = TlsFragment::of(
+            rule.tls_fragment,
+            rule.tls_record_fragment,
+            rule.tls_fragment_fallback_delay
+                .unwrap_or(TLS_FRAGMENT_DELAY),
+        );
         let set = OptionsSet {
             override_address,
             override_port: rule.override_port,
@@ -2143,7 +2138,13 @@ mod tests {
         );
         assert_eq!(route.udp_timeout, Some(Duration::from_secs(10)));
         assert!(route.udp_connect && route.udp_disable_domain_unmapping);
-        assert_eq!(route.tls_fragment, Some(TlsFragment::Records));
+        assert_eq!(
+            route.tls_fragment,
+            Some(TlsFragment {
+                records: true,
+                segments: None
+            })
+        );
 
         // A port alone keeps the address; the first destination is kept.
         let router = self::router(serde_json::json!([
@@ -2163,7 +2164,10 @@ mod tests {
         );
         assert_eq!(
             sess.route.tls_fragment,
-            Some(TlsFragment::Segments(TLS_FRAGMENT_DELAY))
+            Some(TlsFragment {
+                records: false,
+                segments: Some(TLS_FRAGMENT_DELAY)
+            })
         );
     }
 
@@ -2181,7 +2185,31 @@ mod tests {
         assert_eq!(sess.destination, to("[::1]:443").destination);
         assert_eq!(
             sess.route.tls_fragment,
-            Some(TlsFragment::Segments(Duration::from_millis(10)))
+            Some(TlsFragment {
+                records: false,
+                segments: Some(Duration::from_millis(10))
+            })
+        );
+    }
+
+    /// As in sing-box, both cuts combine: each record a segment of its own.
+    #[tokio::test]
+    async fn tls_fragment_and_tls_record_fragment_combine() {
+        let router = router(serde_json::json!([
+            { "port": 443, "outbound": "a", "tls_fragment": true,
+              "tls_record_fragment": true },
+        ]));
+        let mut sess = to("x.test:443");
+        assert_eq!(
+            pick(&router, &mut sess).await,
+            Decision::Route(Some("a".into()))
+        );
+        assert_eq!(
+            sess.route.tls_fragment,
+            Some(TlsFragment {
+                records: true,
+                segments: Some(TLS_FRAGMENT_DELAY)
+            })
         );
     }
 

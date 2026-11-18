@@ -56,6 +56,7 @@ pub mod tls_stream;
 #[cfg(any(feature = "inbound-ws", feature = "outbound-ws"))]
 pub mod ws;
 
+pub(crate) mod fragment;
 pub mod layers;
 pub mod uot;
 #[cfg(any(

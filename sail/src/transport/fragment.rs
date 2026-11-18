@@ -1,8 +1,9 @@
-//! `tls_fragment` and `tls_record_fragment`: the first thing written to an
-//! outbound stream, when it is a TLS ClientHello, goes out cut in its
+//! `tls_fragment` and `tls_record_fragment` (route options), and an
+//! outbound's `tls.fragment` and `tls.record_fragment`: the first thing
+//! written to a stream, when it is a TLS ClientHello, goes out cut in its
 //! server name, so that a middlebox reading one segment or one record
 //! does not see the whole name. As sing-box's `tf.Conn`, the cut falls at
-//! random within the name's first label.
+//! random within the name's first label, after its first byte.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -16,6 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::session::TlsFragment;
 
 const RECORD_HEADER_LEN: usize = 5;
+
+/// The wait between segments unless one is configured, sing-box's.
+pub(crate) const FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Where the server name is in a ClientHello record, and the name.
 #[derive(Debug, PartialEq, Eq)]
@@ -86,26 +90,38 @@ pub(crate) fn cut(hello: &[u8], how: TlsFragment) -> Option<Vec<Vec<u8>>> {
     if first_label == 0 {
         return None;
     }
-    let at = sni.index + rand::thread_rng().gen_range(0..first_label);
+    // Never before the name's first byte, as sing-box's may: the second
+    // piece would then hold the whole name. A one-letter label is cut
+    // before it all the same.
+    let at = sni.index + rand::thread_rng().gen_range(1.min(first_label - 1)..first_label);
     let pieces = [&hello[..at], &hello[at..]];
-    match how {
-        TlsFragment::Segments(_) => Some(pieces.iter().map(|p| p.to_vec()).collect()),
-        TlsFragment::Records => {
-            // Each piece of the handshake in a record of its own, with the
-            // first record's type and version.
-            let mut records = Vec::with_capacity(hello.len() + RECORD_HEADER_LEN);
-            for (i, piece) in pieces.iter().enumerate() {
+    let pieces: Vec<Vec<u8>> = if how.records {
+        // Each piece of the handshake in a record of its own, with the
+        // first record's type and version.
+        pieces
+            .iter()
+            .enumerate()
+            .map(|(i, piece)| {
                 let piece = if i == 0 {
                     &piece[RECORD_HEADER_LEN..]
                 } else {
                     piece
                 };
-                records.extend_from_slice(&hello[..3]);
-                records.extend_from_slice(&(piece.len() as u16).to_be_bytes());
-                records.extend_from_slice(piece);
-            }
-            Some(vec![records])
-        }
+                let mut record = Vec::with_capacity(RECORD_HEADER_LEN + piece.len());
+                record.extend_from_slice(&hello[..3]);
+                record.extend_from_slice(&(piece.len() as u16).to_be_bytes());
+                record.extend_from_slice(piece);
+                record
+            })
+            .collect()
+    } else {
+        pieces.iter().map(|p| p.to_vec()).collect()
+    };
+    if how.segments.is_some() {
+        Some(pieces)
+    } else {
+        // Records alone go out in one write.
+        Some(vec![pieces.concat()])
     }
 }
 
@@ -146,6 +162,44 @@ impl<S: AsyncRead + Unpin> AsyncRead for FragmentStream<S> {
     }
 }
 
+impl<S: AsyncWrite + Unpin> FragmentStream<S> {
+    /// Writes the pieces left, each flushed to go out on its own, then
+    /// `buf` as it is; once the pieces are out, the write they stand for is
+    /// done.
+    fn poll_pending(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        while let Some(piece) = self.pending.front() {
+            if let Some(delay) = self.delay.as_mut() {
+                futures::ready!(delay.as_mut().poll(cx));
+                self.delay = None;
+            }
+            if self.written < piece.len() {
+                let n = futures::ready!(
+                    Pin::new(&mut self.inner).poll_write(cx, &piece[self.written..])
+                )?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                self.written += n;
+                continue;
+            }
+            // Each piece is flushed, to go out in a segment of its own.
+            futures::ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+            self.pending.pop_front();
+            self.written = 0;
+            if let (false, Some(delay)) = (self.pending.is_empty(), self.how.segments) {
+                self.delay = Some(Box::pin(tokio::time::sleep(delay)));
+            }
+            if self.pending.is_empty() {
+                return Poll::Ready(Ok(self.accepted));
+            }
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+}
+
 impl<S: AsyncWrite + Unpin> AsyncWrite for FragmentStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -160,33 +214,36 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FragmentStream<S> {
                 this.accepted = buf.len();
             }
         }
-        while let Some(piece) = this.pending.front() {
-            if let Some(delay) = this.delay.as_mut() {
-                futures::ready!(delay.as_mut().poll(cx));
-                this.delay = None;
+        this.poll_pending(cx, buf)
+    }
+
+    /// A ClientHello handed over in several buffers is cut whole.
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        if this.first {
+            let whole: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
+            if whole.is_empty() {
+                return Poll::Ready(Ok(0));
             }
-            if this.written < piece.len() {
-                let n = futures::ready!(
-                    Pin::new(&mut this.inner).poll_write(cx, &piece[this.written..])
-                )?;
-                if n == 0 {
-                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                }
-                this.written += n;
-                continue;
-            }
-            // Each piece is flushed, to go out in a segment of its own.
-            futures::ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
-            this.pending.pop_front();
-            this.written = 0;
-            if let (false, TlsFragment::Segments(delay)) = (this.pending.is_empty(), this.how) {
-                this.delay = Some(Box::pin(tokio::time::sleep(delay)));
-            }
-            if this.pending.is_empty() {
-                return Poll::Ready(Ok(this.accepted));
+            this.first = false;
+            if let Some(pieces) = cut(&whole, this.how) {
+                this.pending = pieces.into();
+                this.accepted = whole.len();
+                return this.poll_pending(cx, &[]);
             }
         }
-        Pin::new(&mut this.inner).poll_write(cx, buf)
+        if !this.pending.is_empty() {
+            return this.poll_pending(cx, &[]);
+        }
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -203,6 +260,31 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const RECORDS: TlsFragment = TlsFragment {
+        records: true,
+        segments: None,
+    };
+
+    fn segments(delay: Duration) -> TlsFragment {
+        TlsFragment {
+            records: false,
+            segments: Some(delay),
+        }
+    }
+
+    /// The records `bytes` holds, header and body each, in order.
+    fn records_of(mut bytes: &[u8]) -> Vec<(&[u8], &[u8])> {
+        let mut records = Vec::new();
+        while bytes.len() >= RECORD_HEADER_LEN {
+            let len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+            let (record, rest) = bytes.split_at(RECORD_HEADER_LEN + len);
+            records.push(record.split_at(RECORD_HEADER_LEN));
+            bytes = rest;
+        }
+        assert!(bytes.is_empty(), "a record cut short");
+        records
+    }
 
     /// A ClientHello for `name`, as a client would send it.
     fn client_hello(name: &str) -> Vec<u8> {
@@ -253,17 +335,17 @@ mod tests {
         let hello = client_hello("www.example.com");
         let index = index_server_name(&hello).unwrap().index;
         for _ in 0..20 {
-            let pieces = cut(&hello, TlsFragment::Segments(Duration::ZERO)).unwrap();
+            let pieces = cut(&hello, segments(Duration::ZERO)).unwrap();
             assert_eq!(pieces.len(), 2);
             assert_eq!(pieces.concat(), hello);
-            assert!((index..index + 3).contains(&pieces[0].len()));
+            assert!((index + 1..index + 3).contains(&pieces[0].len()));
         }
     }
 
     #[test]
     fn records_carry_the_handshake_in_two() {
         let hello = client_hello("www.example.com");
-        let records = cut(&hello, TlsFragment::Records).unwrap().concat();
+        let records = cut(&hello, RECORDS).unwrap().concat();
         assert_eq!(records.len(), hello.len() + RECORD_HEADER_LEN);
         let first_len = u16::from_be_bytes([records[3], records[4]]) as usize;
         let second = &records[RECORD_HEADER_LEN + first_len..];
@@ -275,11 +357,67 @@ mod tests {
         assert_eq!(handshake, hello[RECORD_HEADER_LEN..]);
     }
 
+    /// Whatever the random cut, no piece after the first holds the whole
+    /// name: the cut never falls before its first byte (sing-box's may).
+    #[test]
+    fn the_second_piece_never_holds_the_whole_name() {
+        for name in ["ab.example.com", "www.example.com", "localhost"] {
+            let hello = client_hello(name);
+            for how in [
+                segments(Duration::ZERO),
+                TlsFragment {
+                    records: true,
+                    segments: Some(Duration::ZERO),
+                },
+            ] {
+                for _ in 0..200 {
+                    let pieces = cut(&hello, how).unwrap();
+                    assert_eq!(pieces.len(), 2);
+                    for piece in &pieces {
+                        assert!(
+                            !piece.windows(name.len()).any(|w| w == name.as_bytes()),
+                            "a piece holds {}",
+                            name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both: two records, each a piece of its own.
+    #[test]
+    fn records_and_segments_combine() {
+        let hello = client_hello("www.example.com");
+        let how = TlsFragment {
+            records: true,
+            segments: Some(Duration::ZERO),
+        };
+        let pieces = cut(&hello, how).unwrap();
+        assert_eq!(pieces.len(), 2);
+        let mut handshake = Vec::new();
+        for piece in &pieces {
+            let records = records_of(piece);
+            assert_eq!(records.len(), 1);
+            assert_eq!(&records[0].0[..3], &hello[..3]);
+            handshake.extend_from_slice(records[0].1);
+        }
+        assert_eq!(handshake, hello[RECORD_HEADER_LEN..]);
+        // Neither record holds the whole name.
+        for piece in &pieces {
+            assert!(!piece.windows(15).any(|w| w == b"www.example.com"));
+        }
+    }
+
     #[tokio::test]
     async fn the_stream_writes_the_pieces_then_the_rest_as_is() {
         for how in [
-            TlsFragment::Segments(Duration::from_millis(20)),
-            TlsFragment::Records,
+            segments(Duration::from_millis(20)),
+            RECORDS,
+            TlsFragment {
+                records: true,
+                segments: Some(Duration::from_millis(20)),
+            },
         ] {
             let (near, mut far) = tokio::io::duplex(1 << 16);
             let mut stream = FragmentStream::new(near, how);
@@ -291,21 +429,42 @@ mod tests {
             let mut got = Vec::new();
             far.read_to_end(&mut got).await.unwrap();
             assert!(got.ends_with(b"after"));
-            match how {
-                TlsFragment::Segments(delay) => {
-                    assert_eq!(&got[..hello.len()], hello);
-                    assert!(start.elapsed() >= delay);
-                }
-                TlsFragment::Records => assert_eq!(got.len(), hello.len() + 5 + 5),
+            if let Some(delay) = how.segments {
+                assert!(start.elapsed() >= delay);
+            }
+            if how.records {
+                assert_eq!(got.len(), hello.len() + 5 + 5);
+                assert_eq!(records_of(&got[..got.len() - 5]).len(), 2);
+            } else {
+                assert_eq!(&got[..hello.len()], hello);
             }
         }
         // What is not a ClientHello goes as it is.
         let (near, mut far) = tokio::io::duplex(1024);
-        let mut stream = FragmentStream::new(near, TlsFragment::Records);
+        let mut stream = FragmentStream::new(near, RECORDS);
         stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
         drop(stream);
         let mut got = Vec::new();
         far.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"GET / HTTP/1.1\r\n\r\n");
+    }
+
+    /// A ClientHello handed over as a vectored write, header and body
+    /// apart, is cut whole.
+    #[tokio::test]
+    async fn a_vectored_hello_is_cut_whole() {
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let mut stream = FragmentStream::new(near, RECORDS);
+        let hello = client_hello("www.example.com");
+        let (head, body) = hello.split_at(RECORD_HEADER_LEN);
+        let bufs = [io::IoSlice::new(head), io::IoSlice::new(body)];
+        let n = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_vectored(cx, &bufs))
+            .await
+            .unwrap();
+        assert_eq!(n, hello.len());
+        drop(stream);
+        let mut got = Vec::new();
+        far.read_to_end(&mut got).await.unwrap();
+        assert_eq!(records_of(&got).len(), 2);
     }
 }

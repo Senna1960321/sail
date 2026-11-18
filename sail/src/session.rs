@@ -716,13 +716,27 @@ impl Dialled {
     }
 }
 
-/// How a TLS ClientHello is cut, in its server name.
+/// How a TLS ClientHello is cut, in its server name: into TLS records, into
+/// TCP segments, or both (each record a segment of its own), as sing-box's
+/// `fragment` and `record_fragment` combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsFragment {
-    /// Into TCP segments, this long apart.
-    Segments(std::time::Duration),
-    /// Into TLS records, sent at once.
-    Records,
+pub struct TlsFragment {
+    /// Into TLS records.
+    pub records: bool,
+    /// Into TCP segments, this long apart; with `records`, one a record.
+    /// Without, the records go out in one write.
+    pub segments: Option<std::time::Duration>,
+}
+
+impl TlsFragment {
+    /// As `fragment` and `record_fragment` say, with `delay` between
+    /// segments; None when neither is set.
+    pub fn of(segments: bool, records: bool, delay: std::time::Duration) -> Option<Self> {
+        (segments || records).then_some(TlsFragment {
+            records,
+            segments: segments.then_some(delay),
+        })
+    }
 }
 
 impl Clone for Session {

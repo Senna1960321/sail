@@ -277,9 +277,9 @@ Rust 定义：[`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sa
 | `client_certificate_path` | string | 未设置 | 支持 | `client_certificate`, by path. |
 | `client_key` | listable-string | 未设置 | 支持 | The inline PEM key of the client certificate. |
 | `client_key_path` | string | 未设置 | 支持 | `client_key`, by path. |
-| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
-| `fragment_fallback_delay` | duration | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
-| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
+| `fragment` | bool | — | 报错：Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do here | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | — | 报错：Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
 | `spoof` | string | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `spoof_method` | string, 取值 `wrong-sequence`, `wrong-checksum`, `wrong-ack`, `wrong-md5`, `wrong-timestamp` | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `kernel_tx` | bool | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |
@@ -580,10 +580,48 @@ Rust 定义：[`ShadowTlsOutboundOptions`](https://github.com/peakpassvpn/sail/b
 | `server_port` | number | 必填 | 支持 | — |
 | `version` | number, 取值 `1`, `2`, `3` | `1` | 支持 | Must be 3: versions 1 and 2 are not supported. sing-box's default is 1. |
 | `password` | string | `""` | 支持 | Cannot be empty. |
-| `tls` | object → [对象](/sail/zh/reference/shared/#tls-outbounds) | 未设置 | 支持 | Must be enabled: the handshake with the site the server imitates, `server_name` being the site's (the server's address when unset). A browser fingerprint, disable_sni and a client certificate apply as for TLS; REALITY and ECH do not. |
+| `tls` | object → [对象](#outbounds-shadowtls-tls) | 未设置 | 支持 | Must be enabled: the handshake with the site the server imitates, `server_name` being the site's (the server's address when unset). A browser fingerprint, disable_sni and a client certificate apply as for TLS; REALITY and ECH do not. |
 | `domain_strategy` | string | 未设置 | 支持 (sing-box 已弃用) | sing-box's deprecated field for the families names resolve to, which a resolver's own `strategy` goes before. |
 | `skip_default_domain_resolver` | bool | `false` | sail 扩展 | A sail extension: without a `domain_resolver` of its own, the names dialled resolve as the DNS rules say, not as `route.default_domain_resolver` does; as Mihomo's DIRECT resolves apart from the proxies' servers. |
 | `tcp_concurrent` | bool | `false` | sail 扩展 | A sail extension, Mihomo's `tcp-concurrent`: a name's addresses are all connected to at once and the first to connect is taken, rather than one family's one by one, the other's raced against them after `fallback_delay` (Happy Eyeballs). With `network_strategy`, each address is still raced over the interfaces, so as many sockets open at once as there are addresses times interfaces. |
+
+<a id="outbounds-shadowtls-tls"></a>
+
+### `outbounds[shadowtls].tls`
+
+Rust 定义：[`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sail/src/transport/layers.rs)
+
+| 字段 | 类型 | 默认 | 状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | 支持 | — |
+| `engine` | string, 取值 `go`, `apple`, `windows` | — | 警告：The TLS stack: sail has one | — |
+| `disable_sni` | bool | `false` | 支持 | Sends no SNI. The certificate is still verified against `server_name`, unless `insecure`. |
+| `server_name` | string | 未设置 | 支持 | Defaults to the server's address. |
+| `insecure` | bool | `false` | 支持 | — |
+| `alpn` | listable-string | 未设置 | 支持 | — |
+| `min_version` | string, 取值 `1.0`, `1.1`, `1.2`, `1.3` | 未设置 | 支持 | The lowest TLS version to negotiate, `1.0` to `1.3`; unset, 1.2. |
+| `max_version` | string, 取值 `1.0`, `1.1`, `1.2`, `1.3` | 未设置 | 支持 | The highest; unset, 1.3. |
+| `cipher_suites` | listable-string | — | 报错：TLS cipher suites and key exchanges: sail's TLS would negotiate others than asked | — |
+| `curve_preferences` | listable-string, 取值 `P256`, `P384`, `P521`, `X25519`, `X25519MLKEM768` | — | 报错：TLS cipher suites and key exchanges: sail's TLS would negotiate others than asked | — |
+| `certificate` | listable-string | 未设置 | 支持 | An inline PEM certificate to trust. |
+| `certificate_path` | string | 未设置 | 支持 | A PEM certificate to trust, by path. |
+| `certificate_public_key_sha256` | listable-string\|array | 未设置 | 支持 | The SHA-256 hashes, base64, of the public keys to take a server's certificate by, in place of the certificates trusted, the name and `insecure`. |
+| `client_certificate` | listable-string | 未设置 | 支持 | An inline PEM certificate, its chain after it, presented when the server asks for one; with `client_key`. |
+| `client_certificate_path` | string | 未设置 | 支持 | `client_certificate`, by path. |
+| `client_key` | listable-string | 未设置 | 支持 | The inline PEM key of the client certificate. |
+| `client_key_path` | string | 未设置 | 支持 | `client_key`, by path. |
+| `fragment` | bool | — | 报错：Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do here | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | — | 报错：Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
+| `spoof` | string | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
+| `spoof_method` | string, 取值 `wrong-sequence`, `wrong-checksum`, `wrong-ack`, `wrong-md5`, `wrong-timestamp` | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
+| `kernel_tx` | bool | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |
+| `kernel_rx` | bool | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |
+| `handshake_timeout` | duration | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |
+| `ech` | object → [对象](/sail/zh/reference/shared/#ech-outbounds) | 未设置 | 支持 | — |
+| `utls` | object → [对象](/sail/zh/reference/shared/#utls-dns-servers-outbounds) | 未设置 | 支持 | The browser the ClientHello imitates. Unset, it is Chrome's. |
+| `reality` | object → [对象](/sail/zh/reference/shared/#reality-outbounds) | 未设置 | 支持 | — |
+| `certificate_sha256` | string 或 数组，元素为 string | 未设置 | sail 扩展 | sing-box 1.15's, with Mihomo's `fingerprint` semantics beyond it: the SHA-256 hashes, hex or base64, of whole certificates (DER) to take a server by, in place of the certificates trusted and `insecure`. A hash of the server's own certificate takes it outright: no CA and no name are checked, so that exact certificate is trusted for any server name. A hash of a certificate sent after it, an intermediate or a root, is the only CA the server's certificate is verified by, with the server name. With `certificate_public_key_sha256`, either passing is enough. |
 
 <a id="outbounds-smart"></a>
 
@@ -797,9 +835,9 @@ Rust 定义：[`OutboundTls`](https://github.com/peakpassvpn/sail/blob/master/sa
 | `client_certificate_path` | string | 未设置 | 支持 | `client_certificate`, by path. |
 | `client_key` | listable-string | 未设置 | 支持 | The inline PEM key of the client certificate. |
 | `client_key_path` | string | 未设置 | 支持 | `client_key`, by path. |
-| `fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
-| `fragment_fallback_delay` | duration | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
-| `record_fragment` | bool | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
+| `fragment` | bool | — | 报错：Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello | sing-box 1.12's: the ClientHello goes out in TCP segments, cut in its server name, `fragment_fallback_delay` apart. |
+| `fragment_fallback_delay` | duration | — | 警告：Only for fragmenting the TLS handshake, which sail does not do here | The wait between those segments; unset (or zero), 500ms. sing-box waits for the segment's ACK where it can tell, which sail does not yet. |
+| `record_fragment` | bool | — | 报错：Fragmenting the TLS handshake: over QUIC, or under ShadowTLS, whose server reads the ClientHello | sing-box 1.12's: the ClientHello goes out as TLS records, cut in its server name, in one write; with `fragment`, each record a segment of its own. |
 | `spoof` | string | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `spoof_method` | string, 取值 `wrong-sequence`, `wrong-checksum`, `wrong-ack`, `wrong-md5`, `wrong-timestamp` | — | 报错：Fragmenting or spoofing the TLS handshake against censorship | — |
 | `kernel_tx` | bool | — | 警告：The TLS stack, kernel TLS and the handshake's timeout: the same TLS without them | — |

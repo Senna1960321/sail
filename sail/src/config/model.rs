@@ -3253,12 +3253,6 @@ impl Rule {
                 path
             ));
         }
-        if self.tls_fragment && self.tls_record_fragment {
-            return Err(anyhow!(
-                "{}: tls_fragment and tls_record_fragment are exclusive",
-                path
-            ));
-        }
         if self.tls_fragment_fallback_delay.is_some() && !self.tls_fragment {
             return Err(anyhow!(
                 "{}.tls_fragment_fallback_delay: only with tls_fragment",
@@ -4785,10 +4779,6 @@ mod tests {
             (
                 r#"[{ "action": "reject", "port": 1, "method": "other" }]"#,
                 "route.rules[0].method",
-            ),
-            (
-                r#"[{ "action": "route-options", "tls_fragment": true, "tls_record_fragment": true }]"#,
-                "exclusive",
             ),
             (
                 r#"[{ "action": "route-options", "tls_fragment_fallback_delay": "1s" }]"#,

@@ -1717,7 +1717,14 @@ An outbound closes the carriers it keeps -- a Hysteria2 connection, a pooled con
 quic or grpc transport, an HTTP proxy's HTTP/2 connection, \
 a mux or amux session -- once nothing has been open on one for 60 s; the \
 next connection dials anew. So does the member a group selects, which sing-box 1.14.3 and later \
-keep: they close only the outbounds no rule or group selection references.",
+keep: they close only the outbounds no rule or group selection references.
+
+A ClientHello cut by `fragment` or `record_fragment` (an outbound's `tls`, or the route options \
+`tls_fragment` and `tls_record_fragment`) is cut at random inside its server name's first label, \
+as in sing-box, but never before the name's first byte: sing-box's cut may fall there, leaving \
+the whole name in the second piece. The two may be set together, each record then a segment of \
+its own, as sing-box allows; the wait between segments is always `fragment_fallback_delay`, \
+where sing-box waits for the segment's ACK on the platforms it can tell it.",
     summary: "## Summary",
     area: "Section",
     total: "Fields",
@@ -1764,7 +1771,9 @@ REALITY 出站无论 `tls.alpn` 如何都提供其指纹的 ALPN，因此经 REA
 
 Windows 无法实现的拨号字段在 Windows 上报错。已知缺口是 `tcp_fast_open`：Windows 只在连接调用本身（`ConnectEx`）里随 SYN 发送 Fast Open 数据，而 sail 在首次写入之前就已连接；Linux 和 macOS 则由内核把 SYN 留到首次写入。sing-box 的 tfo-go 返回自己的连接类型，在首次写入时才连接。`routing_mark` 与 `route.default_mark` 只在 Linux 上支持（Windows 没有 socket 标记，出口由 `bind_interface` 选择），`protect_path` 只在 Unix 上支持，`bind_address_no_port` 只在 Linux 上支持：Windows 接受 `SO_REUSE_UNICASTPORT`，但设了它的 socket 仍在 bind 时分到端口，读回该选项也是未设置，无法证明它起作用。
 
-出站保留的承载连接（Hysteria2 连接、quic 与 grpc 传输层池中的连接、HTTP 代理的 HTTP/2 连接、mux 与 amux 会话）在 60 秒内没有任何打开的流或 UDP 会话时关闭，下一个连接重新拨号。分组当前选中的成员也是如此；sing-box 1.14.3 起保留它，只关闭没有任何规则或分组选择引用的出站。",
+出站保留的承载连接（Hysteria2 连接、quic 与 grpc 传输层池中的连接、HTTP 代理的 HTTP/2 连接、mux 与 amux 会话）在 60 秒内没有任何打开的流或 UDP 会话时关闭，下一个连接重新拨号。分组当前选中的成员也是如此；sing-box 1.14.3 起保留它，只关闭没有任何规则或分组选择引用的出站。
+
+`fragment` 或 `record_fragment`（出站的 `tls`，或路由选项 `tls_fragment` 与 `tls_record_fragment`）切分 ClientHello 时，同 sing-box 在服务器名第一个标签内随机切分，但切点不落在名字首字节之前：sing-box 的切点可能落在那里，第二段仍含完整的名字。两者可以同时设置，此时每个 record 各占一个分段，同 sing-box；分段之间总是等待 `fragment_fallback_delay`，sing-box 在能判断的平台上等待该分段的 ACK。",
     summary: "## 汇总",
     area: "部分",
     total: "字段数",
