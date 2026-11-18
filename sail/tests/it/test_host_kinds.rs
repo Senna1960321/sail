@@ -1341,7 +1341,12 @@ mod retained_via {
         let live = instance.connections().await.unwrap();
         assert_eq!(live.len(), 1, "Via dials add no counted connection/place");
         assert_eq!(live[0].id, root);
-        assert_eq!((live[0].upload, live[0].download), (8, 16));
+        let counts = common::settled((8, 16), || async {
+            let live = &instance.connections().await.unwrap()[0];
+            (live.upload, live.download)
+        })
+        .await;
+        assert_eq!(counts, (8, 16));
         drop(send);
         // Inbound EOF alone leaves an ordinary UDP NAT until its idle
         // cleanup. End the host outbound explicitly, without waiting on
