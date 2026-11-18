@@ -83,6 +83,8 @@ pub struct Hop {
 }
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize)]
 pub struct Event {
+    /// Emission order in this sink, from 1; a poller tells new events by it.
+    pub sequence: u64,
     pub epoch: u64,
     pub flow_id: u64,
     pub parent_flow_id: u64,
@@ -119,9 +121,12 @@ impl Slot {
         _padding: [0; 512 - std::mem::size_of::<Option<Event>>()],
     };
 }
+// The 16 newest events: when full, a new event replaces the oldest.
 struct Ring {
     slots: [Slot; 16],
+    head: usize,
     len: usize,
+    sequence: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Snapshot {
@@ -129,8 +134,12 @@ pub struct Snapshot {
     pub fixture: &'static str,
     pub configured: bool,
     pub epoch: u64,
+    /// Events never stored: a foreign trace's, or the ring was busy.
     pub dropped: u64,
+    /// Stored events a newer one has since replaced.
+    pub overwritten: u64,
     pub snapshot_contended: bool,
+    /// The newest events, oldest first. Reading does not remove them.
     pub events: Vec<Event>,
 }
 impl Snapshot {
@@ -141,6 +150,7 @@ impl Snapshot {
             configured: false,
             epoch,
             dropped: 0,
+            overwritten: 0,
             snapshot_contended: false,
             events: Vec::new(),
         }
@@ -151,6 +161,7 @@ pub(crate) struct Sink {
     epoch: u64,
     next: AtomicU64,
     dropped: AtomicU64,
+    overwritten: AtomicU64,
     ring: Mutex<Ring>,
 }
 #[derive(Clone)]
@@ -193,6 +204,29 @@ pub(crate) fn error_kind(kind: io::ErrorKind) -> ErrorCode {
 pub(crate) fn current() -> Option<Trace> {
     CURRENT.try_with(Clone::clone).ok().flatten()
 }
+/// Records a stage's result on the current trace, if there is one.
+pub(crate) fn observe<T>(stage: Stage, result: &io::Result<T>) {
+    if let Some(trace) = current() {
+        trace.result(stage, result.as_ref().map(|_| ()).map_err(|e| e.kind()));
+    }
+}
+/// Records a layered outbound's transport connect on the current trace.
+pub(crate) fn observe_transport<T>(transport: &io::Result<Option<T>>) {
+    if let Some(trace) = current() {
+        let mut event = trace.event(Stage::ConnectTransport);
+        match transport {
+            Ok(stream) => {
+                event.result = Outcome::Accepted;
+                event.transport_present = stream.is_some();
+            }
+            Err(error) => {
+                event.result = Outcome::Failed;
+                event.error_kind = error_kind(error.kind());
+            }
+        }
+        trace.emit(event);
+    }
+}
 pub(crate) async fn scope<T>(trace: Option<Trace>, future: impl Future<Output = T>) -> T {
     CURRENT.scope(trace, future).await
 }
@@ -203,9 +237,12 @@ impl Sink {
             epoch,
             next: AtomicU64::new(1),
             dropped: AtomicU64::new(0),
+            overwritten: AtomicU64::new(0),
             ring: Mutex::new(Ring {
                 slots: [Slot::EMPTY; 16],
+                head: 0,
                 len: 0,
+                sequence: 0,
             }),
         })
     }
@@ -224,9 +261,8 @@ impl Sink {
     pub(crate) fn snapshot(&self) -> Snapshot {
         let (events, snapshot_contended) = match self.ring.try_lock() {
             Ok(ring) => (
-                ring.slots[..ring.len]
-                    .iter()
-                    .filter_map(|s| s.event)
+                (0..ring.len)
+                    .filter_map(|i| ring.slots[(ring.head + i) % ring.slots.len()].event)
                     .collect(),
                 false,
             ),
@@ -238,6 +274,7 @@ impl Sink {
             configured: true,
             epoch: self.epoch,
             dropped: self.dropped.load(Ordering::Relaxed),
+            overwritten: self.overwritten.load(Ordering::Relaxed),
             snapshot_contended,
             events,
         }
@@ -256,7 +293,7 @@ impl Trace {
             ..Event::default()
         }
     }
-    pub(crate) fn emit(&self, event: Event) {
+    pub(crate) fn emit(&self, mut event: Event) {
         if event.epoch != self.sink.epoch || event.flow_id != self.flow_id {
             self.sink.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -265,13 +302,38 @@ impl Trace {
             self.sink.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        let index = ring.len;
-        if index == 16 {
-            self.sink.dropped.fetch_add(1, Ordering::Relaxed);
+        ring.sequence += 1;
+        event.sequence = ring.sequence;
+        let capacity = ring.slots.len();
+        let index = if ring.len == capacity {
+            let oldest = ring.head;
+            ring.head = (ring.head + 1) % capacity;
+            self.sink.overwritten.fetch_add(1, Ordering::Relaxed);
+            oldest
+        } else {
+            ring.len += 1;
+            (ring.head + ring.len - 1) % capacity
+        };
+        ring.slots[index].event = Some(event);
+    }
+    /// Records a UoT write to the fixture: the encoded frame accepted by
+    /// the stream, or the write's error.
+    pub(crate) fn write<T>(&self, target: &SocksAddr, len: usize, result: &io::Result<T>) {
+        if !self.is_fixture(target) {
             return;
         }
-        ring.slots[index].event = Some(event);
-        ring.len += 1;
+        let mut event = self.event(WRITE);
+        event.address_kind = address_kind(target);
+        event.matches_fixture = true;
+        event.bytes = u32::try_from(len).unwrap_or(u32::MAX);
+        match result {
+            Ok(_) => event.result = Outcome::Accepted,
+            Err(error) => {
+                event.result = Outcome::Failed;
+                event.error_kind = error_kind(error.kind());
+            }
+        }
+        self.emit(event);
     }
     pub(crate) fn result(&self, stage: Stage, result: Result<(), io::ErrorKind>) {
         let mut event = self.event(stage);

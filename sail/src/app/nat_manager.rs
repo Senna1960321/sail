@@ -510,6 +510,25 @@ impl NatManager {
             debug!("drop udp packet from {}: {}", dgram_src, e);
             return;
         }
+        // One trace for the packet, whichever inbound sent it: its entry,
+        // queue and dispatch events share the flow a TUN began, or this one.
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        let trace = self.dispatcher.udp_target_trace(&pkt.dst_addr);
+        let send = self.send_restored(sess, dgram_src, inbound_tag, client_ch_tx, pkt);
+        #[cfg(feature = "internal-udp-target-diagnostics")]
+        super::udp_target_diagnostics::scope(trace, send).await;
+        #[cfg(not(feature = "internal-udp-target-diagnostics"))]
+        send.await
+    }
+
+    async fn send_restored(
+        &self,
+        sess: Option<&Session>,
+        dgram_src: &DatagramSource,
+        inbound_tag: &str,
+        client_ch_tx: &Sender<UdpPacket>,
+        pkt: UdpPacket,
+    ) {
         #[cfg(feature = "internal-udp-target-diagnostics")]
         let diagnostic_trace = self.dispatcher.udp_target_trace(&pkt.dst_addr);
         let key = NatKey::new(inbound_tag, dgram_src);
@@ -1549,5 +1568,46 @@ mod udp_target_tests {
         );
         assert!(env.scope.stop(Duration::from_secs(1)).await.clean());
         assert!(instance.dispatcher.udp_target_trace(&fixture).is_some());
+    }
+    /// A packet from an inbound that began no trace (not a TUN) is one
+    /// flow: its entry, queue and dispatch events share the flow ID.
+    #[tokio::test]
+    async fn udp_target_a_non_tun_packet_is_one_flow() {
+        let config = crate::config::Config::from_json("{}").unwrap();
+        let env = Arc::new(diag::test_env());
+        let instance = env
+            .scope
+            .enter(async {
+                crate::app::instance::Instance::build(
+                    &config,
+                    config.route.rules.clone(),
+                    env.clone(),
+                    Arc::default(),
+                )
+                .unwrap()
+            })
+            .await;
+        let nat = NatManager::new(instance.dispatcher.clone(), &config.inbounds);
+        let source = DatagramSource::new("127.0.0.1:50001".parse().unwrap(), None);
+        let (down, _down_rx) = mpsc::channel(1);
+        let fixture = SocksAddr::Ip(diag::TEST_ADDR.into());
+        let packet = UdpPacket::new(vec![1], SocksAddr::Ip(source.address), fixture);
+        env.scope
+            .enter(nat.send(None, &source, "socks", &down, packet))
+            .await;
+        let events = instance
+            .dispatcher
+            .internal_diagnostics(0)
+            .udp_target
+            .events;
+        let entry = events.iter().find(|e| e.stage == Stage::NatEntry).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.stage == Stage::NatQueue && e.flow_id == entry.flow_id));
+        for event in &events {
+            assert_eq!(event.flow_id, entry.flow_id, "{:?}", event.stage);
+        }
+        nat.sessions.lock().await.clear();
+        assert!(env.scope.stop(Duration::from_secs(1)).await.clean());
     }
 }

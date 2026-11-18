@@ -496,6 +496,8 @@ jobs:
           for diagnostic_case in \
             app::dispatcher::udp_target_route_tests::udp_target_none_policy_allocates_no_sink_or_ring \
             app::dispatcher::udp_target_route_tests::udp_target_source_rule_identity_and_final_sentinel \
+            app::dispatcher::udp_target_route_tests::udp_target_route_ignores_tcp_and_keeps_a_sniffed_udp_flow \
+            app::nat_manager::udp_target_tests::udp_target_a_non_tun_packet_is_one_flow \
             app::nat_manager::udp_target_tests::udp_target_existing_nonfixture_entry_queue_reasons_and_packet_gate \
             app::sessions::diagnostics_tests::diagnostics_distinguish_wait_overflow_and_closed_from_timeout_or_cancel \
             app::sessions::diagnostics_tests::diagnostics_do_not_repair_cancelled_waiting_budget \
@@ -619,6 +621,15 @@ jobs:
             test_dynamic_tun::diagnostics_observe_real_native_udp_and_current_admission_without_os_device \
             -- --exact --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/diagnostics-native.log"
           grep -F '1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/diagnostics-native.log"
+
+      # Its own feature set compiles sail again: here, not in L1's budget.
+      - name: diagnostics off, UoT writes allocate as before
+        if: ${{ !cancelled() && matrix.shard == 0 }}
+        run: |
+          set -euo pipefail
+          cargo test --locked -p sail --features alloc-stats --test test_diagnostics_off_alloc \
+            -- --nocapture 2>&1 | tee "$RUNNER_TEMP/diagnostics-off.log"
+          grep -F '1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/diagnostics-off.log"
 
       # Run whatever the tests before did, so that one failure hides no other.
       - name: sail-ffi

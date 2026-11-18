@@ -1,5 +1,12 @@
-//! Paired baseline/candidate measurement; the driver uses loopback mocks only.
-#![cfg(feature = "alloc-stats")]
+//! With the diagnostics features off, a UoT write allocates what it did
+//! before they existed: 2 allocations and 421 bytes a packet, measured on
+//! the source before diagnostics (fb5a1f4) with this driver. Loopback mocks
+//! only. CI runs it: `--features alloc-stats --test test_diagnostics_off_alloc`.
+#![cfg(all(
+    feature = "alloc-stats",
+    not(feature = "internal-diagnostics"),
+    not(feature = "internal-udp-target-diagnostics")
+))]
 use sail::adapter::OutboundDatagram;
 use std::{
     io,
@@ -38,7 +45,7 @@ impl AsyncWrite for Discard {
     }
 }
 #[test]
-fn diagnostics_feature_off_allocation_and_layout_measurement() {
+fn diagnostics_feature_off_uot_writes_allocate_as_before() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -54,9 +61,11 @@ fn diagnostics_feature_off_allocation_and_layout_measurement() {
         for _ in 0..32 { sender.send_to(&[2; 64], &target).await.unwrap(); }
         let after = sail::alloc_stats::counts();
         assert_eq!(WRITES.load(Ordering::Relaxed) - writes_before, 32);
-        assert!(after.0 > before.0, "the existing frame/future path must execute");
+        let (allocations, bytes) = (after.0 - before.0, after.1 - before.1);
+        assert_eq!(allocations, 2 * 32, "allocations per UoT write changed");
+        assert!(bytes <= 421 * 32, "UoT writes allocate {bytes} bytes for 32 packets");
         eprintln!("DIAG_OFF_ALLOC packets=32 allocations={} bytes={} sessions_size={} dispatcher_size={} kinds_size={} uot_size={}",
-            after.0-before.0, after.1-before.1,
+            allocations, bytes,
             std::mem::size_of::<sail::app::sessions::Sessions>(),
             std::mem::size_of::<sail::app::dispatcher::Dispatcher>(),
             std::mem::size_of::<sail::embed::HostKinds>(), uot_size);

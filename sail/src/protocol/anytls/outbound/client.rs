@@ -187,6 +187,7 @@ impl Client {
         if let Some(trace) = crate::app::udp_target_diagnostics::current() {
             trace.emit(trace.event(crate::app::udp_target_diagnostics::OPEN));
         }
+        // With the feature off, the open as it was (see the auth below).
         #[cfg(not(feature = "internal-udp-target-diagnostics"))]
         {
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -200,24 +201,25 @@ impl Client {
         }
         #[cfg(feature = "internal-udp-target-diagnostics")]
         {
-            let opened = async {
-                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
-                let pooled = self
-                    .new_session(sess)
-                    .instrument(tracing::Span::current())
-                    .await?;
-                debug!("anytls session {} to {}:{}", seq, self.server, self.port);
-                let stream = pooled.session.open_stream(first).await?;
-                io::Result::Ok(self.lease(seq, pooled, stream))
-            }
-            .await;
-            #[cfg(feature = "internal-udp-target-diagnostics")]
-            if let Some(trace) = crate::app::udp_target_diagnostics::current() {
-                trace.result(
-                    crate::app::udp_target_diagnostics::OPEN,
-                    opened.as_ref().map(|_| ()).map_err(|e| e.kind()),
-                );
-            }
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let opened = match self
+                .new_session(sess)
+                .instrument(tracing::Span::current())
+                .await
+            {
+                Ok(pooled) => {
+                    debug!("anytls session {} to {}:{}", seq, self.server, self.port);
+                    match pooled.session.open_stream(first).await {
+                        Ok(stream) => Ok(self.lease(seq, pooled, stream)),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            crate::app::udp_target_diagnostics::observe(
+                crate::app::udp_target_diagnostics::OPEN,
+                &opened,
+            );
             opened
         }
     }
@@ -293,6 +295,8 @@ impl Client {
             .read()
             .map(|p| p.auth_padding())
             .unwrap_or_default();
+        // With the feature off, as it was: another shape of this body
+        // can grow the future (see tests/test_diagnostics_off_alloc.rs).
         #[cfg(not(feature = "internal-udp-target-diagnostics"))]
         {
             conn.write_all(&auth(&self.password_hash, padding)).await?;
@@ -300,18 +304,14 @@ impl Client {
         }
         #[cfg(feature = "internal-udp-target-diagnostics")]
         {
-            let authenticated = async {
-                conn.write_all(&auth(&self.password_hash, padding)).await?;
-                conn.flush().await
-            }
-            .await;
-            #[cfg(feature = "internal-udp-target-diagnostics")]
-            if let Some(trace) = crate::app::udp_target_diagnostics::current() {
-                trace.result(
-                    crate::app::udp_target_diagnostics::Stage::Authenticate,
-                    authenticated.as_ref().map(|_| ()).map_err(|e| e.kind()),
-                );
-            }
+            let authenticated = match conn.write_all(&auth(&self.password_hash, padding)).await {
+                Ok(()) => conn.flush().await,
+                Err(e) => Err(e),
+            };
+            crate::app::udp_target_diagnostics::observe(
+                crate::app::udp_target_diagnostics::Stage::Authenticate,
+                &authenticated,
+            );
             authenticated?;
         }
         Ok(Pooled {

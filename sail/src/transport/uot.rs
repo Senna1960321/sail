@@ -372,6 +372,9 @@ where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
     async fn send_to(&mut self, buf: &[u8], target: &SocksAddr) -> io::Result<usize> {
+        // With the feature off, the write as it was: any other shape of
+        // this body grows the boxed future of every packet (measured by
+        // tests/test_diagnostics_off_alloc.rs).
         #[cfg(not(feature = "internal-udp-target-diagnostics"))]
         {
             let packet = encode_packet(Some(target), buf)?;
@@ -380,31 +383,12 @@ where
         }
         #[cfg(feature = "internal-udp-target-diagnostics")]
         {
-            let result: io::Result<usize> = async {
-                let packet = encode_packet(Some(target), buf)?;
-                self.w.write_all(&packet).await?;
-                Ok(buf.len())
-            }
-            .await;
-            #[cfg(feature = "internal-udp-target-diagnostics")]
+            let result = match encode_packet(Some(target), buf) {
+                Ok(packet) => self.w.write_all(&packet).await.map(|()| buf.len()),
+                Err(e) => Err(e),
+            };
             if let Some(trace) = &self.diagnostic_trace {
-                if trace.is_fixture(target) {
-                    let mut event = trace.event(crate::app::udp_target_diagnostics::WRITE);
-                    event.address_kind = crate::app::udp_target_diagnostics::address_kind(target);
-                    event.matches_fixture = true;
-                    event.bytes = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-                    match &result {
-                        Ok(_) => {
-                            event.result = crate::app::udp_target_diagnostics::Outcome::Accepted
-                        }
-                        Err(error) => {
-                            event.result = crate::app::udp_target_diagnostics::Outcome::Failed;
-                            event.error_kind =
-                                crate::app::udp_target_diagnostics::error_kind(error.kind());
-                        }
-                    }
-                    trace.emit(event);
-                }
+                trace.write(target, buf.len(), &result);
             }
             result
         }

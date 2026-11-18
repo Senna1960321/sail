@@ -84,9 +84,19 @@ fn udp_target_fixed_ring_overflow_and_contention_drop() {
     for _ in 0..19 {
         trace.emit(trace.event(NATIVE));
     }
+    // The newest 16 of 19 stored events, oldest first; the busy ring's one
+    // was never stored. Reading again gives the same events.
     let snapshot = sink.snapshot();
-    assert_eq!(snapshot.events.len(), 16);
-    assert_eq!(snapshot.dropped, 4);
+    assert_eq!(snapshot.dropped, 1);
+    assert_eq!(snapshot.overwritten, 3);
+    let sequences: Vec<_> = snapshot.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(sequences, (4..=19).collect::<Vec<_>>());
+    assert_eq!(sink.snapshot(), snapshot);
+    trace.emit(trace.event(WRITE));
+    let next = sink.snapshot();
+    assert_eq!(next.events.first().unwrap().sequence, 5);
+    assert_eq!(next.events.last().unwrap().sequence, 20);
+    assert_eq!(next.events.last().unwrap().stage, WRITE);
 }
 #[test]
 fn udp_target_owner_epochs_and_context_are_isolated() {
@@ -134,6 +144,7 @@ fn udp_target_opaque_chain_privacy_and_bound() {
 #[test]
 fn udp_target_json_export_has_a_separate_bounded_budget() {
     let event = Event {
+        sequence: u64::MAX,
         epoch: u64::MAX,
         flow_id: u64::MAX,
         parent_flow_id: u64::MAX,
@@ -168,6 +179,7 @@ fn udp_target_json_export_has_a_separate_bounded_budget() {
         configured: false,
         epoch: u64::MAX,
         dropped: u64::MAX,
+        overwritten: u64::MAX,
         snapshot_contended: false,
         events: vec![event; 16],
     };
