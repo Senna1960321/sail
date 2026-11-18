@@ -271,7 +271,7 @@ fn build_outbound(ctx: &mut OutboundContext<'_>) -> anyhow::Result<AnyOutboundHa
     let host = call("outbound", ctx.tag, || factory(&cx))?;
     let via = Via {
         outbounds: ctx.outbounds.clone(),
-        dns: ctx.dns_client.clone(),
+        dns: Arc::downgrade(ctx.dns_client),
     };
     let shared = Arc::new(OutboundShared { host, via });
     Ok(crate::adapter::outbound::HandlerBuilder::default()
@@ -1000,6 +1000,9 @@ pub trait HostOutbound: Send + Sync + 'static {
     /// `session.clone()` to choose a next hop when sending a later target.
     /// Keep routing policy in the session's frozen host context: `Via`
     /// looks up the current outbound by tag, including after reload.
+    /// Dial through a retained `Via` only from the halves' own calls,
+    /// which run in the session's task and end with the instance; a dial
+    /// from a task of the host's own is not ended by the instance's stop.
     fn datagrams<'a>(
         &'a self,
         session: &'a SessionInfo,
@@ -1152,8 +1155,10 @@ impl SessionInfo {
 /// session it carries: the tag is added to the session's chain, as a
 /// group adds its member.
 ///
-/// Clones share the live, weak outbound lookup and DNS client; they do not
-/// freeze a handler table or keep the running outbound manager alive.
+/// Clones share the live outbound lookup and DNS client, both weak: they
+/// do not freeze a handler table, and keep neither the running outbound
+/// manager nor the DNS client, with its upstream connections, alive. Once
+/// the instance has stopped, a clone's dials fail.
 /// Retain a cloned `SessionInfo` for the host's frozen policy/context and
 /// use `SessionInfo::with_destination` for each next-hop target. Cloning
 /// this handle creates no session, connection place or accounting record;
@@ -1161,7 +1166,7 @@ impl SessionInfo {
 #[derive(Clone)]
 pub struct Via {
     outbounds: crate::net::dial::Outbounds,
-    dns: SyncDnsClient,
+    dns: std::sync::Weak<arc_swap::ArcSwap<crate::app::dns::DnsClient>>,
 }
 
 impl fmt::Debug for Via {
@@ -1171,6 +1176,12 @@ impl fmt::Debug for Via {
 }
 
 impl Via {
+    fn dns(&self) -> io::Result<SyncDnsClient> {
+        self.dns
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "the instance has stopped"))
+    }
+
     fn handler(&self, outbound: &str) -> io::Result<AnyOutboundHandler> {
         self.outbounds.find(outbound).ok_or_else(|| {
             io::Error::new(
@@ -1184,6 +1195,7 @@ impl Via {
     /// another of the host's) to `session.destination`.
     pub async fn stream(&self, outbound: &str, session: &SessionInfo) -> io::Result<HostStream> {
         let h = self.handler(outbound)?;
+        let dns = self.dns()?;
         let sess = session.next_hop(Network::Tcp);
         sess.chain.push(h.tag());
         let th = h.stream()?;
@@ -1198,8 +1210,7 @@ impl Via {
             handshake = crate::net::dial_domain::stream_done(
                 &at,
                 async {
-                    let stream =
-                        crate::net::connect_stream_routed(&at, self.dns.clone(), &h).await?;
+                    let stream = crate::net::connect_stream_routed(&at, dns.clone(), &h).await?;
                     th.handle(&at, None, stream).await
                 }
                 .await,
@@ -1214,9 +1225,10 @@ impl Via {
     /// Datagrams through the outbound `outbound` for `session`.
     pub async fn datagrams(&self, outbound: &str, session: &SessionInfo) -> io::Result<Datagrams> {
         let h = self.handler(outbound)?;
+        let dns = self.dns()?;
         let sess = session.next_hop(Network::Udp);
         sess.chain.push(h.tag());
-        let transport = crate::net::connect_datagram_outbound(&sess, self.dns.clone(), &h).await?;
+        let transport = crate::net::connect_datagram_outbound(&sess, dns, &h).await?;
         let (recv, send) = h.datagram()?.handle(&sess, transport).await?.split();
         Ok(Datagrams {
             recv: Box::new(OutboundRecv(recv)),
@@ -1352,6 +1364,34 @@ impl OutboundDatagramSendHalf for HostSend {
 #[cfg(test)]
 mod parent_tests {
     use super::*;
+
+    /// A retained Via keeps no DNS client alive: once the instance drops
+    /// it, its upstream connections go with it, and the Via's dials fail.
+    #[test]
+    fn a_retained_via_does_not_keep_the_dns_client_alive() {
+        let config = crate::config::Config::from_json("{}").unwrap();
+        let dns =
+            crate::app::dns::DnsClient::new(&config.dns, Default::default(), &Default::default())
+                .unwrap()
+                .into_shared();
+        let via = Via {
+            outbounds: Default::default(),
+            dns: Arc::downgrade(&dns),
+        };
+        let retained = via.clone();
+        drop(via);
+        assert!(retained.dns().is_ok());
+        let gone = Arc::downgrade(&dns);
+        drop(dns);
+        assert!(
+            gone.upgrade().is_none(),
+            "a retained Via kept the DNS client"
+        );
+        assert_eq!(
+            retained.dns().err().map(|e| e.kind()),
+            Some(io::ErrorKind::NotConnected)
+        );
+    }
 
     #[test]
     fn parent_metadata_is_optional_and_does_not_follow_a_via_hop() {

@@ -83,7 +83,8 @@ pub struct Snapshot {
     pub stalls: u64,
     /// Streams the peer opened and this end turned away, since start.
     pub refused: u64,
-    /// Authenticated multiplex sessions created since process start.
+    /// Multiplex sessions started since process start, client and server,
+    /// whether or not the protocol authenticates them.
     pub sessions_created: u64,
     /// Streams opened or accepted since process start, including the first.
     pub streams_opened: u64,

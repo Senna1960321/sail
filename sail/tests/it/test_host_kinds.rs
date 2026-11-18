@@ -1388,3 +1388,163 @@ mod retained_via {
         );
     }
 }
+
+/// A `Via` a host keeps after its session holds the DNS client weakly:
+/// once the instance is gone, the DNS connections it pooled close, though
+/// the host still has the `Via`.
+#[cfg(feature = "inbound-socks")]
+mod kept_via_dns {
+    use super::*;
+    use hickory_proto::op::{Message, MessageType};
+    use hickory_proto::rr::{rdata::A, RData, Record, RecordType};
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Keeps the `Via` it is given, and dials through `direct`.
+    struct Keeper(Arc<Mutex<Option<Via>>>);
+
+    impl HostOutbound for Keeper {
+        fn stream<'a>(
+            &'a self,
+            session: &'a SessionInfo,
+            via: &'a Via,
+        ) -> BoxFuture<'a, io::Result<HostStream>> {
+            *self.0.lock().unwrap() = Some(via.clone());
+            Box::pin(via.stream("direct", session))
+        }
+        fn datagrams<'a>(
+            &'a self,
+            _: &'a SessionInfo,
+            _: &'a Via,
+        ) -> BoxFuture<'a, io::Result<Datagrams>> {
+            Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+        }
+    }
+
+    /// 127.0.0.1 for an A query, nothing for others.
+    fn answer(query: &[u8]) -> Vec<u8> {
+        let query = Message::from_vec(query).unwrap();
+        let mut resp = Message::new(
+            query.metadata.id,
+            MessageType::Response,
+            query.metadata.op_code,
+        );
+        resp.metadata.recursion_desired = query.metadata.recursion_desired;
+        resp.metadata.recursion_available = true;
+        for q in &query.queries {
+            resp.add_query(q.clone());
+            if q.query_type() == RecordType::A {
+                resp.add_answer(Record::from_rdata(
+                    q.name().clone(),
+                    60,
+                    RData::A(A(Ipv4Addr::LOCALHOST)),
+                ));
+            }
+        }
+        resp.to_vec().unwrap()
+    }
+
+    /// A DNS server on TCP: its port, how many connections it accepted,
+    /// and the end of each, as it sees it.
+    async fn dns_server() -> (u16, Arc<AtomicUsize>, mpsc::UnboundedReceiver<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (closed, ends) = mpsc::unbounded_channel();
+        let count = accepted.clone();
+        test_spawn(Box::pin(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let closed = closed.clone();
+                test_spawn(Box::pin(async move {
+                    loop {
+                        let mut len = [0u8; 2];
+                        if conn.read_exact(&mut len).await.is_err() {
+                            break;
+                        }
+                        let mut query = vec![0u8; u16::from_be_bytes(len).into()];
+                        if conn.read_exact(&mut query).await.is_err() {
+                            break;
+                        }
+                        let reply = answer(&query);
+                        let mut out = (reply.len() as u16).to_be_bytes().to_vec();
+                        out.extend_from_slice(&reply);
+                        if conn.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = closed.send(());
+                }));
+            }
+        }));
+        (port, accepted, ends)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kept_via_does_not_keep_the_dns_connections_open() {
+        let (dns_port, accepted, mut ends) = dns_server().await;
+        let (echo, serve) = common::run_tcp_echo_server("127.0.0.1:0").await.unwrap();
+        test_spawn(Box::pin(async move {
+            let _ = serve.await;
+        }));
+        let kept = Arc::new(Mutex::new(None));
+        let keeper = kept.clone();
+        let instance = Instance::new(
+            Options::new()
+                .threads(Threads::Workers(2, 2 << 20))
+                .outbound_kind("keeper-test", move |_| Ok(Arc::new(Keeper(keeper.clone()))))
+                .unwrap(),
+        )
+        .unwrap();
+        instance
+            .start(Config::Json(
+                serde_json::json!({
+                    "dns": { "servers": [
+                        { "type": "tcp", "tag": "stub", "server": "127.0.0.1",
+                          "server_port": dns_port },
+                    ] },
+                    "inbounds": [{ "type": "socks", "tag": "in", "listen": "127.0.0.1",
+                        "listen_port": common::free_port() }],
+                    "outbounds": [
+                        { "type": "keeper-test", "tag": "keeper" },
+                        { "type": "direct", "tag": "direct" },
+                    ],
+                    "route": { "final": "keeper" },
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let (mut ours, theirs) = tokio::io::duplex(1024);
+        instance
+            .sessions("in")
+            .unwrap()
+            .tcp(
+                NewSession::new(Address::Domain("echo.test".into(), echo.port())),
+                theirs,
+            )
+            .await
+            .unwrap();
+        round_trip(&mut ours, b"through a kept via").await;
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 1,
+            "the name was resolved by the server here"
+        );
+        drop(ours);
+        tokio::time::timeout(Duration::from_secs(5), instance.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(instance);
+        assert!(kept.lock().unwrap().is_some(), "the host still has its Via");
+        for _ in 0..accepted.load(Ordering::SeqCst) {
+            tokio::time::timeout(Duration::from_secs(5), ends.recv())
+                .await
+                .expect("a DNS connection stayed open after the instance went")
+                .unwrap();
+        }
+    }
+}
