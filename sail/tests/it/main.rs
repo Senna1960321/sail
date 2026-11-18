@@ -93,6 +93,7 @@ mod test_route_pass;
 mod test_route_resolve_proxy;
 mod test_route_sing_box;
 mod test_rule_set;
+mod test_sail;
 mod test_session_cap;
 mod test_shadowsocks;
 mod test_shadowtls;

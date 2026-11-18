@@ -1,4 +1,4 @@
-//! Fallback on the Trojan, VLESS and AnyTLS inbounds: what fails to
+//! Fallback on the Trojan, VLESS, AnyTLS and Sail/1 inbounds: what fails to
 //! authenticate is relayed, byte for byte, to a fallback server chosen by
 //! the TLS ALPN, and clients that do authenticate are not affected.
 //!
@@ -450,6 +450,8 @@ fn test_fallback_config_mistakes() -> anyhow::Result<()> {
     let mut inbounds: Vec<Server> = vec![trojan_server, vless_server];
     #[cfg(all(feature = "inbound-anytls", feature = "outbound-anytls"))]
     inbounds.push(anytls_server);
+    #[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+    inbounds.push(sail_server);
     for inbound in inbounds {
         anyhow::ensure!(bad(inbound, &|i| i["fallback_for_alpn"] =
             json!({ "": { "server": "127.0.0.1", "server_port": 80 } })));
@@ -565,6 +567,163 @@ fn test_anytls_without_fallback_closes() -> anyhow::Result<()> {
     common::retry_port_clash(|| {
         let port = common::free_port();
         let configs = vec![anytls_server(&cert, port, None)];
+        with_sail(configs, move || {
+            let mut tls = tls_connect(port, b"\x08http/1.1")?;
+            tls.write_all(HTTP1_REQUEST)?;
+            let mut buf = [0u8; 64];
+            match tls.read(&mut buf) {
+                Ok(0) | Err(_) => Ok(()),
+                Ok(n) => Err(anyhow::anyhow!("got {} bytes without a fallback", n)),
+            }
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Sail/1
+// ---------------------------------------------------------------------------
+
+/// The 32 bytes 0x5a, as a Sail/1 token.
+#[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+const SAIL_TOKEN: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo";
+
+#[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+fn sail_server(cert: &Cert, port: u16, fallback: Option<(u16, u16)>) -> String {
+    let mut inbound = json!({
+        "type": "sail",
+        "listen": "127.0.0.1",
+        "listen_port": port,
+        "users": [{ "token": SAIL_TOKEN }],
+        "tls": server_tls(cert),
+    });
+    if let Some((http1, h2)) = fallback {
+        fallbacks(&mut inbound, http1, h2);
+    }
+    json!({ "inbounds": [inbound], "outbounds": [{ "type": "direct" }] }).to_string()
+}
+
+#[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+fn sail_outbound(cert: &Cert, server_port: u16, alpn: &str) -> serde_json::Value {
+    json!({
+        "type": "sail",
+        "server": "127.0.0.1",
+        "server_port": server_port,
+        "token": SAIL_TOKEN,
+        "tls": client_tls(cert, alpn),
+    })
+}
+
+/// A Sail/1 prelude: `version`, the token of 32 `token` bytes, a digest,
+/// and `padding` bytes of padding.
+#[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+fn sail_prelude(version: u8, token: u8, padding: u16) -> Vec<u8> {
+    let mut prelude = vec![version];
+    prelude.extend_from_slice(&[token; 32]);
+    prelude.extend_from_slice(&[0; 8]);
+    prelude.extend_from_slice(&padding.to_be_bytes());
+    prelude.resize(prelude.len() + padding as usize, 0);
+    prelude
+}
+
+/// What fails to open with a user's prelude goes to the web server, byte
+/// for byte: a web client on either ALPN, a wrong token or version (its
+/// padding and what follows too), random bytes, and what is short of a
+/// prelude's head once the header timeout is up. Sail/1 clients get
+/// through on either ALPN meanwhile.
+#[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+#[test]
+fn test_sail_fallback() -> anyhow::Result<()> {
+    let cert = Cert::new("sail")?;
+    let http1 = run_web_server("http1")?;
+    let h2 = run_web_server("h2")?;
+    common::retry_port_clash(|| {
+        let [port, socks_h2, socks_http1] = common::free_ports();
+        let configs = vec![
+            sail_server(&cert, port, Some((http1, h2))),
+            sail_client(sail_outbound(&cert, port, "h2"), socks_h2),
+            sail_client(sail_outbound(&cert, port, "http/1.1"), socks_http1),
+        ];
+        with_sail(configs, move || {
+            probe(port, b"\x08http/1.1", HTTP1_REQUEST, "http1")?;
+            probe(port, b"", HTTP1_REQUEST, "http1")?;
+            probe(port, b"\x02h2", H2_PREFACE, "h2")?;
+            let mut wrong = sail_prelude(1, 0x33, 30);
+            wrong.extend_from_slice(HTTP1_REQUEST);
+            probe(port, b"\x08http/1.1", &wrong, "http1")?;
+            let mut version = sail_prelude(2, 0x5a, 0);
+            version.extend_from_slice(HTTP1_REQUEST);
+            probe(port, b"\x02h2", &version, "h2")?;
+            let random: Vec<u8> = (0..300u32).map(|i| (i * 7919 % 251) as u8).collect();
+            probe(port, b"\x08http/1.1", &random, "http1")?;
+            probe(port, b"\x02h2", b"GET / HTTP/1.1\r\n\r\n", "h2")?;
+            echo_through_socks(socks_h2)?;
+            echo_through_socks(socks_http1)?;
+            Ok(())
+        })
+    })
+}
+
+/// Part of a user's prelude, then nothing: the inbound waits for the rest
+/// up to the header timeout, then gives the fallback what it read.
+#[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+#[test]
+fn test_sail_fallback_after_truncated_prelude() -> anyhow::Result<()> {
+    let cert = Cert::new("sail-truncated")?;
+    let http1 = run_web_server("http1")?;
+    let h2 = run_web_server("h2")?;
+    common::retry_port_clash(|| {
+        let port = common::free_port();
+        let configs = vec![sail_server(&cert, port, Some((http1, h2)))];
+        with_sail(configs, move || {
+            let prelude = sail_prelude(1, 0x5a, 0);
+            let took = probe(port, b"\x08http/1.1", &prelude[..20], "http1")?;
+            anyhow::ensure!(
+                took >= HEADER_TIMEOUT - Duration::from_millis(100),
+                "fell back after {:?}, before the header timeout",
+                took
+            );
+            Ok(())
+        })
+    })
+}
+
+/// A user's prelude sent a byte at a time, slower than the header timeout
+/// allows: the fallback gets every byte, those read before the timeout
+/// and those after.
+#[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+#[test]
+fn test_sail_fallback_slow_bytes() -> anyhow::Result<()> {
+    let cert = Cert::new("sail-slow")?;
+    let http1 = run_web_server("http1")?;
+    let h2 = run_web_server("h2")?;
+    common::retry_port_clash(|| {
+        let port = common::free_port();
+        let configs = vec![sail_server(&cert, port, Some((http1, h2)))];
+        with_sail(configs, move || {
+            let prelude = sail_prelude(1, 0x5a, 0);
+            let mut tls = tls_connect(port, b"\x08http/1.1")?;
+            for byte in &prelude {
+                tls.write_all(std::slice::from_ref(byte))?;
+                tls.flush()?;
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            let expected = answer("http1", &prelude);
+            let mut got = vec![0u8; expected.len()];
+            tls.read_exact(&mut got)
+                .map_err(|e| anyhow::anyhow!("no answer from the fallback: {}", e))?;
+            anyhow::ensure!(got == expected, "the fallback got other bytes");
+            Ok(())
+        })
+    })
+}
+
+#[cfg(all(feature = "inbound-sail", feature = "outbound-sail"))]
+#[test]
+fn test_sail_without_fallback_closes() -> anyhow::Result<()> {
+    let cert = Cert::new("sail-none")?;
+    common::retry_port_clash(|| {
+        let port = common::free_port();
+        let configs = vec![sail_server(&cert, port, None)];
         with_sail(configs, move || {
             let mut tls = tls_connect(port, b"\x08http/1.1")?;
             tls.write_all(HTTP1_REQUEST)?;

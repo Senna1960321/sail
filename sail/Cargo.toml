@@ -131,6 +131,8 @@ outbound-http = ["base64", "h2", "http"]
 outbound-hysteria2 = ["quic", "blake2", "quinn-proto"]
 outbound-tuic = ["quic", "tokio/macros"]
 outbound-anytls = ["sha2", "md-5", "tokio-util"]
+# Sail/1, sail's own protocol (sail#60).
+outbound-sail = ["outbound-tls", "outbound-anytls", "base64", "sha2"]
 # ShadowTLS v3, the outbound other outbounds detour through.
 outbound-shadowtls = ["tls", "hmac", "sha-1", "sha2"]
 outbound-tls = ["tls"]
@@ -171,6 +173,7 @@ inbound-mixed = ["inbound-http", "inbound-socks"]
 inbound-hysteria2 = ["quic", "blake2", "quinn-proto", "url", "h2", "http"]
 inbound-tuic = ["quic", "tokio/macros"]
 inbound-anytls = ["sha2", "md-5", "tokio-util"]
+inbound-sail = ["inbound-tls", "inbound-anytls", "base64", "sha2"]
 # ShadowTLS v3, handing its connections to the inbound its detour names.
 inbound-shadowtls = ["hmac", "sha-1", "sha2"]
 inbound-mptp = []

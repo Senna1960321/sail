@@ -17,12 +17,12 @@ mod frame;
     not(all(feature = "inbound-anytls", feature = "outbound-anytls")),
     allow(dead_code)
 )]
-mod padding;
+pub(crate) mod padding;
 #[cfg_attr(
     not(all(feature = "inbound-anytls", feature = "outbound-anytls")),
     allow(dead_code)
 )]
-mod session;
+pub(crate) mod session;
 
 /// Fuzzing (sail::fuzzing): see `session::fuzz`.
 #[cfg(feature = "fuzzing")]

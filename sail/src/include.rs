@@ -52,6 +52,8 @@ pub(crate) static OUTBOUNDS: LazyLock<OutboundRegistry> = LazyLock::new(|| {
     crate::protocol::tuic::outbound::register(&mut registry);
     #[cfg(feature = "outbound-anytls")]
     crate::protocol::anytls::outbound::register(&mut registry);
+    #[cfg(feature = "outbound-sail")]
+    crate::protocol::sail::outbound::register(&mut registry);
     #[cfg(feature = "outbound-shadowtls")]
     crate::protocol::shadowtls::outbound::register(&mut registry);
 
@@ -106,6 +108,8 @@ pub(crate) static INBOUNDS: LazyLock<InboundRegistry> = LazyLock::new(|| {
     crate::protocol::tuic::inbound::register(&mut registry);
     #[cfg(feature = "inbound-anytls")]
     crate::protocol::anytls::inbound::register(&mut registry);
+    #[cfg(feature = "inbound-sail")]
+    crate::protocol::sail::inbound::register(&mut registry);
     #[cfg(feature = "inbound-shadowtls")]
     crate::protocol::shadowtls::inbound::register(&mut registry);
     #[cfg(all(feature = "inbound-nf", windows))]

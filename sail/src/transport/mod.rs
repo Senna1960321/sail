@@ -26,7 +26,8 @@ pub mod httpupgrade;
     feature = "outbound-quic",
     feature = "outbound-grpc",
     feature = "outbound-http",
-    feature = "outbound-amux"
+    feature = "outbound-amux",
+    feature = "outbound-sail"
 ))]
 pub mod idle;
 #[cfg(feature = "mux")]
