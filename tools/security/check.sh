@@ -37,6 +37,12 @@ require_tool() {
 classify_failure() {
   local scanner="$1"
   local log="$2"
+  # Findings first: a scanner that reports an advisory and also failed a
+  # side lookup (a yank query, say) has still found it.
+  if grep -Eq '(^|[^A-Z])RUSTSEC-[0-9]{4}-[0-9]{4}|Vulnerabilit(y|ies) found|error\[' "$log"; then
+    echo "security-check: FAIL: $scanner reported policy findings" >&2
+    return "$EXIT_FINDINGS"
+  fi
   if grep -Eiq 'operation not permitted|permission denied|read-only file system' "$log"; then
     echo "security-check: ERROR: $scanner was blocked by filesystem permissions" >&2
     return "$EXIT_ERROR"
@@ -44,10 +50,6 @@ classify_failure() {
   if grep -Eiq 'could not resolve|failed to (fetch|download)|network failure|timed? out|unable to access|could not connect|connection refused|couldn.t fetch advisory database|error sending request|allotted timeframe' "$log"; then
     echo "security-check: UNAVAILABLE: $scanner could not reach a required service" >&2
     return "$EXIT_UNAVAILABLE"
-  fi
-  if grep -Eq '(^|[^A-Z])RUSTSEC-[0-9]{4}-[0-9]{4}|Vulnerabilit(y|ies) found|error\[' "$log"; then
-    echo "security-check: FAIL: $scanner reported policy findings" >&2
-    return "$EXIT_FINDINGS"
   fi
   echo "security-check: ERROR: $scanner failed before producing classified findings" >&2
   return "$EXIT_ERROR"

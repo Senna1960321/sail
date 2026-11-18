@@ -2014,9 +2014,12 @@ async fn each_connection_has_one_closed_record_telling_its_outcome() {
     instance.stop().await.unwrap();
 }
 
-/// Exercises the production AsyncFd registration in dial_fd, including a
-/// cancelled read, peer closure, a fresh dial, and instance teardown. No TUN
-/// or system routes are involved; only loopback UDP and Unix socket pairs.
+/// Exercises the production AsyncFd registration in dial_fd across its
+/// lifecycle: a host read that times out before any reply, a relay round
+/// trip, a second dial after the host closed the first pair, and EOF on the
+/// host end once the instance stops. Registration behaves the same with the
+/// old constructor, so this covers the lifecycle, not the advisory itself.
+/// No TUN or system routes are involved; only loopback UDP and Unix pairs.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_dial_fd_survives_cancel_and_peer_close_then_stops() {

@@ -101,6 +101,17 @@ write_mock_cargo 'RUSTSEC-2026-0001: vulnerability found'
 expect_exit 1 env PATH="$mock_bin:/usr/bin:/bin" \
   SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit
 
+# A finding reported beside a failed side lookup is still a finding.
+cat >"$mock_bin/cargo" <<'MOCK'
+#!/usr/bin/env bash
+echo 'RUSTSEC-2026-0001: vulnerability found' >&2
+echo 'warning: yank lookup: error sending request for url (https://index.crates.io/)' >&2
+exit 1
+MOCK
+chmod +x "$mock_bin/cargo"
+expect_exit 1 env PATH="$mock_bin:/usr/bin:/bin" \
+  SECURITY_LOCKFILE="$repo_root/Cargo.lock" "$script_dir/check.sh" audit
+
 # An informational unsound advisory exits zero unless the scanner is told
 # to deny it. Exercise the actual cargo argument contract, not log wording.
 cat >"$mock_bin/cargo" <<'MOCK'
