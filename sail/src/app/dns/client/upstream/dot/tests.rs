@@ -75,7 +75,7 @@ async fn duplicate_original_ids_receive_their_own_out_of_order_answers() {
         let requests: Vec<_> = (0..8).map(|marker| message(42, marker)).collect();
         let queries = requests
             .iter()
-            .map(|request| connection.reserve(request, false).unwrap().exchange());
+            .map(|request| connection.reserve(request, false, None).unwrap().exchange());
         let server = async {
             let mut frames = Vec::new();
             for _ in 0..8 {
@@ -101,14 +101,14 @@ async fn a_late_cancelled_answer_cannot_answer_the_next_query() {
     scoped(async {
         let slots = Arc::new(Semaphore::new(1));
         let (connection, mut peer) = connection(&slots, 1024, Duration::from_secs(1)).await;
-        let first = connection.reserve(&message(42, 1), false).unwrap();
+        let first = connection.reserve(&message(42, 1), false, None).unwrap();
         let first = crate::runtime::scope::spawn("cancelled DoT test query", first.exchange());
         let old = read_frame(&mut peer).await;
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
 
         let next_request = message(42, 2);
-        let next = connection.reserve(&next_request, false).unwrap();
+        let next = connection.reserve(&next_request, false, None).unwrap();
         let next = crate::runtime::scope::spawn("next DoT test query", next.exchange());
         let current = read_frame(&mut peer).await;
         assert_ne!(&old[..2], &current[..2]);
@@ -129,7 +129,7 @@ async fn cancelling_a_partial_write_keeps_the_next_frame_aligned() {
         let (connection, mut peer) = connection(&slots, 4, Duration::from_secs(1)).await;
         let mut first_request = message(42, 1);
         first_request.resize(128, 17);
-        let first = connection.reserve(&first_request, false).unwrap();
+        let first = connection.reserve(&first_request, false, None).unwrap();
         let first = crate::runtime::scope::spawn("partial DoT test query", first.exchange());
         let len = peer.read_u16().await.unwrap() as usize;
         let id = peer.read_u16().await.unwrap();
@@ -137,13 +137,13 @@ async fn cancelling_a_partial_write_keeps_the_next_frame_aligned() {
         assert!(first.await.unwrap_err().is_cancelled());
 
         // A queued query cancelled before its write must be skipped.
-        let cancelled = connection.reserve(&message(42, 2), false).unwrap();
+        let cancelled = connection.reserve(&message(42, 2), false, None).unwrap();
         let cancelled = crate::runtime::scope::spawn("queued DoT test query", cancelled.exchange());
         tokio::task::yield_now().await;
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
         let next_request = message(42, 3);
-        let next = connection.reserve(&next_request, false).unwrap();
+        let next = connection.reserve(&next_request, false, None).unwrap();
         let next = crate::runtime::scope::spawn("aligned DoT test query", next.exchange());
 
         let mut tail = vec![0; len - 2];
@@ -164,8 +164,8 @@ async fn malformed_or_truncated_replies_fail_all_queries_and_release_the_slot() 
         for short in [true, false] {
             let slots = Arc::new(Semaphore::new(1));
             let (connection, mut peer) = connection(&slots, 1024, Duration::from_secs(1)).await;
-            let first = connection.reserve(&message(1, 1), false).unwrap();
-            let second = connection.reserve(&message(2, 2), false).unwrap();
+            let first = connection.reserve(&message(1, 1), false, None).unwrap();
+            let second = connection.reserve(&message(2, 2), false, None).unwrap();
             let first = crate::runtime::scope::spawn("first broken DoT query", first.exchange());
             let second = crate::runtime::scope::spawn("second broken DoT query", second.exchange());
             read_frame(&mut peer).await;
@@ -179,7 +179,7 @@ async fn malformed_or_truncated_replies_fail_all_queries_and_release_the_slot() 
             }
             assert!(first.await.unwrap().is_err());
             assert!(second.await.unwrap().is_err());
-            assert!(connection.reserve(&message(3, 3), false).is_none());
+            assert!(connection.reserve(&message(3, 3), false, None).is_none());
             assert_eq!(slots.available_permits(), 1);
         }
     })
@@ -192,11 +192,11 @@ async fn a_write_timeout_closes_the_connection_and_wakes_every_waiter() {
         let slots = Arc::new(Semaphore::new(1));
         let (connection, _peer) = connection(&slots, 1, Duration::from_millis(10)).await;
         let first = connection
-            .reserve(&message(1, 1), false)
+            .reserve(&message(1, 1), false, None)
             .unwrap()
             .exchange();
         let second = connection
-            .reserve(&message(2, 2), false)
+            .reserve(&message(2, 2), false, None)
             .unwrap()
             .exchange();
         let (first, second) = tokio::join!(first, second);
@@ -212,7 +212,7 @@ async fn aborting_before_the_driver_is_polled_releases_its_slot() {
     scoped(async {
         let slots = Arc::new(Semaphore::new(1));
         let (connection, _peer) = connection(&slots, 1024, Duration::from_secs(1)).await;
-        let query = connection.reserve(&message(1, 1), false).unwrap();
+        let query = connection.reserve(&message(1, 1), false, None).unwrap();
         connection.driver.abort();
         assert!(query.exchange().await.is_err());
         assert_eq!(slots.available_permits(), 1);
@@ -227,14 +227,14 @@ async fn id_exhaustion_retires_new_queries_but_finishes_the_last_one() {
         let (connection, mut peer) = connection(&slots, 1024, Duration::from_secs(1)).await;
         connection.shared.lock().unwrap().next_id = u16::MAX as u32;
         let request = message(42, 1);
-        let last = connection.reserve(&request, false).unwrap();
-        assert!(connection.reserve(&message(42, 2), false).is_none());
+        let last = connection.reserve(&request, false, None).unwrap();
+        assert!(connection.reserve(&message(42, 2), false, None).is_none());
         let last = crate::runtime::scope::spawn("last DoT ID query", last.exchange());
         let frame = read_frame(&mut peer).await;
         assert_eq!(&frame[..2], &u16::MAX.to_be_bytes());
         reply(&mut peer, &frame).await;
         assert_eq!(last.await.unwrap().unwrap(), request);
-        assert!(connection.reserve(&message(42, 3), false).is_none());
+        assert!(connection.reserve(&message(42, 3), false, None).is_none());
     })
     .await;
 }
@@ -244,13 +244,13 @@ async fn idle_expiry_does_not_retire_a_connection_with_active_queries() {
     scoped(async {
         let slots = Arc::new(Semaphore::new(1));
         let (connection, _peer) = connection(&slots, 1024, Duration::from_secs(1)).await;
-        let query = connection.reserve(&message(1, 1), false).unwrap();
+        let query = connection.reserve(&message(1, 1), false, None).unwrap();
         connection.shared.lock().unwrap().used = Instant::now() - IDLE_TIMEOUT;
-        let another = connection.reserve(&message(2, 2), false).unwrap();
+        let another = connection.reserve(&message(2, 2), false, None).unwrap();
         drop(query);
         drop(another);
         connection.shared.lock().unwrap().used = Instant::now() - IDLE_TIMEOUT;
-        assert!(connection.reserve(&message(3, 3), false).is_none());
+        assert!(connection.reserve(&message(3, 3), false, None).is_none());
     })
     .await;
 }
@@ -263,7 +263,7 @@ async fn close_idle_leaves_an_active_query_alive_then_releases_the_connection() 
             connection(&pool.connections, 1024, Duration::from_secs(1)).await;
         kept(&pool, &connection).await;
         let request = message(42, 1);
-        let query = connection.reserve(&request, false).unwrap();
+        let query = connection.reserve(&request, false, None).unwrap();
         let query = crate::runtime::scope::spawn("retired DoT query", query.exchange());
         let frame = read_frame(&mut peer).await;
         drop(connection);
@@ -294,7 +294,7 @@ async fn reset_aborts_retired_connections_as_well_as_the_kept_one() {
                 connection(&pool.connections, 1024, Duration::from_secs(1)).await;
             kept(&pool, &connection).await;
             let query = connection
-                .reserve(&message(42, marker as u8), false)
+                .reserve(&message(42, marker as u8), false, None)
                 .unwrap();
             queries.push(crate::runtime::scope::spawn(
                 "reset DoT query",
@@ -529,6 +529,81 @@ async fn a_late_sequential_timeout_does_not_retire_a_newer_connection() {
     .await;
 }
 
+/// A pipeline that has been silent for a whole reuse wait while busy is
+/// probed again: a connection that died silently under steady load must
+/// still time out and be retired, not hang every joining query.
+#[tokio::test]
+async fn a_busy_pipeline_silent_for_the_reuse_wait_is_probed_and_retired() {
+    scoped(async {
+        let pool = Pool::default();
+        let (connection, _silent_peer) =
+            connection(&pool.connections, 1024, Duration::from_secs(1)).await;
+        kept(&pool, &connection).await;
+        // Another query is still waiting: the pipeline is never idle.
+        let _outstanding = connection.reserve(&message(7, 7), false, None).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let (client, upstream) = client();
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempt = super::super::Attempt {
+            reuse: Some(Duration::from_millis(20)),
+            kept_timed_out: timed_out.clone(),
+        };
+        let request = message(42, 1);
+        let answer = timeout(
+            Duration::from_millis(500),
+            super::super::ATTEMPT.scope(
+                attempt,
+                client.exchange_dot(&upstream, &pool, "127.0.0.1:0".parse().unwrap(), &request),
+            ),
+        )
+        .await
+        .expect("a query joining a silent busy pipeline had no reuse deadline");
+        assert!(answer
+            .unwrap_err()
+            .to_string()
+            .contains("kept connection timed out"));
+        assert!(timed_out.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(pool.state.lock().await.kept.is_none());
+    })
+    .await;
+}
+
+/// A query joining a pipeline that has just opened keeps its normal
+/// deadline: it is not cut to the shorter idle-probe wait.
+#[tokio::test]
+async fn a_query_joining_a_fresh_pipeline_is_not_cut_to_the_reuse_wait() {
+    scoped(async {
+        let pool = Pool::default();
+        let (connection, mut peer) =
+            connection(&pool.connections, 1024, Duration::from_secs(1)).await;
+        kept(&pool, &connection).await;
+        // The query that opened the connection is still waiting.
+        let _opener = connection.reserve(&message(7, 7), false, None).unwrap();
+        let (client, upstream) = client();
+        let attempt = super::super::Attempt {
+            reuse: Some(Duration::from_millis(100)),
+            kept_timed_out: Default::default(),
+        };
+        let request = message(42, 1);
+        let query = super::super::ATTEMPT.scope(
+            attempt,
+            client.exchange_dot(&upstream, &pool, "127.0.0.1:0".parse().unwrap(), &request),
+        );
+        let server = async {
+            let frame = read_frame(&mut peer).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            reply(&mut peer, &frame).await;
+        };
+        let (answer, ()) = tokio::join!(query, server);
+        assert_eq!(answer.unwrap(), request);
+        assert!(Arc::ptr_eq(
+            pool.state.lock().await.kept.as_ref().unwrap(),
+            &connection
+        ));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn reset_cancels_a_stalled_handshake_before_it_can_repopulate_the_pool() {
     scoped(async {
@@ -539,7 +614,7 @@ async fn reset_cancels_a_stalled_handshake_before_it_can_repopulate_the_pool() {
         let mut dial = crate::runtime::scope::spawn("stalled DoT handshake", async move {
             let (client, upstream) = client();
             dialing_pool
-                .query(&client, &upstream, addr, &message(42, 1), None)
+                .query(&client, &upstream, addr, &message(42, 1), None, None)
                 .await
                 .map(|_| ())
         });
@@ -578,7 +653,7 @@ async fn reset_is_not_blocked_by_a_query_waiting_for_a_connection_slot() {
             let (connection, peer) =
                 connection(&pool.connections, 1024, Duration::from_secs(1)).await;
             kept(&pool, &connection).await;
-            let query = connection.reserve(&message(42, 1), false).unwrap();
+            let query = connection.reserve(&message(42, 1), false, None).unwrap();
             retained.push((query, peer));
         }
         pool.close_idle().await;
@@ -589,6 +664,7 @@ async fn reset_is_not_blocked_by_a_query_waiting_for_a_connection_slot() {
             &upstream,
             "127.0.0.1:853".parse().unwrap(),
             &request,
+            None,
             None,
         ));
         // Poll through connection creation to the exhausted semaphore.

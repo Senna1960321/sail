@@ -44,8 +44,8 @@ tokio::task_local! {
 
 /// An attempt of a `sequential` server on one member.
 pub(super) struct Attempt {
-    /// How long a kept connection may take to answer; `None` takes none,
-    /// and a new connection is opened.
+    /// How long a kept connection may take to answer; `None` requires a
+    /// replacement. Pipelined DoT retries share one that a sibling opened.
     pub reuse: Option<std::time::Duration>,
     /// Set when a kept connection timed out, which ends the attempt: the
     /// server is asked again on a new connection, with a whole attempt's
