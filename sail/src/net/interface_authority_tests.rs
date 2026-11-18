@@ -250,3 +250,33 @@ fn dynamic_owned_leases_filter_existing_os_cache_without_refresh() {
         Some("utun91")
     );
 }
+
+/// A pushed state that names no interface (its type only, say) leaves
+/// egress to detection: auto_route must not go out unbound for it. An
+/// offline push still means no egress.
+#[test]
+fn a_push_naming_no_interface_leaves_egress_to_detection() {
+    let network = Network::default();
+    let auto = AutoInterface::with_network(vec![], initial, network.clone());
+    assert!(auto.refresh_from(|| (
+        Ok("en1".into()),
+        vec![("192.0.2.0".parse().unwrap(), 24, "en2".into())]
+    )));
+    network.push(NetworkState {
+        kind: Some(NetworkType::Wifi),
+        ..Default::default()
+    });
+    assert_eq!(auto.current().as_deref(), Some("en1"));
+    assert_eq!(
+        auto.for_target("192.0.2.9".parse().unwrap()).as_deref(),
+        Some("en2")
+    );
+    assert!(
+        auto.refresh_from(|| (Ok("en3".into()), vec![])),
+        "detection goes on"
+    );
+    assert_eq!(auto.current().as_deref(), Some("en3"));
+    network.push(NetworkState::default());
+    assert_eq!(auto.current(), None);
+    assert_eq!(auto.for_target("203.0.113.9".parse().unwrap()), None);
+}

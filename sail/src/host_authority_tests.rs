@@ -1,5 +1,13 @@
 use std::sync::Arc;
 
+/// A run's environment with a dynamic TUN, whose host network authority
+/// automatic egress follows.
+fn dynamic_env() -> crate::runtime::RuntimeEnv {
+    let mut env = crate::runtime::RuntimeEnv::default();
+    env.host.kinds = env.host.kinds.with_dynamic_tun(true);
+    env
+}
+
 #[test]
 fn automatic_dialers_keep_this_runs_authority_before_after_creation_and_reload() {
     let config = crate::config::Config::from_json(
@@ -7,7 +15,7 @@ fn automatic_dialers_keep_this_runs_authority_before_after_creation_and_reload()
     )
     .unwrap();
     for before in [true, false] {
-        let env = crate::runtime::RuntimeEnv::default();
+        let env = dynamic_env();
         let physical = || crate::net::network::NetworkState {
             interface: Some("en0".into()),
             ..Default::default()
@@ -35,7 +43,7 @@ fn automatic_dialers_keep_this_runs_authority_before_after_creation_and_reload()
             ..Default::default()
         });
         assert_eq!(auto.current().as_deref(), Some("en1"));
-        let next_run = crate::runtime::RuntimeEnv::default();
+        let next_run = dynamic_env();
         next_run.network.push(crate::net::network::NetworkState {
             interface: Some("en2".into()),
             ..Default::default()
@@ -50,4 +58,26 @@ fn automatic_dialers_keep_this_runs_authority_before_after_creation_and_reload()
             "retained old run cannot read the new authority"
         );
     }
+}
+
+/// Without a dynamic TUN, a host's push does not take automatic egress
+/// over: the interface is detected as before.
+#[test]
+fn without_a_dynamic_tun_automatic_egress_is_detected_as_before() {
+    let config = crate::config::Config::from_json(
+        r#"{"route":{"auto_detect_interface":true},"outbounds":[{"type":"direct"}]}"#,
+    )
+    .unwrap();
+    let env = crate::runtime::RuntimeEnv::default();
+    env.network.push(crate::net::network::NetworkState {
+        interface: Some("sail-test-if0".into()),
+        ..Default::default()
+    });
+    let defaults = crate::dial_defaults(&config, &env).unwrap();
+    let auto = defaults.env.auto_interface.as_ref().unwrap();
+    assert_ne!(auto.current().as_deref(), Some("sail-test-if0"));
+    assert_ne!(
+        auto.for_target("192.0.2.9".parse().unwrap()).as_deref(),
+        Some("sail-test-if0")
+    );
 }

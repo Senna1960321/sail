@@ -2071,11 +2071,21 @@ pub(crate) fn dial_defaults(
         defaults.env.auto_interface = Some(
             env.auto_interface
                 .get_or_init(|| {
-                    net::interface::AutoInterface::with_network(
-                        own_interfaces,
-                        platform::detect_default_interface,
-                        env.network.clone(),
-                    )
+                    // The host's network authority and exact device
+                    // leases are a dynamic TUN's; without one, egress is
+                    // detected as before.
+                    if env.host.kinds.dynamic_tun_enabled() {
+                        net::interface::AutoInterface::with_network(
+                            own_interfaces,
+                            platform::detect_default_interface,
+                            env.network.clone(),
+                        )
+                    } else {
+                        net::interface::AutoInterface::new(
+                            own_interfaces,
+                            platform::detect_default_interface,
+                        )
+                    }
                 })
                 .clone(),
         );
@@ -2364,6 +2374,10 @@ fn run(rt_id: RuntimeId, opts: StartOptions, start: &Arc<Starting>) -> Result<()
         events.clone(),
         host.admission_hooks.as_ref(),
     );
+    let network = net::network::Network::telling_to(events.network_sender());
+    if host.kinds.dynamic_tun_enabled() {
+        network.hold_host_authority();
+    }
     let env = Arc::new(runtime::RuntimeEnv {
         options: opts.runtime,
         host,
@@ -2372,7 +2386,7 @@ fn run(rt_id: RuntimeId, opts: StartOptions, start: &Arc<Starting>) -> Result<()
         ledger,
         #[cfg(feature = "inbound-tun")]
         tun_names: Arc::new(std::sync::Mutex::new(tun_names)),
-        network: net::network::Network::telling_to(events.network_sender()),
+        network,
         admission,
         events,
         scope: scope.clone(),
@@ -2763,8 +2777,16 @@ fn run(rt_id: RuntimeId, opts: StartOptions, start: &Arc<Starting>) -> Result<()
     // in the system (routes, rules, filters, DNS); then the root tasks
     // left, the TUN's among them, which closes the device; the instance;
     // its tasks, within the bound; the runtime, within it too.
+    // A dynamic TUN's drain is part of the stop's bound (E2 teardown): the
+    // instance's tasks get what it leaves, not a bound of their own.
     #[cfg(feature = "inbound-tun")]
-    rt.block_on(runtime_manager.stop_dynamic_tun());
+    let drained = {
+        let started = std::time::Instant::now();
+        rt.block_on(runtime_manager.stop_dynamic_tun(stop_within));
+        started.elapsed()
+    };
+    #[cfg(not(feature = "inbound-tun"))]
+    let drained = std::time::Duration::ZERO;
     env.teardown.run_all();
     drop(here);
     for task in &spawned {
@@ -2774,6 +2796,7 @@ fn run(rt_id: RuntimeId, opts: StartOptions, start: &Arc<Starting>) -> Result<()
     // for within the stop's bound, which the instance's tasks get the rest
     // of, and one that outlasts it is the stop's to report.
     let ending = std::time::Instant::now();
+    let stop_within = stop_within.saturating_sub(drained);
     let _ = rt.block_on(tokio::time::timeout(
         stop_within,
         futures::future::join_all(spawned),

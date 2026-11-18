@@ -99,7 +99,7 @@ struct Kinds {
 impl HostKinds {
     // Keep the opt-in Rust setting in this sealed per-instance host
     // configuration, without adding a field to public Host struct literals.
-    pub(super) fn with_dynamic_tun(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_dynamic_tun(mut self, enabled: bool) -> Self {
         self.1 = enabled;
         self
     }

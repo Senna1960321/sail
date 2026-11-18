@@ -1013,6 +1013,120 @@ async fn instance_stop_is_bounded_and_reports_a_host_open_that_has_not_returned(
     i.stop().await.unwrap();
 }
 
+/// A host whose TUN open and connection-owner lookup both block until
+/// released: the first keeps an attachment from draining, the second a
+/// root task from ending.
+#[cfg(unix)]
+struct StuckHost {
+    open: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    lookup: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+#[cfg(unix)]
+impl StuckHost {
+    fn wait(&self, entered: &std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>) {
+        if let Some(entered) = entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let mut released = self.gate.0.lock().unwrap();
+        while !*released {
+            released = self.gate.1.wait(released).unwrap();
+        }
+    }
+}
+#[cfg(unix)]
+impl sail::embed::Platform for StuckHost {
+    fn log(&self, _: &str) {}
+    fn opens_tun(&self) -> bool {
+        true
+    }
+    fn open_tun(&self, _: &sail::embed::TunRequest) -> std::io::Result<i32> {
+        self.wait(&self.open);
+        Err(std::io::Error::other("released"))
+    }
+    fn finds_connection_owner(&self) -> bool {
+        true
+    }
+    fn find_connection_owner(
+        &self,
+        _: &sail::embed::ConnectionQuery,
+    ) -> std::io::Result<Option<sail::embed::ConnectionOwner>> {
+        self.wait(&self.lookup);
+        Ok(None)
+    }
+}
+
+/// The stop's bound covers a dynamic TUN's drain and the instance's tasks
+/// together: an attachment that does not drain and a root task that does
+/// not end each use the bound, but the stop takes it once, not twice.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instance_stop_bound_covers_dynamic_drain_and_tasks_together() {
+    const WITHIN: Duration = Duration::from_millis(500);
+    let (open_tx, opened) = tokio::sync::oneshot::channel();
+    let (lookup_tx, looking) = tokio::sync::oneshot::channel();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let release = Release(gate.clone());
+    let host = Arc::new(StuckHost {
+        open: std::sync::Mutex::new(Some(open_tx)),
+        lookup: std::sync::Mutex::new(Some(lookup_tx)),
+        gate,
+    });
+    let i = Instance::new(
+        Options::new()
+            .dynamic_tun(true)
+            .platform(host)
+            .runtime(Runtime::Host(tokio::runtime::Handle::current()))
+            .stop_within(WITHIN),
+    )
+    .unwrap();
+    // A process rule makes every connection ask the host who opened it.
+    let port = crate::common::free_port();
+    i.start(Config::Json(
+        serde_json::json!({"log":{"level":"warn"},
+            "inbounds":[{"type":"mixed","tag":"mixed","listen":"127.0.0.1","listen_port":port,"users":[{"username":"u","password":"p"}]}],
+            "outbounds":[{"type":"direct","tag":"direct"}],
+            "route":{"rules":[{"process_name":["no-such-process"],"outbound":"direct"}],"final":"direct"}})
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let p = i.prepare_tun_device(TUN).await.unwrap();
+    let commit = tokio::spawn(p.commit());
+    let client = tokio::spawn(socks(port, 1, "127.0.0.1:9".parse().unwrap()));
+    for entered in [opened, looking] {
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let started = std::time::Instant::now();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), i.stop())
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    let _ = stopped;
+    assert!(
+        !i.stop_report().unwrap().clean(),
+        "the stuck callbacks are reported"
+    );
+    assert!(
+        took < WITHIN * 3 / 2,
+        "stop took {took:?} with a bound of {WITHIN:?}"
+    );
+    drop(release);
+    client.abort();
+    let _ = client.await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), commit).await;
+}
+
 #[cfg(target_os = "linux")]
 struct BlockingOwnedFdHost {
     wait: BlockingOpenHost,

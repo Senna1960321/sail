@@ -500,20 +500,23 @@ impl RuntimeManager {
     pub(crate) async fn detach_dynamic_tun(&self) -> Result<StopReport, Error> {
         let _update = self.update.lock().await;
         let _drain = self.dynamic_tun.drain.lock().await;
-        self.drain_capture().await
-    }
-
-    async fn drain_capture(&self) -> Result<StopReport, Error> {
         let within = self
             .env
             .host
             .stop_within
             .unwrap_or(crate::runtime::scope::STOP_WITHIN);
+        self.drain_capture(within).await
+    }
+
+    /// Drains the attachment, and any retired ones, all within `within`.
+    async fn drain_capture(&self, within: std::time::Duration) -> Result<StopReport, Error> {
+        let deadline = std::time::Instant::now() + within;
+        let left = || deadline.saturating_duration_since(std::time::Instant::now());
         let retired = self.dynamic_tun.lock().retired.clone();
         if !retired.is_empty() {
             let mut combined = StopReport::default();
             for generation in retired {
-                let report = generation.owner.stop(within).await;
+                let report = generation.owner.stop(left()).await;
                 combined.tasks.extend(report.tasks);
                 combined.left.extend(report.left);
                 combined.waited += report.waited;
@@ -531,7 +534,7 @@ impl RuntimeManager {
         };
         drop(source);
         generation.undo.run_all();
-        let mut report = generation.owner.stop(within).await;
+        let mut report = generation.owner.stop(left()).await;
         if report.tasks.is_empty() {
             generation.undo.check_all();
         }
@@ -546,10 +549,12 @@ impl RuntimeManager {
         Ok(report)
     }
 
-    pub(crate) async fn stop_dynamic_tun(&self) {
+    /// Ends the attachment as the instance stops, within `within`: part of
+    /// the stop's bound, which its tasks get the rest of.
+    pub(crate) async fn stop_dynamic_tun(&self, within: std::time::Duration) {
         self.dynamic_tun.lock().closed = true;
         let _drain = self.dynamic_tun.drain.lock().await;
-        match self.drain_capture().await {
+        match self.drain_capture(within).await {
             Ok(report) if !report.clean() => {
                 for left in report.left {
                     let mut check = Step::new(left.kind, left.resource, move || {

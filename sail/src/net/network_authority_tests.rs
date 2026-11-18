@@ -11,6 +11,7 @@ fn physical(name: &str, address: &str) -> NetworkState {
 #[test]
 fn a_detected_publication_queued_before_push_cannot_overwrite_it() {
     let network = Network::default();
+    network.hold_host_authority();
     network.settle_first(Some(physical("en0", "192.0.2.2/24")));
     let (queried_tx, queried) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel();
@@ -40,6 +41,7 @@ fn a_detected_publication_queued_before_push_cannot_overwrite_it() {
 #[test]
 fn a_late_automatic_notice_neither_resets_nor_consumes_the_host_fold() {
     let network = Network::default();
+    network.hold_host_authority();
     network.settle_first(Some(physical("en0", "192.0.2.2/24")));
     let (observed_tx, observed) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel();
@@ -194,4 +196,23 @@ fn an_old_run_lease_cannot_clear_a_new_runs_same_named_device() {
     assert_eq!(new_run.egress_view().own, vec!["utun91"]);
     drop(new);
     assert!(new_run.egress_view().own.is_empty());
+}
+
+/// Host authority is a dynamic TUN's: without it, sail's own watcher still
+/// tells of a default-interface move after a host push, as before.
+#[test]
+fn without_host_authority_an_os_notice_after_a_push_still_resets() {
+    let network = Network::default();
+    network.settle_first(Some(physical("en0", "192.0.2.2/24")));
+    network.push(physical("en0", "192.0.2.2/24"));
+    let generation = network.snapshot_with_generation().generation;
+    let mut changes = network.change_events();
+    assert_eq!(
+        network.announce(ChangeReason::DefaultInterface),
+        Some(generation + 1)
+    );
+    assert_eq!(
+        changes.try_recv().unwrap().reason,
+        ChangeReason::DefaultInterface
+    );
 }

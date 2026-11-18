@@ -433,6 +433,10 @@ pub struct Network {
     known: Arc<AtomicBool>,
     /// Whether the host pushes the state, which detection then leaves.
     pushed: Arc<AtomicBool>,
+    /// Whether a pushed state is the host's alone: with a dynamic TUN, a
+    /// late notice from sail's own watchers does not reset it. Off, sail's
+    /// watchers still tell of a move as before.
+    host_authority: Arc<AtomicBool>,
     /// Exact host input for egress. The public/rule snapshot may filter
     /// owned interfaces; that must not permanently erase host declarations.
     host_egress: Arc<arc_swap::ArcSwapOption<NetworkState>>,
@@ -506,6 +510,7 @@ impl Default for Network {
             telling: Arc::default(),
             known: Arc::default(),
             pushed: Arc::default(),
+            host_authority: Arc::default(),
             host_egress: Arc::default(),
             pushed_at: Arc::default(),
             own: Arc::default(),
@@ -579,10 +584,32 @@ impl Network {
         (self.state.borrow().clone(), self.events.subscribe())
     }
 
+    /// Makes a pushed state the host's alone (`host_authority`), for an
+    /// instance with a dynamic TUN.
+    pub(crate) fn hold_host_authority(&self) {
+        self.host_authority.store(true, Ordering::Relaxed);
+    }
+
+    fn host_owns_state(&self) -> bool {
+        self.host_authority.load(Ordering::Relaxed) && self.pushed()
+    }
+
+    /// The host's pushed state when it says how to go out: it names an
+    /// interface, or it is no network at all (offline). One that names
+    /// none but tells of a network (its type, say) leaves egress to
+    /// detection, so that auto_route never goes out unbound for it.
+    fn host_egress(&self) -> Option<Arc<NetworkState>> {
+        self.host_egress.load_full().filter(|state| {
+            state.interface.is_some()
+                || !state.interfaces.is_empty()
+                || **state == NetworkState::default()
+        })
+    }
+
     pub(crate) fn egress_view(&self) -> EgressView {
         let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
         EgressView {
-            host: self.host_egress.load_full(),
+            host: self.host_egress(),
             own: self.own.lock().unwrap_or_else(|e| e.into_inner()).names(),
         }
     }
@@ -591,7 +618,7 @@ impl Network {
     /// authority. Recheck owned names at publication, not at lookup start.
     pub(crate) fn publish_automatic<T>(&self, publish: impl FnOnce(&[String]) -> T) -> Option<T> {
         let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
-        if self.pushed() {
+        if self.host_egress().is_some() {
             return None;
         }
         let own = self.own.lock().unwrap_or_else(|e| e.into_inner()).names();
@@ -606,7 +633,9 @@ impl Network {
         let _telling = self.telling.lock().unwrap_or_else(|e| e.into_inner());
         // A delayed OS/capture notice cannot reset a host-owned network,
         // nor consume the folding token for an explicit host notification.
-        if self.pushed() && matches!(reason, ChangeReason::DefaultInterface | ChangeReason::State) {
+        if self.host_owns_state()
+            && matches!(reason, ChangeReason::DefaultInterface | ChangeReason::State)
+        {
             return None;
         }
         // The host's word right after the state it pushed is about that
@@ -840,7 +869,7 @@ impl Network {
             self.pushed.store(true, Ordering::Relaxed);
             *self.pushed_at.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(std::time::Instant::now());
-        } else if self.pushed() {
+        } else if self.host_owns_state() {
             return false;
         }
         self.leave_own_out(&mut state);
