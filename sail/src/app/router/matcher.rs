@@ -479,7 +479,9 @@ impl CidrIndex {
     pub(crate) fn from_ranges(ranges: &[(IpAddr, IpAddr)]) -> Result<Self> {
         let mut index = CidrIndex::default();
         for &(first, last) in ranges {
-            match (first.to_canonical(), last.to_canonical()) {
+            // Each in the family it is written in: an IPv4-mapped range
+            // stays IPv6, as in sing-box (MRS maps its own on reading).
+            match (first, last) {
                 (IpAddr::V4(first), IpAddr::V4(last)) if first <= last => {
                     index.v4.push((first.into(), last.into()))
                 }
@@ -1483,6 +1485,12 @@ impl Conditions {
         };
         conditions.empty = conditions.items.is_empty() && !conditions.has_rule_sets();
         conditions
+    }
+
+    /// Whether it has no conditions, and so matches everything.
+    #[cfg(feature = "rule-set")]
+    pub(crate) fn is_unconditional(&self) -> bool {
+        self.empty
     }
 
     fn has_rule_sets(&self) -> bool {

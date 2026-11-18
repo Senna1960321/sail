@@ -48,7 +48,7 @@ pub(crate) fn read(
                     None => rule.domain.push(name),
                 }
             }
-            Ok(vec![rule::from_source(&rule, "rules[0]", env)?])
+            rule::from_list(rule, "rules[0]", env).map(Vec::from_iter)
         }
         ClashBehavior::Classical => classical(lines, env),
         ClashBehavior::Ipcidr => Err(anyhow!(

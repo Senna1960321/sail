@@ -90,8 +90,58 @@ fn compile(rule: &HeadlessRule, path: &str, depth: usize, env: &RuntimeEnv) -> R
     }
 }
 
-/// Compiles a default rule, found at `path`, of `env`'s data files.
+impl Parts {
+    /// Whether it names no condition at all, inverted or not.
+    fn has_none(&self) -> bool {
+        let meta = HeadlessRule {
+            kind: self.rule.kind.clone(),
+            invert: self.rule.invert,
+            no_resolve: self.rule.no_resolve,
+            ..Default::default()
+        };
+        self.rule == meta
+            && self.succinct.is_none()
+            && self.ip_ranges.is_none()
+            && self.source_ip_ranges.is_none()
+            && self.query_types.is_empty()
+    }
+}
+
+/// Compiles a default rule of a sing-box rule-set, found at `path`, of
+/// `env`'s data files. One with no conditions is refused, as sing-box
+/// refuses it: it would match everything.
 pub(crate) fn default(parts: Parts, path: &str, env: &RuntimeEnv) -> Result<Condition> {
+    if parts.has_none() {
+        return Err(anyhow!("{}: missing conditions", path));
+    }
+    Ok(Condition::Default(Box::new(conditions(parts, path, env)?)))
+}
+
+/// The rule of a list (Clash's, Surge's, an MRS), found at `path`: none
+/// when the list has no entry taken, so that it matches nothing, as
+/// Mihomo's empty set matches nothing.
+pub(crate) fn listed(parts: Parts, path: &str, env: &RuntimeEnv) -> Result<Option<Condition>> {
+    let compiled = conditions(parts, path, env)?;
+    Ok((!compiled.is_unconditional()).then(|| Condition::Default(Box::new(compiled))))
+}
+
+/// `listed`, of the conditions of `rule`.
+pub(crate) fn from_list(
+    rule: HeadlessRule,
+    path: &str,
+    env: &RuntimeEnv,
+) -> Result<Option<Condition>> {
+    listed(
+        Parts {
+            rule,
+            ..Default::default()
+        },
+        path,
+        env,
+    )
+}
+
+fn conditions(parts: Parts, path: &str, env: &RuntimeEnv) -> Result<Conditions> {
     let rule = &parts.rule;
     if let Some(field) = rule.unsupported() {
         return Err(anyhow!("{}.{}: sail does not match it yet", path, field));
@@ -141,6 +191,5 @@ pub(crate) fn default(parts: Parts, path: &str, env: &RuntimeEnv) -> Result<Cond
         env,
         rule_sets: &Default::default(),
     };
-    let compiled = Conditions::compile(&conditions, extras, path, &mut ctx)?;
-    Ok(Condition::Default(Box::new(compiled)))
+    Conditions::compile(&conditions, extras, path, &mut ctx)
 }

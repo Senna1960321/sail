@@ -1303,6 +1303,124 @@ mod tests {
         assert!(RuleSet::read(&data, RuleSetFormat::Binary, None, &RuntimeEnv::default()).is_err());
     }
 
+    fn to_ip(ip: &str) -> Facts {
+        Facts::new(
+            &Session {
+                destination: SocksAddr::Ip(std::net::SocketAddr::new(ip.parse().unwrap(), 443)),
+                ..Default::default()
+            },
+            &[],
+        )
+    }
+
+    /// A binary rule-set of one default rule of `items`, not inverted.
+    fn binary(items: &[u8]) -> Vec<u8> {
+        let mut rules = vec![1u8, 0];
+        rules.extend(items);
+        rules.extend([0xff, 0]);
+        let mut data = b"SRS\x03".to_vec();
+        data.extend(miniz_oxide::deflate::compress_to_vec_zlib(&rules, 6));
+        data
+    }
+
+    /// An address of 16 bytes in a binary rule-set is IPv6, a mapped one
+    /// too, as sing-box reads it: `::ffff:0:0/96` matches no IPv4 address.
+    #[test]
+    fn a_mapped_range_of_a_binary_rule_set_stays_ipv6() {
+        let v6 = |s: &str| s.parse::<std::net::Ipv6Addr>().unwrap().octets();
+        let mut items = vec![6u8, 1];
+        items.extend(2u64.to_be_bytes());
+        for (from, to) in [
+            ("::ffff:0:0", "::ffff:ffff:ffff"),
+            ("2001:db8::", "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"),
+        ] {
+            for addr in [from, to] {
+                items.push(16);
+                items.extend(v6(addr));
+            }
+        }
+        let set = RuleSet::read(
+            &binary(&items),
+            RuleSetFormat::Binary,
+            None,
+            &RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert!(!set.matches(&to_ip("1.2.3.4"), false));
+        assert!(!set.matches(&to_ip("::ffff:1.2.3.4"), false));
+        assert!(set.matches(&to_ip("2001:db8::1"), false));
+    }
+
+    /// A rule-set rule with no conditions, inverted or not, at any depth,
+    /// is refused, as sing-box refuses it: it would match everything.
+    #[test]
+    fn a_rule_set_rule_with_no_conditions_is_refused() {
+        for (rules, path) in [
+            (serde_json::json!([{}]), "rules[0]"),
+            (serde_json::json!([{ "invert": true }]), "rules[0]"),
+            (
+                serde_json::json!([{ "domain": "a.example" }, { "type": "default" }]),
+                "rules[1]",
+            ),
+            (
+                serde_json::json!([{ "type": "logical", "mode": "or", "rules": [
+                    { "domain": "a.example" }, { "invert": true }
+                ] }]),
+                "rules[0].rules[1]",
+            ),
+        ] {
+            let data = serde_json::json!({ "version": 3, "rules": rules }).to_string();
+            let err = RuleSet::read(
+                data.as_bytes(),
+                RuleSetFormat::Source,
+                None,
+                &RuntimeEnv::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{} was taken", rules));
+            assert_eq!(err.to_string(), format!("{}: missing conditions", path));
+        }
+        let err = RuleSet::read(
+            &binary(&[]),
+            RuleSetFormat::Binary,
+            None,
+            &RuntimeEnv::default(),
+        )
+        .err()
+        .expect("an empty binary rule was taken");
+        assert_eq!(err.to_string(), "rules[0]: missing conditions");
+    }
+
+    /// A list with no entry taken matches nothing, as Mihomo's empty set.
+    #[test]
+    fn an_empty_list_matches_nothing() {
+        let comments = b"# nothing here\n\n// nor here\n";
+        for (format, behavior) in [
+            (RuleSetFormat::ClashText, ClashBehavior::Domain),
+            (RuleSetFormat::ClashText, ClashBehavior::Ipcidr),
+            (RuleSetFormat::SurgeText, ClashBehavior::Domain),
+        ] {
+            let set =
+                RuleSet::read(comments, format, Some(behavior), &RuntimeEnv::default()).unwrap();
+            assert!(
+                !set.matches(&at("a.example", 443, Tcp), false),
+                "{:?} {:?}",
+                format,
+                behavior
+            );
+            assert!(!set.matches(&to_ip("1.2.3.4"), false));
+        }
+        // Entries all passed over leave it empty too.
+        let set = RuleSet::read(
+            b"not-an-ip\n",
+            RuleSetFormat::ClashText,
+            Some(ClashBehavior::Ipcidr),
+            &RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert!(!set.matches(&to_ip("1.2.3.4"), false));
+    }
+
     #[test]
     fn a_damaged_binary_is_an_error_not_a_panic() {
         let data = std::fs::read(format!("{}/domains.srs", FIXTURES)).unwrap();

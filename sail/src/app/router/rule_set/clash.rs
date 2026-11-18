@@ -22,22 +22,24 @@ pub(crate) fn read(
     let lines = match format {
         RuleSetFormat::Mrs => {
             return match mrs::read(data, behavior)? {
-                mrs::Set::Domains(set) => Ok(vec![rule::default(
+                mrs::Set::Domains(set) => rule::listed(
                     Parts {
                         succinct: Some(SuccinctSet::Mihomo(set)),
                         ..Default::default()
                     },
                     "rules[0]",
                     env,
-                )?]),
-                mrs::Set::Ranges(ranges) => Ok(vec![rule::default(
+                )
+                .map(Vec::from_iter),
+                mrs::Set::Ranges(ranges) => rule::listed(
                     Parts {
                         ip_ranges: Some(ranges),
                         ..Default::default()
                     },
                     "rules[0]",
                     env,
-                )?]),
+                )
+                .map(Vec::from_iter),
             }
         }
         RuleSetFormat::ClashText => text(data)?,
@@ -56,7 +58,7 @@ pub(crate) fn from_lines(
     env: &RuntimeEnv,
 ) -> Result<Vec<Condition>> {
     match behavior {
-        ClashBehavior::Domain => Ok(vec![domain_set(lines.iter(), env)?]),
+        ClashBehavior::Domain => domain_set(lines.iter(), env).map(Vec::from_iter),
         ClashBehavior::Ipcidr => {
             let prefixes: Vec<String> = lines
                 .iter()
@@ -74,7 +76,7 @@ pub(crate) fn from_lines(
                 ip_cidr: prefixes,
                 ..Default::default()
             };
-            Ok(vec![rule::from_source(&rule, "rules[0]", env)?])
+            rule::from_list(rule, "rules[0]", env).map(Vec::from_iter)
         }
         ClashBehavior::Classical => classical(lines, env),
     }
@@ -129,11 +131,11 @@ fn yaml(_: &[u8]) -> Result<Vec<String>> {
 
 /// The domains of a domain rule-set, as Mihomo writes them: `+.x` is `x`
 /// and every name under it, `.x` every name under it, a label `*` any one
-/// label, and a plain name itself alone.
+/// label, and a plain name itself alone. None when it has no domain.
 fn domain_set<'a>(
     entries: impl Iterator<Item = &'a String>,
     env: &RuntimeEnv,
-) -> Result<Condition> {
+) -> Result<Option<Condition>> {
     let mut rule = HeadlessRule::default();
     for entry in entries {
         let entry = entry.trim().to_ascii_lowercase();
@@ -151,7 +153,7 @@ fn domain_set<'a>(
             rule.domain.push(entry);
         }
     }
-    rule::from_source(&rule, "rules[0]", env)
+    rule::from_list(rule, "rules[0]", env)
 }
 
 /// A domain with `*` labels as a regular expression, each `*` one label.
