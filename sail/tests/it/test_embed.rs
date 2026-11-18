@@ -1453,6 +1453,13 @@ async fn a_connection_s_record_tells_its_user_bytes_and_end() {
     round_trip(&mut s, b"abc").await;
     let open = instance.connections().await.unwrap();
     assert_eq!(open.len(), 1);
+    // Closed with what it has counted: close once the counts are there.
+    let counts = common::settled((3, 3), || async {
+        let live = &instance.connections().await.unwrap()[0];
+        (live.upload, live.download)
+    })
+    .await;
+    assert_eq!(counts, (3, 3));
     assert!(instance.close_connection(open[0].id).await.unwrap());
     let told = record(&mut events).await;
     assert_eq!(
@@ -1502,6 +1509,13 @@ async fn an_interim_pass_before_a_stop_records_what_is_open() {
     let mut s = socks_asked(socks, echo.port()).await;
     assert_eq!(socks_reply(&mut s).await, 0);
     round_trip(&mut s, b"hello").await;
+    // The interim record is a snapshot: report once the counts are there.
+    let counts = common::settled((5, 5), || async {
+        let live = &instance.connections().await.unwrap()[0];
+        (live.upload, live.download)
+    })
+    .await;
+    assert_eq!(counts, (5, 5));
     assert_eq!(instance.report_connections().await.unwrap(), 1);
     let interim = record(&mut events).await;
     assert_eq!(interim.kind, RecordKind::Interim);

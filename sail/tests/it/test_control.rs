@@ -142,7 +142,12 @@ fn an_instance_is_controlled_without_a_clash_api() {
         assert_eq!(c.inbound_tag, "socks-in");
         assert_eq!(c.destination, SocksAddr::from(echo));
         assert_eq!(c.chains.last().map(String::as_str), Some("sel"));
-        assert_eq!((c.upload, c.download), (4, 4));
+        let counts = common::settled((4, 4), || async {
+            let c = &rm.connections().await[0];
+            (c.upload, c.download)
+        })
+        .await;
+        assert_eq!(counts, (4, 4));
         let traffic = rm.traffic().await;
         assert_eq!(traffic.connections, 1);
         assert!(traffic.up_total >= 4 && traffic.down_total >= 4);

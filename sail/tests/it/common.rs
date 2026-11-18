@@ -119,6 +119,28 @@ fn handed_out_ports() -> std::ops::Range<u16> {
     FROM..below
 }
 
+/// What `read` gives once it is `expected`, or after 5 s what it gives
+/// then, for the caller to assert on. A connection's byte counts are taken
+/// after the write that sent the bytes returned: the answer to them can
+/// reach the client, and be counted down, while the thread that sent them
+/// has yet to count them up. A count read just after an echo trails by
+/// that much, and converges.
+pub async fn settled<T, F, Fut>(expected: T, mut read: F) -> T
+where
+    T: PartialEq,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = read().await;
+        if got == expected || tokio::time::Instant::now() >= deadline {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// A port on 127.0.0.1 that is free for both TCP and UDP, as sail inbounds
 /// bind both on the port they are given. It is taken from
 /// `handed_out_ports`, in turn from where this process began, which

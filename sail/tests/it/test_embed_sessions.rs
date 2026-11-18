@@ -344,7 +344,13 @@ async fn a_host_submits_a_users_datagrams_with_no_listener() {
         .unwrap_or_else(|| panic!("{} in {:?}", id, connections));
     assert_eq!(listed.user.as_deref(), Some("dave"));
     assert_eq!(listed.inbound_tag, "link");
-    assert_eq!((listed.upload, listed.download), (10, 10));
+    let counts = common::settled((10, 10), || async {
+        let connections = instance.connections().await.unwrap();
+        let listed = connections.iter().find(|c| c.id == id).unwrap();
+        (listed.upload, listed.download)
+    })
+    .await;
+    assert_eq!(counts, (10, 10));
     drop(to_sail);
     instance.stop().await.unwrap();
 }

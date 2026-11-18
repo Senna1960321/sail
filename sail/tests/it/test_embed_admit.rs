@@ -425,7 +425,12 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
     assert_eq!(connections.len(), 1);
     let live = &connections[0];
     assert_eq!(live.id, id);
-    assert_eq!((live.upload, live.download), (13, 13));
+    let counts = common::settled((13, 13), || async {
+        let live = &instance.connections().await.unwrap()[0];
+        (live.upload, live.download)
+    })
+    .await;
+    assert_eq!(counts, (13, 13));
     let calls = checked.lock().unwrap().clone();
     assert!(
         calls.contains(&(open.clone(), id, None, Some(rejected.run))),
@@ -541,7 +546,12 @@ async fn udp_rechecks_a_new_destination_without_spending_another_session_place()
     let connections = instance.connections().await.unwrap();
     assert_eq!(connections.len(), 1);
     assert_eq!(connections[0].id, id);
-    assert_eq!((connections[0].upload, connections[0].download), (173, 173));
+    let counts = common::settled((173, 173), || async {
+        let live = &instance.connections().await.unwrap()[0];
+        (live.upload, live.download)
+    })
+    .await;
+    assert_eq!(counts, (173, 173));
     drop(send);
     instance.stop().await.unwrap();
     let closed = tokio::time::timeout(Duration::from_secs(5), next_bound(&mut records, &binding))
