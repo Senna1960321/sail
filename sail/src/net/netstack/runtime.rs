@@ -262,6 +262,17 @@ impl NativeRuntimeControl {
             shard_count,
         })
     }
+
+    /// Every live TCP flow of each shard, by shard: a diagnostics read.
+    #[cfg(feature = "internal-diagnostics")]
+    pub(crate) async fn flow_samples(
+        &mut self,
+    ) -> io::Result<Vec<Vec<sail_netstack::tcp::TcpFlowSample>>> {
+        let receivers = self
+            .send_all(|response| TcpCommand::FlowSamples { response })
+            .await?;
+        Self::wait_all(receivers).await
+    }
 }
 
 struct FlowBridge {
@@ -583,6 +594,10 @@ impl<I: PacketIo> NativeRuntime<I> {
             }
             TcpCommand::StatsSnapshot { response } => {
                 let _ = response.send(self.runner.stats_snapshot());
+            }
+            #[cfg(feature = "internal-diagnostics")]
+            TcpCommand::FlowSamples { response } => {
+                let _ = response.send(self.runner.tcp_flow_samples());
             }
             TcpCommand::Connect {
                 local,

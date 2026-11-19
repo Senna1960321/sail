@@ -12,6 +12,9 @@ use crate::{
     TcpFlowToken, TcpOptions, TcpState, TcpTcb, TimerEvent, WireError,
 };
 
+mod flow_samples;
+pub use flow_samples::TcpFlowSample;
+
 const TCP_FLOW_METADATA_CHARGE: usize = 512;
 const TCP_CHUNK_METADATA_CHARGE: usize = 64;
 const TIME_WAIT_METADATA_CHARGE: usize = 128;

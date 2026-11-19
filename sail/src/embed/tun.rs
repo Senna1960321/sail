@@ -8,7 +8,11 @@ use sail_netstack::{
 use tokio::sync::mpsc;
 
 use super::{Error, ErrorKind, Instance};
+#[cfg(feature = "internal-diagnostics")]
+use crate::app::transport_diagnostics::BridgeCounters;
 use crate::RuntimeManager;
+#[cfg(feature = "internal-diagnostics")]
+use std::sync::Arc;
 
 /// The explicit dynamic attachment's state. Static startup TUNs are separate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,11 +43,14 @@ pub enum TunState {
 #[derive(Clone, Debug)]
 pub struct TunPacketSender {
     tx: mpsc::Sender<Vec<u8>>,
+    #[cfg(feature = "internal-diagnostics")]
+    counters: Arc<BridgeCounters>,
 }
 impl TunPacketSender {
     /// Sends one complete IPv4/IPv6 packet, without a platform address-family header.
     /// Backpressures when full. Cancellation accepts no packet; the supplied Vec
     /// is dropped. Detach wakes this call with BrokenPipe.
+    #[cfg(not(feature = "internal-diagnostics"))]
     pub async fn send(&self, packet: Vec<u8>) -> io::Result<()> {
         if packet.is_empty() || packet.len() > MAX_PACKET {
             return Err(io::Error::new(
@@ -53,6 +60,35 @@ impl TunPacketSender {
         }
         self.tx.send(packet).await.map_err(|_| closed())
     }
+
+    /// Sends one complete IPv4/IPv6 packet, without a platform address-family header.
+    /// Backpressures when full. Cancellation accepts no packet; the supplied Vec
+    /// is dropped. Detach wakes this call with BrokenPipe.
+    #[cfg(feature = "internal-diagnostics")]
+    pub async fn send(&self, packet: Vec<u8>) -> io::Result<()> {
+        if packet.is_empty() || packet.len() > MAX_PACKET {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IP packet length must be 1..=65535",
+            ));
+        }
+        // The clock is read only when the queue is full.
+        let packet = match self.tx.try_send(packet) {
+            Ok(()) => {
+                self.counters.uplink_sent();
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed()),
+            Err(mpsc::error::TrySendError::Full(packet)) => packet,
+        };
+        let since = std::time::Instant::now();
+        let sent = self.tx.send(packet).await.map_err(|_| closed());
+        self.counters.uplink_send_waited(since.elapsed());
+        if sent.is_ok() {
+            self.counters.uplink_sent();
+        }
+        sent
+    }
 }
 
 /// IP packets leaving Sail for the host's public packetFlow write API.
@@ -60,10 +96,38 @@ impl TunPacketSender {
 pub struct TunPacketReceiver {
     rx: mpsc::Receiver<Vec<u8>>,
     ended: tokio::sync::watch::Receiver<bool>,
+    #[cfg(feature = "internal-diagnostics")]
+    counters: Arc<BridgeCounters>,
 }
 impl TunPacketReceiver {
     /// Receives a whole packet. None once the attachment ends, discarding
     /// any queued output of that generation. Cancel-safe. Drop to refuse output.
+    #[cfg(feature = "internal-diagnostics")]
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        let packet = self.next().await;
+        if packet.is_some() {
+            self.counters.downlink_received();
+        }
+        packet
+    }
+
+    #[cfg(feature = "internal-diagnostics")]
+    async fn next(&mut self) -> Option<Vec<u8>> {
+        if *self.ended.borrow() {
+            self.rx.close();
+            while self.rx.try_recv().is_ok() {}
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.ended.changed() => { self.rx.close(); while self.rx.try_recv().is_ok() {} None },
+            packet = self.rx.recv() => packet,
+        }
+    }
+
+    /// Receives a whole packet. None once the attachment ends, discarding
+    /// any queued output of that generation. Cancel-safe. Drop to refuse output.
+    #[cfg(not(feature = "internal-diagnostics"))]
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         if *self.ended.borrow() {
             self.rx.close();
@@ -97,6 +161,8 @@ pub(crate) struct PacketBridge {
     tx: mpsc::Sender<Vec<u8>>,
     next: u64,
     ended: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "internal-diagnostics")]
+    counters: Arc<BridgeCounters>,
 }
 impl PacketBridge {
     pub(crate) fn pair(capacity: usize) -> Result<(Self, TunPacketFlow), Error> {
@@ -109,18 +175,28 @@ impl PacketBridge {
         let (uplink, rx) = mpsc::channel(capacity);
         let (tx, downlink) = mpsc::channel(capacity);
         let (ended, end) = tokio::sync::watch::channel(false);
+        #[cfg(feature = "internal-diagnostics")]
+        let counters = crate::app::transport_diagnostics::register_bridge(capacity);
         Ok((
             Self {
                 rx,
                 tx,
                 next: 0,
                 ended,
+                #[cfg(feature = "internal-diagnostics")]
+                counters: counters.clone(),
             },
             TunPacketFlow {
-                uplink: TunPacketSender { tx: uplink },
+                uplink: TunPacketSender {
+                    tx: uplink,
+                    #[cfg(feature = "internal-diagnostics")]
+                    counters: counters.clone(),
+                },
                 downlink: TunPacketReceiver {
                     rx: downlink,
                     ended: end,
+                    #[cfg(feature = "internal-diagnostics")]
+                    counters,
                 },
             },
         ))
@@ -140,6 +216,8 @@ impl PacketIo for PacketBridge {
             ));
         }
         let packet = self.rx.recv().await.ok_or_else(closed)?;
+        #[cfg(feature = "internal-diagnostics")]
+        self.counters.uplink_received();
         out.push(Packet::from_payload(
             PacketToken::new(self.next),
             0,
@@ -161,8 +239,23 @@ impl PacketIo for PacketBridge {
         }
         // Reserve before accepting anything. Never await after enqueue: a
         // cancelled send cannot cause an already accepted packet to be retried.
+        #[cfg(not(feature = "internal-diagnostics"))]
         let permit = self.tx.reserve().await.map_err(|_| closed())?;
+        // The clock is read only when the queue is full.
+        #[cfg(feature = "internal-diagnostics")]
+        let permit = match self.tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(closed()),
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let since = std::time::Instant::now();
+                let permit = self.tx.reserve().await.map_err(|_| closed());
+                self.counters.downlink_reserve_waited(since.elapsed());
+                permit?
+            }
+        };
         permit.send(packet.payload().to_vec());
+        #[cfg(feature = "internal-diagnostics")]
+        self.counters.downlink_sent();
         Ok(1)
     }
     fn capabilities(&self) -> PacketCapabilities {
@@ -288,5 +381,56 @@ mod tests {
             flow.downlink.recv().await.is_none(),
             "ended output is not delivered to a later generation"
         );
+    }
+
+    /// The bridge counts what each side queued and took, and how long a
+    /// side waited on a full queue: the host's send on the uplink, the
+    /// stack's on the downlink (sail#69).
+    #[cfg(feature = "internal-diagnostics")]
+    #[tokio::test]
+    async fn the_bridge_counts_packets_depths_and_waits_on_a_full_queue() {
+        use std::time::Duration;
+        const LATE: Duration = Duration::from_millis(50);
+        let (mut bridge, mut flow) = PacketBridge::pair(1).unwrap();
+        let counters = bridge.counters.clone();
+
+        // The uplink holds one; the second send waits until the stack takes it.
+        flow.uplink.send(vec![0x45]).await.unwrap();
+        let read = counters.snapshot();
+        assert_eq!((read.uplink_sent, read.uplink_depth_now), (1, 1));
+        assert_eq!(
+            read.uplink_send_waits, 0,
+            "a queue with room reads no clock"
+        );
+        let second = flow.uplink.send(vec![0x45]);
+        let take = async {
+            tokio::time::sleep(LATE).await;
+            let mut batch = PacketBatch::with_limit(1);
+            bridge.recv(&mut batch).await.unwrap();
+        };
+        let (sent, ()) = tokio::join!(second, take);
+        sent.unwrap();
+        let read = counters.snapshot();
+        assert_eq!((read.uplink_sent, read.uplink_received), (2, 1));
+        assert_eq!(read.uplink_send_waits, 1);
+        assert!(read.uplink_send_wait_ns >= 40_000_000);
+
+        // The downlink holds one; the stack's second packet waits on the host.
+        let mut out = PacketBatch::with_limit(1);
+        out.push(Packet::from_payload(PacketToken::new(0), 0, &[0x45]))
+            .unwrap();
+        bridge.send(&out).await.unwrap();
+        let second = bridge.send(&out);
+        let drain = async {
+            tokio::time::sleep(LATE).await;
+            flow.downlink.recv().await.unwrap();
+        };
+        let (sent, ()) = tokio::join!(second, drain);
+        sent.unwrap();
+        let read = counters.snapshot();
+        assert_eq!((read.downlink_sent, read.downlink_received), (2, 1));
+        assert_eq!(read.downlink_depth_now, 1);
+        assert_eq!(read.downlink_reserve_waits, 1);
+        assert!(read.downlink_reserve_wait_ns >= 40_000_000);
     }
 }

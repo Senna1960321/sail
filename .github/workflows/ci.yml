@@ -387,6 +387,7 @@ jobs:
           for features in \
             muxcore \
             internal-diagnostics \
+            internal-diagnostics,inbound-tun,outbound-direct \
             internal-udp-target-diagnostics \
             internal-udp-target-diagnostics,inbound-tun,inbound-mixed,outbound-direct,outbound-anytls \
             inbound-socks,outbound-direct \
@@ -551,7 +552,7 @@ jobs:
           set -euo pipefail
           cargo test --locked -p sail --no-default-features --features internal-diagnostics,outbound-direct \
             --lib diagnostics -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/diagnostics-base.log"
-          grep -F '7 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/diagnostics-base.log"
+          grep -F '9 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/diagnostics-base.log"
 
       - name: internal UDP policy and observations
         run: |
@@ -570,6 +571,9 @@ jobs:
             app::sessions::diagnostics_tests::diagnostics_do_not_repair_cancelled_waiting_budget \
             app::sessions::diagnostics_tests::diagnostics_keep_refusal_totals_across_warning_window_resets \
             app::sessions::diagnostics_tests::diagnostics_preserve_cancel_after_a_permit_is_released \
+            app::transport_diagnostics::tests::a_relay_counts_its_waits_on_its_writer_and_its_reader \
+            app::transport_diagnostics::tests::bridge_depths_are_what_was_queued_and_not_taken \
+            app::transport_diagnostics::tests::the_busiest_flow_is_the_one_that_moved_most_since_the_last_read \
             app::udp_target_diagnostics::tests::udp_target_exact_gate_rejects_nearby_domain_and_mapped_v6 \
             app::udp_target_diagnostics::tests::udp_target_fixed_ring_overflow_and_contention_drop \
             app::udp_target_diagnostics::tests::udp_target_getter_restart_returns_only_current_owner \

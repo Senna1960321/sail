@@ -438,6 +438,12 @@ pub const PANICS_ARE_CAUGHT: bool = cfg!(panic = "unwind");
 #[cfg(feature = "internal-diagnostics")]
 #[doc(hidden)]
 pub use crate::app::sessions::diagnostics::{AdmissionDiagnostics, InternalDiagnostics};
+#[cfg(feature = "internal-diagnostics")]
+#[doc(hidden)]
+pub use crate::app::transport_diagnostics::{
+    BridgeDiagnostics, FlowDiagnostics, InternalTransportDiagnostics, NetstackDiagnostics,
+    RelayDiagnostics, TransportDiagnostics,
+};
 #[cfg(feature = "internal-udp-target-diagnostics")]
 #[doc(hidden)]
 pub use crate::app::udp_target_diagnostics::InternalUdpTargetPolicy;

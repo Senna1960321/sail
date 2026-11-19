@@ -15,6 +15,7 @@ pub use state::{
 };
 #[cfg(feature = "fuzzing")]
 pub use table::sack_fuzzing;
+pub use table::TcpFlowSample;
 pub use table::{
     AcceptOverflowPolicy, TcpConnection, TcpEvent, TcpIngress, TcpRead, TcpTable, TcpTableConfig,
     TcpTableError, TcpTableStats, TcpTimerCancel, TcpTimerRequest,

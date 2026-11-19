@@ -304,6 +304,13 @@ struct Direction {
     /// Wakes the relay at the earliest deadline it has, or earlier: it is
     /// reset only when it fires, not on every byte.
     timer: Option<Pin<Box<Sleep>>>,
+    /// Since when it waits, and whether on its writer: counted when it is
+    /// polled again (sail#69).
+    #[cfg(feature = "internal-diagnostics")]
+    waiting: Option<(std::time::Instant, bool)>,
+    /// From the outbound to the client.
+    #[cfg(feature = "internal-diagnostics")]
+    downlink: bool,
 }
 
 impl Direction {
@@ -314,7 +321,18 @@ impl Direction {
             last_progress: Instant::now(),
             idle_timeout: None,
             timer: None,
+            #[cfg(feature = "internal-diagnostics")]
+            waiting: None,
+            #[cfg(feature = "internal-diagnostics")]
+            downlink: false,
         }
+    }
+
+    /// The direction from the outbound to the client.
+    #[cfg(feature = "internal-diagnostics")]
+    fn downlink(mut self) -> Self {
+        self.downlink = true;
+        self
     }
 
     fn is_done(&self) -> bool {
@@ -346,6 +364,14 @@ impl Direction {
         loop {
             match &mut self.state {
                 TransferState::Running(buf) => {
+                    #[cfg(feature = "internal-diagnostics")]
+                    if let Some((since, writer)) = self.waiting.take() {
+                        crate::app::transport_diagnostics::relay_waited(
+                            self.downlink,
+                            writer,
+                            since.elapsed(),
+                        );
+                    }
                     let res = buf.poll_copy(cx, reader.as_mut(), writer.as_mut());
                     if buf.take_progress() {
                         self.last_progress = Instant::now();
@@ -358,6 +384,10 @@ impl Direction {
                         Poll::Pending => {
                             let amount = buf.amount_transferred();
                             let blocked = buf.writer_blocked();
+                            #[cfg(feature = "internal-diagnostics")]
+                            {
+                                self.waiting = Some((std::time::Instant::now(), blocked));
+                            }
                             match ready!(self.poll_deadline(cx, blocked, write_stall)) {
                                 Expired::WriteStall => return Poll::Ready(Err(write_stalled())),
                                 Expired::Idle => {
@@ -537,7 +567,10 @@ where
         a,
         b,
         a_to_b: Direction::new(CopyBuffer::new_adaptive(min_size, max_size)?),
+        #[cfg(not(feature = "internal-diagnostics"))]
         b_to_a: Direction::new(CopyBuffer::new_adaptive(min_size, max_size)?),
+        #[cfg(feature = "internal-diagnostics")]
+        b_to_a: Direction::new(CopyBuffer::new_adaptive(min_size, max_size)?).downlink(),
         timeouts,
         b_first: false,
     }

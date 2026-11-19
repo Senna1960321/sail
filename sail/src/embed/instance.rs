@@ -391,6 +391,24 @@ impl Instance {
         Ok(dispatcher.internal_diagnostics(inner.id))
     }
 
+    /// `internal_diagnostics` with its `transport` child (sail#69): the
+    /// running TUN's stack and busiest flow, the packet bridge and the
+    /// relays. Reading the stack takes a round trip to each of its
+    /// shards' tasks; a host bounds the wait as it sees fit.
+    #[cfg(feature = "internal-diagnostics")]
+    #[doc(hidden)]
+    pub async fn internal_diagnostics_with_transport(
+        &self,
+    ) -> Result<super::InternalTransportDiagnostics, Error> {
+        let base = self.internal_diagnostics()?;
+        let transport = self
+            .with_manager(|manager| {
+                Box::pin(async move { crate::app::transport_diagnostics::read(&manager).await })
+            })
+            .await?;
+        Ok(super::InternalTransportDiagnostics { base, transport })
+    }
+
     /// The runtime id, unique among the instances alive.
     #[doc(hidden)]
     pub fn id(&self) -> RuntimeId {

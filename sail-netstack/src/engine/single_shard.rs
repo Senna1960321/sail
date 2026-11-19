@@ -2422,6 +2422,8 @@ fn poll_once<F: Future>(future: F) -> Option<F::Output> {
     }
 }
 
+mod flow_samples;
+
 #[cfg(test)]
 mod quoted_transport_tests {
     use super::{quoted_transport_endpoints, QuotedTransport};

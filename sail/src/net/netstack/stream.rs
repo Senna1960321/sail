@@ -62,6 +62,10 @@ pub(super) enum TcpCommand {
     StatsSnapshot {
         response: oneshot::Sender<StackStats>,
     },
+    #[cfg(feature = "internal-diagnostics")]
+    FlowSamples {
+        response: oneshot::Sender<Vec<sail_netstack::tcp::TcpFlowSample>>,
+    },
     Connect {
         local: SocketAddr,
         remote: SocketAddr,
