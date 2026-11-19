@@ -670,7 +670,8 @@ impl NatManager {
                 // they are sent before the rest.
                 // Keep only the pre-route identity, never the listed
                 // number or state of the association's counter.
-                let admission_session = match dispatcher.datagram_admission(&mut sess) {
+                let mut unlisted_number = None;
+                let mut admission_session = match dispatcher.datagram_admission(&mut sess) {
                     Ok(session) => session,
                     Err(e) => {
                         debug!("UDP binding refused: {}", e);
@@ -684,7 +685,17 @@ impl NatManager {
                     trace.emit(trace.event(super::udp_target_diagnostics::DISPATCH));
                 }
                 let dispatch = dispatcher
-                    .dispatch_datagram_tracked(sess, &mut sniffer, generation.clone())
+                    .dispatch_datagram_for_nat(
+                        sess,
+                        &mut sniffer,
+                        generation.clone(),
+                        admission_session.as_mut().map(|session| {
+                            crate::app::dispatcher::NatAdmission {
+                                session,
+                                unlisted_number: &mut unlisted_number,
+                            }
+                        }),
+                    )
                     .instrument(tracing::Span::current());
                 #[cfg(feature = "internal-udp-target-diagnostics")]
                 let socket =
@@ -699,6 +710,10 @@ impl NatManager {
                     );
                 }
                 let sniffed = sniffer.into_read();
+                // Rebind after `socket` and `unlisted_number` so cancellation
+                // drops `admission_session` before any terminal-record owner
+                // (`Accounts` or `Number`).
+                let admission_session = admission_session;
                 let (socket, listed) = match socket {
                     Ok(((s, udp_timeout, listed), pending)) => {
                         let mut entries = sessions.lock().await;
@@ -706,6 +721,9 @@ impl NatManager {
                             .get_mut(&key)
                             .filter(|entry| entry.generation.same(&generation))
                         else {
+                            drop(entries);
+                            drop(admission_session);
+                            drop(unlisted_number);
                             // The old entry may have ended while its dial
                             // awaited. Preserve that entry's already-sent
                             // reason on its own counter, never the replacement.
@@ -735,7 +753,7 @@ impl NatManager {
                     }
                 };
 
-                let (mut target_sock_recv, mut target_sock_send) = socket.split();
+                let (mut target_sock_recv, target_sock_send) = socket.split();
 
                 let sessions_uplink = sessions.clone();
                 let key_uplink = key.clone();
@@ -816,6 +834,9 @@ impl NatManager {
                 tasks.spawn(
                     "nat uplink",
                     async move {
+                        let mut target_sock_send = target_sock_send;
+                        let mut unlisted_number = unlisted_number;
+                        let mut admission_session = admission_session;
                         // Authorization is bounded independently of the
                         // association's lifetime/number of destinations.
                         // Evicted targets must be checked again. Rejected
@@ -868,6 +889,8 @@ impl NatManager {
                                     "Failed to send uplink packets on session {} to {}: {:?}",
                                     &raddr_uplink, &pkt.dst_addr, e
                                 );
+                                let _ = admission_session.take();
+                                let _ = unlisted_number.take();
                                 // This sender is terminal. Remove only its own NAT
                                 // generation, waking the downlink abort task and
                                 // dropping both Held halves rather than waiting
@@ -881,6 +904,8 @@ impl NatManager {
                                 return;
                             }
                         }
+                        let _ = admission_session.take();
+                        let _ = unlisted_number.take();
                         if let Err(e) = target_sock_send.close().await {
                             debug!("Failed to close outbound datagram {}: {}", &raddr_uplink, e);
                         }

@@ -445,11 +445,18 @@ fn rejected_attempt_records_keep_the_parent_and_json_run() {
             ..Session::default()
         };
         sm.numbering().number(&mut sess);
-        let number = sess.number.as_ref().unwrap();
-        let id = number.id();
+        let id = sess.number.as_ref().unwrap().id();
         match by {
-            ClosedBy::Host => number.refused_by_host(&sess, reason.clone()),
-            _ => number.closed(&sess, Outcome::Rejected, End::Closed(by)),
+            ClosedBy::Host => sess
+                .number
+                .clone()
+                .unwrap()
+                .refused_by_host(&mut sess, reason.clone()),
+            _ => sess
+                .number
+                .clone()
+                .unwrap()
+                .closed(&mut sess, Outcome::Rejected, End::Closed(by)),
         }
         let saved = sess.clone();
         drop(sess);
@@ -841,7 +848,7 @@ async fn a_number_told_has_one_closed_record() {
     sm.numbering().number(&mut refused);
     let number = refused.number.clone().unwrap();
     number.told(&refused);
-    number.failed(&refused, io::ErrorKind::ConnectionRefused);
+    number.failed(&mut refused, io::ErrorKind::ConnectionRefused);
     let copy = refused.clone();
     drop((refused, number));
     assert!(futures::FutureExt::now_or_never(records.recv()).is_none());
@@ -867,8 +874,8 @@ async fn a_number_told_has_one_closed_record() {
     let mut blocked = session("in", "", None, Network::Tcp);
     sm.numbering().number(&mut blocked);
     let id = blocked.number.as_ref().unwrap().id();
-    blocked.number.as_ref().unwrap().closed(
-        &blocked,
+    blocked.number.clone().unwrap().closed(
+        &mut blocked,
         Outcome::Blocked,
         End::Closed(ClosedBy::Rules),
     );
@@ -915,6 +922,137 @@ fn recent_statistics_must_not_hold_binding_slots() {
     );
     assert!(recent[0].sess.record_context.is_none());
     assert!(recent[0].sess.number.is_none());
+}
+
+#[test]
+fn closed_record_envelope_is_sole_binding_owner_once_enqueued() {
+    use std::sync::{Condvar, Mutex};
+
+    struct Gate {
+        enqueued: (Mutex<bool>, Condvar),
+        release: (Mutex<bool>, Condvar),
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                enqueued: (Mutex::new(false), Condvar::new()),
+                release: (Mutex::new(false), Condvar::new()),
+            })
+        }
+
+        fn open(&self) {
+            let (lock, cvar) = &self.release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+    }
+
+    struct OpenOnDrop(Arc<Gate>);
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    let pool = crate::control::context::ContextPool::new(1);
+    let events = EventHub::with_records(16, Some(16));
+    let lossless = events.lossless_records().unwrap().clone();
+    let mut reader = lossless.reader().unwrap();
+    let sm = Arc::new(StatManager::new(256, UserRegistry::default()).recording(events));
+
+    // 1. Unlisted refusal (untold and told): pause between enqueue and teardown end.
+    for told_first in [false, true] {
+        let gate = Gate::new();
+        let _open = OpenOnDrop(gate.clone());
+        let hook_gate = gate.clone();
+        lossless.set_after_closed_enqueue(Some(Arc::new(move || {
+            let (lock, cvar) = &hook_gate.enqueued;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
+            let (rlock, rcvar) = &hook_gate.release;
+            let _g = rcvar
+                .wait_while(rlock.lock().unwrap(), |open| !*open)
+                .unwrap();
+        })));
+
+        let mut sess = Session::default();
+        sm.numbering().number(&mut sess);
+        if told_first {
+            sess.number.as_ref().unwrap().told(&sess);
+        }
+        sess.record_context = Some(pool.bind(|| 11_u64).unwrap());
+        if told_first {
+            sess.number.as_ref().unwrap().record_context_bound(&sess);
+        }
+        sess.number
+            .clone()
+            .unwrap()
+            .refused_by_host(&mut sess, Some("policy".into()));
+
+        let handle = std::thread::spawn(move || drop(sess));
+        {
+            let (lock, cvar) = &gate.enqueued;
+            let _g = cvar
+                .wait_while(lock.lock().unwrap(), |ready| !*ready)
+                .unwrap();
+        }
+        let envelope = reader
+            .try_next_envelope()
+            .expect("closed record is already readable while teardown is paused");
+        assert_eq!(envelope.context.as_ref().unwrap().get::<u64>(), Some(&11));
+        assert!(pool.bind(|| 12_u64).is_none(), "envelope still holds slot");
+        drop(envelope);
+        // Teardown thread is still paused inside push_envelope before Counter/Number/Session finish dropping.
+        let rebound = pool
+            .bind(|| 12_u64)
+            .expect("dropping the closed envelope must free the slot before teardown finishes");
+        drop(rebound);
+        lossless.set_after_closed_enqueue(None);
+        gate.open();
+        handle.join().unwrap();
+    }
+
+    // 2. Listed connection: pause between Accounts::drop enqueue and Table::retire / retained Counter drop.
+    let gate = Gate::new();
+    let _open = OpenOnDrop(gate.clone());
+    let hook_gate = gate.clone();
+    lossless.set_after_closed_enqueue(Some(Arc::new(move || {
+        let (lock, cvar) = &hook_gate.enqueued;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
+        let (rlock, rcvar) = &hook_gate.release;
+        let _g = rcvar
+            .wait_while(rlock.lock().unwrap(), |open| !*open)
+            .unwrap();
+    })));
+    let mut sess = Session {
+        record_context: Some(pool.bind(|| 21_u64).unwrap()),
+        ..Default::default()
+    };
+    sm.numbering().number(&mut sess);
+    let accounts = sm.register(sess);
+    let retained_counter = accounts.counter.clone();
+    let handle = std::thread::spawn(move || {
+        drop(accounts);
+        drop(retained_counter);
+    });
+    {
+        let (lock, cvar) = &gate.enqueued;
+        let _g = cvar
+            .wait_while(lock.lock().unwrap(), |ready| !*ready)
+            .unwrap();
+    }
+    let envelope = reader.try_next_envelope().unwrap();
+    assert_eq!(envelope.context.as_ref().unwrap().get::<u64>(), Some(&21));
+    drop(envelope);
+    let rebound = pool
+        .bind(|| 22_u64)
+        .expect("listed closed record must move its binding into the envelope");
+    drop(rebound);
+    lossless.set_after_closed_enqueue(None);
+    gate.open();
+    handle.join().unwrap();
 }
 
 #[cfg(any(

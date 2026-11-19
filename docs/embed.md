@@ -859,7 +859,10 @@ and its optional context together. A late child owns the frozen binding
 it needs; it does not depend on a root lookup. Keep the envelope (or an
 owned clone of its context) until the existing Collector/spool has
 successfully accepted it; retain/retry it if persistence fails. Then drop
-it. Root byte cursors and binding ownership have separate lifetimes.
+it: once a connection's `Closed` record is readable, its envelope is the
+sole internal owner of that session's `RecordContext`, so dropping the
+envelope returns the slot without waiting for session teardown to finish.
+Root byte cursors and binding ownership have separate lifetimes.
 Legacy `next` / `try_next` return only the unchanged record DTO and release
 the envelope's context reference; they are unsuitable for this contract.
 Recent statistics are data-only projections: they retain IDs, timestamps,

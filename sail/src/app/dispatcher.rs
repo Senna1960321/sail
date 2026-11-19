@@ -291,6 +291,15 @@ type TrackedDatagram = (
     Option<super::router::hijack_dns::PendingAnswers>,
 );
 
+/// Per-target admission state kept by the NAT uplink after dispatch succeeds.
+/// Unlisted associations (`healthcheck.sail`, `hijack-dns`) also hand their
+/// `Number` here so `admission_session` drops before `Number::drop` emits
+/// the association's closed record.
+pub(crate) struct NatAdmission<'a> {
+    pub session: &'a mut Session,
+    pub unlisted_number: &'a mut Option<std::sync::Arc<super::stat_manager::Number>>,
+}
+
 /// A connection handed over to its outbound: what its relay keeps.
 struct Established {
     lhs: AnyStream,
@@ -377,13 +386,17 @@ impl Dispatcher {
     /// goes through here, so that none is logged and not told.
     fn handled(
         &self,
-        sess: &Session,
+        sess: &mut Session,
         outbound_tag: &str,
         told: Told<'_>,
         connect: Result<std::time::Duration, io::ErrorKind>,
     ) {
-        if let (Err(kind), Some(number)) = (connect, &sess.number) {
-            number.failed(sess, kind);
+        match connect {
+            Ok(_) => sess.record_context = None,
+            Err(kind) => match sess.number.clone() {
+                Some(number) => number.failed(sess, kind),
+                None => sess.record_context = None,
+            },
         }
         log_request(
             sess,
@@ -404,7 +417,7 @@ impl Dispatcher {
     /// copied only while someone listens for routed connections.
     fn handled_listing<T>(
         &self,
-        sess: Session,
+        mut sess: Session,
         outbound_tag: &str,
         took: std::time::Duration,
         list: impl FnOnce(Session) -> (T, u64),
@@ -413,13 +426,18 @@ impl Dispatcher {
             log_request(&sess, outbound_tag, Some(took.as_millis()));
             return list(sess).0;
         }
-        let (listed, id) = list(sess.clone());
+        let listed_sess = Session {
+            record_context: sess.record_context.take(),
+            ..sess.clone()
+        };
+        let (listed, id) = list(listed_sess);
+        let asked = sess.destination.clone();
         let told = Told {
             id: Some(id),
-            asked: Some(&sess.destination),
+            asked: Some(&asked),
             ..Default::default()
         };
-        self.handled(&sess, outbound_tag, told, Ok(took));
+        self.handled(&mut sess, outbound_tag, told, Ok(took));
         listed
     }
 
@@ -427,16 +445,18 @@ impl Dispatcher {
     /// closed record tells as blocked, or served here.
     fn unrouted(
         &self,
-        sess: &Session,
+        sess: &mut Session,
         matched: Matched,
         action: crate::control::events::RouteAction,
     ) {
         use crate::control::events::{ClosedBy, End, Outcome, RouteAction};
-        if let Some(number) = &sess.number {
+        if let Some(number) = sess.number.clone() {
             match action {
                 RouteAction::HijackDns => number.closed(sess, Outcome::Ok, End::Finished),
                 _ => number.closed(sess, Outcome::Blocked, End::Closed(ClosedBy::Rules)),
             }
+        } else {
+            sess.record_context = None;
         }
         let told = Told {
             matched,
@@ -813,6 +833,7 @@ impl Dispatcher {
         let entered = self.enter().await;
         drop(handshake);
         let Ok(place) = entered else {
+            sess.record_context = None;
             let mut lhs = lhs;
             let e = io::Error::other("connection limit reached");
             refuse(&sess, &mut lhs, &e).await;
@@ -821,12 +842,16 @@ impl Dispatcher {
         // Routing, which may sniff and resolve, runs in a future of its own
         // that is freed once it decides: the one relaying for the life of
         // the connection does not keep room for it.
-        let (mut sess, routed, matched, mut lhs) = Box::pin(self.route_stream(sess, lhs)).await?;
+        let (sess, routed, matched, mut lhs) = Box::pin(self.route_stream(sess, lhs)).await?;
+        // Rebind after `lhs` so future cancellation during `handle` drops
+        // `sess` (and any binding kept for a HostOutbound) before `lhs`
+        // (`Accounts`).
+        let mut sess = sess;
         use crate::control::events::RouteAction;
         let outbound = match routed {
             Routed::Outbound(tag) => tag,
             Routed::HijackDns => {
-                self.unrouted(&sess, matched, RouteAction::HijackDns);
+                self.unrouted(&mut sess, matched, RouteAction::HijackDns);
                 if let Err(e) =
                     // Boxed, as the dial: a connection keeps no room for it.
                     Box::pin(super::router::hijack_dns::serve_stream(
@@ -841,7 +866,7 @@ impl Dispatcher {
                 return None;
             }
             Routed::Drop => {
-                self.unrouted(&sess, matched, RouteAction::Drop);
+                self.unrouted(&mut sess, matched, RouteAction::Drop);
                 // Read and thrown away, and never answered, until the
                 // client gives up.
                 if let Some(reply) = &sess.reply {
@@ -859,8 +884,10 @@ impl Dispatcher {
         let Some(h) = self.outbound_manager.load().handler(outbound.as_deref()) else {
             warn!("handler not found");
             let e = io::Error::other("no outbound");
-            if let Some(number) = &sess.number {
-                number.failed(&sess, e.kind());
+            if let Some(number) = sess.number.clone() {
+                number.failed(&mut sess, e.kind());
+            } else {
+                sess.record_context = None;
             }
             refuse(&sess, &mut lhs, &e).await;
             return None;
@@ -876,8 +903,10 @@ impl Dispatcher {
             Ok(th) => th,
             Err(e) => {
                 debug!("get stream handler, err={}", e);
-                if let Some(number) = &sess.number {
-                    number.failed(&sess, e.kind());
+                if let Some(number) = sess.number.clone() {
+                    number.failed(&mut sess, e.kind());
+                } else {
+                    sess.record_context = None;
                 }
                 refuse(&sess, &mut lhs, &e).await;
                 return None;
@@ -902,22 +931,25 @@ impl Dispatcher {
             // failure in it is not the connection's while one is left.
             sess.chain.truncate(0);
             sess.chain.set_more(n < last);
-            let attempt;
-            let at = if to == sess.destination {
-                &sess
-            } else {
-                attempt = Session {
-                    destination: to,
-                    ..sess.clone()
+            let mut held_context = (!matches!(connect, crate::adapter::OutboundConnect::Unknown))
+                .then(|| sess.record_context.take())
+                .flatten();
+            let stream = {
+                let attempt;
+                let at = if to == sess.destination {
+                    &sess
+                } else {
+                    attempt = Session {
+                        destination: to.clone(),
+                        ..sess.clone()
+                    };
+                    &attempt
                 };
-                &attempt
-            };
-            // Where it is dialled as a name, `override_destination`.
-            let at = &*net::dial_domain::session(at, &h, &connect);
-            if self.env.events.routes_wanted() || self.env.events.records_wanted() {
-                asked = Some(at.destination.clone());
-            }
-            let stream =
+                // Where it is dialled as a name, `override_destination`.
+                let at = &*net::dial_domain::session(at, &h, &connect);
+                if self.env.events.routes_wanted() || self.env.events.records_wanted() {
+                    asked = Some(at.destination.clone());
+                }
                 // Boxed: the dial is the largest thing the session awaits,
                 // and unboxed, a relayed connection would keep room for it
                 // for as long as it lives.
@@ -939,12 +971,37 @@ impl Dispatcher {
                         );
                         net::dial_domain::failed(at, &e);
                         handshake = Err(e);
-                        continue;
+                        None
                     }
-                };
+                }
+            };
+            if stream.is_none() && handshake.is_err() && held_context.is_some() {
+                sess.record_context = held_context;
+                continue;
+            }
+            if stream.is_none()
+                && handshake.is_err()
+                && !matches!(connect, crate::adapter::OutboundConnect::Unknown)
+            {
+                // `connect_stream_routed` returned `Err(e)` when no binding was held.
+                continue;
+            }
             let stream = match stream {
                 Some(s) => {
-                    let (s, counter) = self.stat_manager.stat_stream_id(s, sess.clone());
+                    let context = match n < last {
+                        true => {
+                            sess.record_context = held_context.clone();
+                            held_context.take()
+                        }
+                        false => held_context.take().or_else(|| sess.record_context.take()),
+                    };
+                    let (s, counter) = self.stat_manager.stat_stream_id(
+                        s,
+                        Session {
+                            record_context: context,
+                            ..sess.clone()
+                        },
+                    );
                     counter.dialing();
                     id = Some(counter.id);
                     if self.stat_manager.recheck_due(sess.routed_by) {
@@ -954,6 +1011,9 @@ impl Dispatcher {
                     Some(s)
                 }
                 None => {
+                    if held_context.is_some() {
+                        sess.record_context = held_context.take();
+                    }
                     if !lhs_counted {
                         let (counted, counter) =
                             self.stat_manager.stat_inbound_stream_id(lhs, sess.clone());
@@ -969,6 +1029,17 @@ impl Dispatcher {
                     None
                 }
             };
+            let attempt;
+            let at = if to == sess.destination {
+                &sess
+            } else {
+                attempt = Session {
+                    destination: to,
+                    ..sess.clone()
+                };
+                &attempt
+            };
+            let at = &*net::dial_domain::session(at, &h, &connect);
             handshake = th.handle(at, Some(&mut lhs), stream).await;
             match &handshake {
                 Ok(_) => {
@@ -1009,7 +1080,7 @@ impl Dispatcher {
                     id,
                     asked: asked.as_ref(),
                 };
-                self.handled(&sess, h.tag(), told, Ok(elapsed));
+                self.handled(&mut sess, h.tag(), told, Ok(elapsed));
                 Some(Established {
                     lhs,
                     rhs,
@@ -1032,7 +1103,7 @@ impl Dispatcher {
                     id,
                     asked: asked.as_ref(),
                 };
-                self.handled(&sess, h.tag(), told, Err(e.kind()));
+                self.handled(&mut sess, h.tag(), told, Err(e.kind()));
                 refuse(&sess, &mut lhs, &e).await;
                 None
             }
@@ -1156,7 +1227,13 @@ impl Dispatcher {
             // connection is.
             let (stream, id) = match stream {
                 Some(s) => {
-                    let (s, counter) = self.stat_manager.stat_stream_id(s, sess.clone());
+                    let (s, counter) = self.stat_manager.stat_stream_id(
+                        s,
+                        Session {
+                            record_context: sess.record_context.take(),
+                            ..sess.clone()
+                        },
+                    );
                     counter.dialing();
                     (Some(s), Some(counter))
                 }
@@ -1174,23 +1251,33 @@ impl Dispatcher {
             Ok(connected) => connected,
             Err(e) => {
                 self.tell_failed(&sess, h.tag(), &e);
+                let asked = self
+                    .env
+                    .events
+                    .routes_wanted()
+                    .then(|| sess.destination.clone());
                 let told = Told {
-                    asked: Some(&sess.destination),
+                    asked: asked.as_ref(),
                     ..Default::default()
                 };
-                self.handled(&sess, h.tag(), told, Err(e.kind()));
+                self.handled(&mut sess, h.tag(), told, Err(e.kind()));
                 return Err(e);
             }
         };
         let elapsed = handshake_start.elapsed();
         match id {
             Some(_) => {
+                let asked = self
+                    .env
+                    .events
+                    .routes_wanted()
+                    .then(|| sess.destination.clone());
                 let told = Told {
                     id,
-                    asked: Some(&sess.destination),
+                    asked: asked.as_ref(),
                     ..Default::default()
                 };
-                self.handled(&sess, h.tag(), told, Ok(elapsed));
+                self.handled(&mut sess, h.tag(), told, Ok(elapsed));
                 Ok(rhs)
             }
             None => Ok(self.handled_listing(sess, h.tag(), elapsed, |sess| {
@@ -1227,11 +1314,16 @@ impl Dispatcher {
             Ok(d) => d,
             Err(e) => {
                 self.tell_failed(&sess, h.tag(), &e);
+                let asked = self
+                    .env
+                    .events
+                    .routes_wanted()
+                    .then(|| sess.destination.clone());
                 let told = Told {
-                    asked: Some(&sess.destination),
+                    asked: asked.as_ref(),
                     ..Default::default()
                 };
-                self.handled(&sess, h.tag(), told, Err(e.kind()));
+                self.handled(&mut sess, h.tag(), told, Err(e.kind()));
                 return Err(e);
             }
         };
@@ -1261,9 +1353,20 @@ impl Dispatcher {
 
     pub(crate) async fn dispatch_datagram_tracked(
         &self,
+        sess: Session,
+        sniffer: &mut dyn Sniffer,
+        pending: super::router::hijack_dns::PendingAnswers,
+    ) -> io::Result<TrackedDatagram> {
+        self.dispatch_datagram_for_nat(sess, sniffer, pending, None)
+            .await
+    }
+
+    pub(crate) async fn dispatch_datagram_for_nat(
+        &self,
         mut sess: Session,
         sniffer: &mut dyn Sniffer,
         pending: super::router::hijack_dns::PendingAnswers,
+        admission: Option<NatAdmission<'_>>,
     ) -> io::Result<TrackedDatagram> {
         // As a stream's: held until the session has its place, or none.
         let handshake = sess.handshake.take();
@@ -1281,10 +1384,15 @@ impl Dispatcher {
         // Its place, held by the datagram as long as the session lives.
         let entered = self.enter().await;
         drop(handshake);
-        let place = entered
-            .map_err(|()| io::Error::other("refused: inbound.max_connections sessions live"))?;
-        let ((datagram, idle, listed), pending) =
-            self.dispatch_datagram_inner(sess, sniffer, pending).await?;
+        let Ok(place) = entered else {
+            sess.record_context = None;
+            return Err(io::Error::other(
+                "refused: inbound.max_connections sessions live",
+            ));
+        };
+        let ((datagram, idle, listed), pending) = self
+            .dispatch_datagram_inner(sess, sniffer, pending, admission)
+            .await?;
         let datagram = match place {
             Some(place) => super::sessions::Held::wrap(datagram, place),
             None => datagram,
@@ -1297,6 +1405,7 @@ impl Dispatcher {
         mut sess: Session,
         sniffer: &mut dyn Sniffer,
         pending: super::router::hijack_dns::PendingAnswers,
+        admission: Option<NatAdmission<'_>>,
     ) -> io::Result<TrackedDatagram> {
         debug!(
             "dispatch proto={} in={} src={} dst={}",
@@ -1317,6 +1426,12 @@ impl Dispatcher {
 
         if let Some(domain) = sess.destination.domain() {
             if domain == "healthcheck.sail" {
+                if let Some(adm) = admission {
+                    adm.session.record_context = sess.record_context.take();
+                    *adm.unlisted_number = sess.number.clone();
+                } else {
+                    sess.record_context = None;
+                }
                 let recv = HealthcheckUdpRecvHalf {
                     responded: false,
                     src_addr: sess.destination.clone(),
@@ -1339,9 +1454,11 @@ impl Dispatcher {
             Ok(routed) => routed,
             Err(e) => {
                 if matched.rejected {
-                    self.unrouted(&sess, matched, RouteAction::Reject);
-                } else if let Some(number) = &sess.number {
-                    number.failed(&sess, e.kind());
+                    self.unrouted(&mut sess, matched, RouteAction::Reject);
+                } else if let Some(number) = sess.number.clone() {
+                    number.failed(&mut sess, e.kind());
+                } else {
+                    sess.record_context = None;
                 }
                 return Err(e);
             }
@@ -1349,7 +1466,11 @@ impl Dispatcher {
         let outbound = match routed {
             Routed::Outbound(outbound) => outbound,
             Routed::HijackDns => {
-                self.unrouted(&sess, matched, RouteAction::HijackDns);
+                if let Some(adm) = admission {
+                    adm.session.record_context = sess.record_context.clone();
+                    *adm.unlisted_number = sess.number.clone();
+                }
+                self.unrouted(&mut sess, matched, RouteAction::HijackDns);
                 let udp_timeout = sess.route.udp_timeout;
                 let d = super::router::hijack_dns::Datagram::with_pending(
                     self.dns_client.clone(),
@@ -1360,7 +1481,7 @@ impl Dispatcher {
                 return Ok(((Box::new(d), udp_timeout, None), Some(pending)));
             }
             Routed::Drop => {
-                self.unrouted(&sess, matched, RouteAction::Drop);
+                self.unrouted(&mut sess, matched, RouteAction::Drop);
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "dropped by a rule",
@@ -1371,8 +1492,10 @@ impl Dispatcher {
         let Some(h) = self.outbound_manager.load().handler(outbound.as_deref()) else {
             warn!("handler not found");
             let e = io::Error::other("handler not found");
-            if let Some(number) = &sess.number {
-                number.failed(&sess, e.kind());
+            if let Some(number) = sess.number.clone() {
+                number.failed(&mut sess, e.kind());
+            } else {
+                sess.record_context = None;
             }
             return Err(e);
         };
@@ -1388,8 +1511,10 @@ impl Dispatcher {
         let dh = match h.datagram() {
             Ok(dh) => dh,
             Err(e) => {
-                if let Some(number) = &sess.number {
-                    number.failed(&sess, e.kind());
+                if let Some(number) = sess.number.clone() {
+                    number.failed(&mut sess, e.kind());
+                } else {
+                    sess.record_context = None;
                 }
                 return Err(e);
             }
@@ -1442,8 +1567,16 @@ impl Dispatcher {
             Ok(mut d) => {
                 let elapsed = tokio::time::Instant::now().duration_since(handshake_start);
 
-                let (counted, listed) =
-                    self.stat_manager.stat_outbound_datagram_id(d, sess.clone());
+                if let Some(adm) = admission {
+                    adm.session.record_context = sess.record_context.clone();
+                }
+                let (counted, listed) = self.stat_manager.stat_outbound_datagram_id(
+                    d,
+                    Session {
+                        record_context: sess.record_context.take(),
+                        ..sess.clone()
+                    },
+                );
                 d = counted;
                 if self.stat_manager.recheck_due(sess.routed_by) {
                     self.recheck_late(&sess, listed.id).await;
@@ -1456,7 +1589,7 @@ impl Dispatcher {
                     id: Some(listed.id),
                     asked: Some(&dialed),
                 };
-                self.handled(&sess, h.tag(), told, Ok(elapsed));
+                self.handled(&mut sess, h.tag(), told, Ok(elapsed));
 
                 if reverse_mapping && sess.destination.port() == 53 {
                     d = Box::new(SniffingDatagram::new(d, self.env.reverse_map.clone()));
@@ -1492,7 +1625,7 @@ impl Dispatcher {
                     id: None,
                     asked: Some(&dialed),
                 };
-                self.handled(&sess, h.tag(), told, Err(e.kind()));
+                self.handled(&mut sess, h.tag(), told, Err(e.kind()));
                 Err(e)
             }
         }
@@ -1515,6 +1648,7 @@ impl Dispatcher {
 
         if let Some(domain) = sess.destination.domain() {
             if domain == "healthcheck.sail" {
+                sess.record_context = None;
                 if let Err(e) = healthcheck_respond_simple(&mut lhs).await {
                     debug!("healthcheck response failed: {}", e);
                 }
@@ -1525,6 +1659,7 @@ impl Dispatcher {
         self.identify_inbound(&mut sess);
         let was_address = sess.destination.domain().is_none();
         if let Err(e) = self.restore_fake_ip(&mut sess.destination) {
+            sess.record_context = None;
             debug!("src={}: {}", &sess.source, e);
             return None;
         }
@@ -1540,9 +1675,15 @@ impl Dispatcher {
                     &sess.source, &sess.destination, e
                 );
                 if matched.rejected {
-                    self.unrouted(&sess, matched, crate::control::events::RouteAction::Reject);
-                } else if let Some(number) = &sess.number {
-                    number.failed(&sess, e.kind());
+                    self.unrouted(
+                        &mut sess,
+                        matched,
+                        crate::control::events::RouteAction::Reject,
+                    );
+                } else if let Some(number) = sess.number.clone() {
+                    number.failed(&mut sess, e.kind());
+                } else {
+                    sess.record_context = None;
                 }
                 refuse(&sess, &mut sniffer.into_stream(), &e).await;
                 None
@@ -1870,7 +2011,7 @@ impl Dispatcher {
                 self.stat_manager.numbering().number(sess);
             }
             if let Err(reason) = admission.bind_session(sess) {
-                if let Some(number) = &sess.number {
+                if let Some(number) = sess.number.clone() {
                     number.refused_by_host(sess, reason.map(std::borrow::Cow::into_owned));
                 }
                 return false;
@@ -1894,9 +2035,13 @@ impl Dispatcher {
                 debug!("user [{}]: connection refused: {}", user, user.status());
                 if self.env.events.records_wanted() {
                     self.stat_manager.numbering().number(sess);
-                    if let Some(number) = &sess.number {
+                    if let Some(number) = sess.number.clone() {
                         number.closed(sess, Outcome::Rejected, End::Closed(ClosedBy::User));
+                    } else {
+                        sess.record_context = None;
                     }
+                } else {
+                    sess.record_context = None;
                 }
                 false
             }
@@ -1941,9 +2086,13 @@ impl Dispatcher {
         {
             if self.env.events.records_wanted() {
                 self.stat_manager.numbering().number(&mut probe);
-                if let Some(number) = &probe.number {
-                    number.closed(&probe, Outcome::Rejected, End::Closed(ClosedBy::User));
+                if let Some(number) = probe.number.clone() {
+                    number.closed(&mut probe, Outcome::Rejected, End::Closed(ClosedBy::User));
+                } else {
+                    probe.record_context = None;
                 }
+            } else {
+                probe.record_context = None;
             }
             return false;
         }
@@ -1952,6 +2101,8 @@ impl Dispatcher {
 
     /// Prepare a root id before dispatch, also for unlisted DNS/health
     /// associations. Numbering alone neither admits nor records a session.
+    /// The binding stays solely on `sess` until dispatch succeeds, so a
+    /// refused dispatch never holds a second reference past its closed record.
     pub(crate) fn datagram_admission(&self, sess: &mut Session) -> io::Result<Option<Session>> {
         if !self
             .env
@@ -1971,6 +2122,7 @@ impl Dispatcher {
         self.stat_manager.numbering().number(sess);
         Ok(Some(Session {
             parent_id: sess.number.as_ref().map(|number| number.id()),
+            record_context: None,
             number: None,
             state: Default::default(),
             ..sess.clone()
@@ -1996,8 +2148,10 @@ impl Dispatcher {
             "session refused by the host: {}",
             reason.as_deref().unwrap_or("its check panicked")
         );
-        if let Some(number) = &sess.number {
+        if let Some(number) = sess.number.clone() {
             number.refused_by_host(sess, reason);
+        } else {
+            sess.record_context = None;
         }
         false
     }

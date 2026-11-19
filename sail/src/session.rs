@@ -468,6 +468,10 @@ pub struct Session {
     /// What a host's inbound kind put in for its outbound kind: see
     /// `Extensions`. Empty for sail's own inbounds.
     pub extensions: Extensions,
+    /// Host-private frozen binding, shared with interim record envelopes
+    /// and moved into the closed one.
+    #[doc(hidden)]
+    pub record_context: Option<crate::control::context::RecordContext>,
     /// The number it is listed by, from when it is routed or submitted:
     /// shared by its copies. Public only as `handshake` is.
     #[doc(hidden)]
@@ -476,9 +480,6 @@ pub struct Session {
     /// Internal metadata, not a new connection or accounting identity.
     #[doc(hidden)]
     pub parent_id: Option<u64>,
-    /// Host-private frozen binding, shared with record envelopes.
-    #[doc(hidden)]
-    pub record_context: Option<crate::control::context::RecordContext>,
 }
 
 /// The members groups handed a connection to, the outermost first: each

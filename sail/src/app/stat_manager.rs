@@ -317,12 +317,16 @@ struct Reported {
     seq: u32,
     /// Its closed record was told: nothing more is.
     closed: bool,
+    /// Kept for interim records and moved into the closed record so that
+    /// once readable, the envelope is its sole owner.
+    context: Option<crate::control::context::RecordContext>,
 }
 
 impl Counter {
-    fn new(id: u64, sess: Session) -> Self {
+    fn new(id: u64, mut sess: Session) -> Self {
         let now = get_unix_timestamp();
         let started = SystemTime::now();
+        let context = sess.record_context.take();
         Counter {
             id,
             sess,
@@ -341,6 +345,7 @@ impl Counter {
                 down: 0,
                 seq: 0,
                 closed: false,
+                context,
             }),
             asked: OnceLock::new(),
             outcome: OnceLock::new(),
@@ -467,18 +472,19 @@ impl Counter {
             start: self.started,
             at,
         };
+        let context = match closed.is_some() {
+            true => reported.context.take(),
+            false => reported.context.clone(),
+        };
         *reported = Reported {
             up: up_total,
             down: down_total,
             seq: reported.seq.saturating_add(1),
             closed: closed.is_some(),
+            context: reported.context.take(),
         };
         // Under the lock: the next of this connection goes after it.
-        events.recorded_with_context(
-            closed.is_none() && !asked,
-            sess.record_context.clone(),
-            || record,
-        );
+        events.recorded_with_context(closed.is_none() && !asked, context, || record);
         true
     }
 
@@ -513,6 +519,7 @@ impl Counter {
                 down: reported.down,
                 seq: reported.seq,
                 closed: reported.closed,
+                context: None,
             }),
             asked: self.asked.clone(),
             outcome: self.outcome.clone(),
@@ -783,24 +790,27 @@ impl Number {
     }
 
     /// Its dial failed, `sess` as it was dialled, before it was counted.
-    pub fn failed(&self, sess: &Session, kind: io::ErrorKind) {
+    pub fn failed(&self, sess: &mut Session, kind: io::ErrorKind) {
         self.closed(sess, Outcome::DialFailed, End::Error(kind));
     }
 
     /// It ended unlisted, `sess` as it was then, as `outcome` and `end`
     /// tell: what its closed record tells, unless it is listed after
     /// all. Nothing while no one listens for records.
-    pub fn closed(&self, sess: &Session, outcome: Outcome, end: End) {
+    pub fn closed(&self, sess: &mut Session, outcome: Outcome, end: End) {
         self.closed_for(sess, outcome, end, None);
     }
 
     /// The host's check refused it, for `reason` (none for a check that
     /// panicked), `sess` as it was checked.
-    pub(crate) fn refused_by_host(&self, sess: &Session, reason: Option<String>) {
+    pub(crate) fn refused_by_host(&self, sess: &mut Session, reason: Option<String>) {
         self.closed_for(sess, Outcome::Rejected, End::Closed(ClosedBy::Host), reason);
     }
 
-    fn closed_for(&self, sess: &Session, outcome: Outcome, end: End, reason: Option<String>) {
+    fn closed_for(&self, sess: &mut Session, outcome: Outcome, end: End, reason: Option<String>) {
+        // Move the binding out of the session: once the closed record is
+        // queued on drop, the envelope must be its sole owner.
+        let context = sess.record_context.take();
         let Some(recorder) = &self.recorder else {
             return;
         };
@@ -811,11 +821,14 @@ impl Number {
         if self.listed.load(Ordering::Relaxed) {
             return;
         }
-        let at = told
-            .as_ref()
-            .map_or_else(SystemTime::now, |unlisted| unlisted.at);
+        let (at, prior_context) = match told.take() {
+            Some(unlisted) => (unlisted.at, unlisted.sess.record_context),
+            None => (SystemTime::now(), None),
+        };
+        let mut unlisted_sess = Self::unlisted(sess);
+        unlisted_sess.record_context = context.or(prior_context);
         *told = Some(Box::new(Unlisted {
-            sess: Self::unlisted(sess),
+            sess: unlisted_sess,
             at,
             end: Some(end),
             outcome,
@@ -923,6 +936,12 @@ impl Drop for Accounts {
                 None,
                 false,
             );
+        } else {
+            self.counter
+                .reported
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .context = None;
         }
         self.counter.recv_completed.store(true, Ordering::Relaxed);
         self.counter.send_completed.store(true, Ordering::Relaxed);

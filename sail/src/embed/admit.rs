@@ -164,3 +164,381 @@ impl Options {
         self
     }
 }
+
+#[cfg(all(test, feature = "inbound-socks", feature = "outbound-direct"))]
+mod tests {
+    use crate::embed::{
+        Address, Config, DatagramRecv, DatagramSend, Datagrams, HostStream, Instance, NewSession,
+        Options, RecordKind, Threads, Verdict,
+    };
+    use futures::future::BoxFuture;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+
+    struct OnePacket(Option<(Vec<u8>, Address)>);
+
+    impl DatagramRecv for OnePacket {
+        fn recv_from<'a>(
+            &'a mut self,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, io::Result<(usize, Address)>> {
+            Box::pin(async move {
+                match self.0.take() {
+                    Some((pkt, dst)) => {
+                        buf[..pkt.len()].copy_from_slice(&pkt);
+                        Ok((pkt.len(), dst))
+                    }
+                    None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "done")),
+                }
+            })
+        }
+    }
+
+    struct SinkDatagrams;
+
+    impl DatagramSend for SinkDatagrams {
+        fn send_to<'a>(
+            &'a mut self,
+            _data: &'a [u8],
+            _to: &'a Address,
+        ) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close(&mut self) -> BoxFuture<'_, io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        hold_call: Option<usize>,
+        entered: usize,
+        completed: usize,
+        release_all: bool,
+    }
+
+    struct HoldGate {
+        state: Mutex<GateState>,
+        cvar: Condvar,
+        changed: Notify,
+    }
+
+    impl HoldGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(GateState::default()),
+                cvar: Condvar::new(),
+                changed: Notify::new(),
+            })
+        }
+
+        fn hold_call(&self, call: usize) {
+            self.state.lock().unwrap().hold_call = Some(call);
+        }
+
+        async fn wait_entered(&self, call: usize) {
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.state.lock().unwrap().entered >= call {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        async fn finish_step(&self, expected_completed: usize) {
+            {
+                let mut st = self.state.lock().unwrap();
+                st.hold_call = None;
+                self.cvar.notify_all();
+            }
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.state.lock().unwrap().completed >= expected_completed {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn open_all(&self) {
+            let mut st = self.state.lock().unwrap();
+            st.hold_call = None;
+            st.release_all = true;
+            self.cvar.notify_all();
+        }
+
+        fn on_closed_enqueue(&self) {
+            let (call, should_hold) = {
+                let mut st = self.state.lock().unwrap();
+                st.entered += 1;
+                let call = st.entered;
+                self.changed.notify_waiters();
+                (call, !st.release_all && st.hold_call == Some(call))
+            };
+            if should_hold {
+                tokio::task::block_in_place(|| {
+                    let _g = self
+                        .cvar
+                        .wait_while(self.state.lock().unwrap(), |st| {
+                            !st.release_all && st.hold_call == Some(call)
+                        })
+                        .unwrap();
+                });
+            }
+            self.state.lock().unwrap().completed += 1;
+            self.changed.notify_waiters();
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<HoldGate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.open_all();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_closed_record_frees_slot_while_session_teardown_is_held() {
+        let allow = Arc::new(AtomicBool::new(false));
+        let allow_check = allow.clone();
+        let next_seq = Arc::new(AtomicUsize::new(1));
+        let seq_provider = next_seq.clone();
+
+        let instance = Instance::new(
+            Options::new()
+                .connection_records_lossless(8)
+                .record_context(1, move |_| seq_provider.fetch_add(1, Ordering::SeqCst))
+                .unwrap()
+                .admit(move |_| {
+                    if allow_check.load(Ordering::SeqCst) {
+                        Verdict::Accept
+                    } else {
+                        Verdict::reject("policy")
+                    }
+                })
+                .threads(Threads::Workers(2, 2 << 20)),
+        )
+        .unwrap();
+
+        let gate = HoldGate::new();
+        let _guard = ReleaseOnDrop(gate.clone());
+        let hook_gate = gate.clone();
+        instance
+            .inner()
+            .events()
+            .lossless_records()
+            .unwrap()
+            .set_after_closed_enqueue(Some(Arc::new(move || hook_gate.on_closed_enqueue())));
+
+        let mut records = instance.connection_records().unwrap();
+        instance
+            .start(Config::Json(
+                serde_json::json!({
+                    "inbounds":[{"type":"socks","tag":"in","listen":"127.0.0.1","listen_port":0}],
+                    "outbounds":[{"type":"direct","tag":"direct"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let sessions = instance.sessions("in").unwrap();
+
+        // 1. Refused TCP session: hold worker between closed-record enqueue and session drop.
+        let tcp_dst = Address::Ip("127.0.0.1:80".parse().unwrap());
+        gate.hold_call(1);
+        let (a, _b) = tokio::io::duplex(64);
+        sessions
+            .tcp(NewSession::new(tcp_dst.clone()), HostStream::new(a))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_entered(1))
+            .await
+            .unwrap();
+        let first = records.try_next_envelope().unwrap();
+        assert_eq!(
+            first.context.as_ref().and_then(|c| c.get::<usize>()),
+            Some(&1)
+        );
+        assert!(matches!(first.record.kind, RecordKind::Closed(_)));
+        drop(first);
+
+        let (c, _d) = tokio::io::duplex(64);
+        sessions
+            .tcp(NewSession::new(tcp_dst.clone()), HostStream::new(c))
+            .await
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+            .await
+            .unwrap();
+        assert_eq!(
+            second.context.as_ref().and_then(|c| c.get::<usize>()),
+            Some(&2),
+            "TCP session slot must be back in the pool as soon as the reader drops the closed record"
+        );
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(5), gate.finish_step(2))
+            .await
+            .unwrap();
+
+        // 2. Refused UDP session through NAT: admission_session must not retain a second clone either.
+        gate.hold_call(3);
+        let udp_dst = Address::Ip("127.0.0.1:5353".parse().unwrap());
+        sessions
+            .udp(
+                NewSession::new(udp_dst.clone()),
+                Datagrams {
+                    recv: Box::new(OnePacket(Some((b"x".to_vec(), udp_dst.clone())))),
+                    send: Box::new(SinkDatagrams),
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_entered(3))
+            .await
+            .unwrap();
+        let udp_first = records.try_next_envelope().unwrap();
+        assert_eq!(
+            udp_first.context.as_ref().and_then(|c| c.get::<usize>()),
+            Some(&3)
+        );
+        drop(udp_first);
+
+        let (e, _f) = tokio::io::duplex(64);
+        sessions
+            .tcp(NewSession::new(tcp_dst.clone()), HostStream::new(e))
+            .await
+            .unwrap();
+        let after_udp = tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+            .await
+            .unwrap();
+        assert_eq!(
+            after_udp.context.as_ref().and_then(|c| c.get::<usize>()),
+            Some(&4),
+            "UDP refused dispatch must not hold a second binding reference past its closed record"
+        );
+        drop(after_udp);
+        tokio::time::timeout(Duration::from_secs(5), gate.finish_step(4))
+            .await
+            .unwrap();
+
+        // 3. Accepted, relayed TCP connection closing through Accounts::drop.
+        allow.store(true, Ordering::SeqCst);
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        gate.hold_call(5);
+        let (mut client, host_side) = tokio::io::duplex(64);
+        sessions
+            .tcp(
+                NewSession::new(Address::Ip(echo_addr)),
+                HostStream::new(host_side),
+            )
+            .await
+            .unwrap();
+        let (mut peer, _) = tokio::time::timeout(Duration::from_secs(5), echo.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = client.shutdown().await;
+        drop(client);
+        let _ = peer.shutdown().await;
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_entered(5))
+            .await
+            .unwrap();
+        let relayed = records.try_next_envelope().unwrap();
+        assert_eq!(
+            relayed.context.as_ref().and_then(|c| c.get::<usize>()),
+            Some(&5)
+        );
+        drop(relayed);
+
+        allow.store(false, Ordering::SeqCst);
+        let (g, _h) = tokio::io::duplex(64);
+        sessions
+            .tcp(NewSession::new(tcp_dst.clone()), HostStream::new(g))
+            .await
+            .unwrap();
+        let after_relayed = tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+            .await
+            .unwrap();
+        assert_eq!(
+            after_relayed
+                .context
+                .as_ref()
+                .and_then(|c| c.get::<usize>()),
+            Some(&6),
+            "listed closed record must free its slot before Accounts/Established teardown finishes"
+        );
+        drop(after_relayed);
+        tokio::time::timeout(Duration::from_secs(5), gate.finish_step(6))
+            .await
+            .unwrap();
+
+        // 4. Accepted unlisted NAT UDP session (healthcheck.sail): Number::drop must run after
+        // admission_session drops, freeing the slot as soon as the closed record is dropped.
+        allow.store(true, Ordering::SeqCst);
+        gate.hold_call(7);
+        let hc_dst = Address::Domain("healthcheck.sail".into(), 53);
+        sessions
+            .udp(
+                NewSession::new(hc_dst.clone()),
+                Datagrams {
+                    recv: Box::new(OnePacket(Some((b"PING".to_vec(), hc_dst)))),
+                    send: Box::new(SinkDatagrams),
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_entered(7))
+            .await
+            .unwrap();
+        let unlisted_udp = records.try_next_envelope().unwrap();
+        assert_eq!(
+            unlisted_udp.context.as_ref().and_then(|c| c.get::<usize>()),
+            Some(&7)
+        );
+        drop(unlisted_udp);
+
+        allow.store(false, Ordering::SeqCst);
+        let (i, _j) = tokio::io::duplex(64);
+        sessions
+            .tcp(NewSession::new(tcp_dst), HostStream::new(i))
+            .await
+            .unwrap();
+        let after_unlisted_udp =
+            tokio::time::timeout(Duration::from_secs(5), records.next_envelope())
+                .await
+                .unwrap();
+        assert_eq!(
+            after_unlisted_udp
+                .context
+                .as_ref()
+                .and_then(|c| c.get::<usize>()),
+            Some(&8),
+            "unlisted NAT UDP session must release admission_session before Number::drop enqueues its closed record"
+        );
+        drop(after_unlisted_udp);
+        tokio::time::timeout(Duration::from_secs(5), gate.finish_step(8))
+            .await
+            .unwrap();
+
+        instance
+            .inner()
+            .events()
+            .lossless_records()
+            .unwrap()
+            .set_after_closed_enqueue(None);
+        instance.stop().await.unwrap();
+    }
+}

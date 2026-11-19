@@ -44,6 +44,8 @@ pub struct LosslessRecords {
     notify: tokio::sync::Notify,
     /// A reader holds it.
     taken: AtomicBool,
+    #[cfg(test)]
+    after_closed_enqueue: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Default)]
@@ -65,7 +67,17 @@ impl LosslessRecords {
             closed: AtomicUsize::new(0),
             notify: tokio::sync::Notify::new(),
             taken: AtomicBool::new(false),
+            #[cfg(test)]
+            after_closed_enqueue: Mutex::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_closed_enqueue(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .after_closed_enqueue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -99,6 +111,17 @@ impl LosslessRecords {
             }
         }
         self.notify.notify_one();
+        #[cfg(test)]
+        if closed {
+            let hook = self
+                .after_closed_enqueue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
     }
 
     /// Whether a new connection is refused: `cap` closed records wait for

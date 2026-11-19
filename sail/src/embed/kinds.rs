@@ -1484,12 +1484,12 @@ mod parent_tests {
         assert_ne!(old_key.0, new_key.0);
         assert_eq!(new_info.parent_id, old_attempt.parent_id);
         drop(new_info);
-        for (attempt, key) in [(new_attempt, new_key), (old_attempt, old_key)] {
+        for (mut attempt, key) in [(new_attempt, new_key), (old_attempt, old_key)] {
             attempt
                 .number
-                .as_ref()
+                .clone()
                 .unwrap()
-                .refused_by_host(&attempt, None);
+                .refused_by_host(&mut attempt, None);
             drop(attempt);
             let record = futures::FutureExt::now_or_never(records.recv())
                 .unwrap()
