@@ -12,6 +12,8 @@
 //	netgen hold       -proxies P1,P2 -targets T1,T2 -conns 100000 -rate 2000 -hold 60s
 //	netgen churn      -proxy P -targets T1,T2 -rate 200 -duration 30s
 //	netgen halfclose  -proxy P -target T -n 50 -bytes 1048576
+//	netgen stall      -proxy P -target T -conns 20 -bytes 1073741824 -hold 3600s
+//	netgen stallup    -proxy P -target T -conns 20 -bytes 1073741824 -hold 3600s
 //	netgen probe      -proxy P -target T -duration 60s -interval 100ms
 //
 // Without -proxy it dials the target directly. -cc gives the connections a
@@ -31,6 +33,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -431,10 +434,15 @@ type bulkResult struct {
 	Bytes   int64   `json:"bytes"`
 	Seconds float64 `json:"seconds"`
 	Mbps    float64 `json:"mbps"`
+	// Each stream's own rate, from its start to its end, in the order the
+	// streams were started (null for one that failed): streams of one
+	// multiplexed session share a TCP connection's window, separate
+	// connections each have one.
+	StreamMbps []*float64 `json:"stream_mbps"`
 }
 
 func runBulk(d dialer, streams int, size int64, dir string) any {
-	r := &bulkResult{Streams: streams}
+	r := &bulkResult{Streams: streams, StreamMbps: make([]*float64, streams)}
 	var moved atomic.Int64
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -443,6 +451,7 @@ func runBulk(d dialer, streams int, size int64, dir string) any {
 		go func(i int) {
 			defer wg.Done()
 			seed := uint64(time.Now().UnixNano()) + uint64(i)
+			began := time.Now()
 			c, err := d.dial()
 			if err != nil {
 				r.add(err)
@@ -475,6 +484,8 @@ func runBulk(d dialer, streams int, size int64, dir string) any {
 			}
 			if err == nil {
 				moved.Add(size)
+				mbps := float64(size) * 8 / time.Since(began).Seconds() / 1e6
+				r.StreamMbps[i] = &mbps
 			}
 			r.add(err)
 		}(i)
@@ -587,7 +598,17 @@ func runEcho(d dialer, conns, rounds, size int) any {
 
 type setupResult struct {
 	counts
-	Setup latencies `json:"setup"`
+	Setup setupLatencies `json:"setup"`
+}
+
+// setupLatencies are the percentiles of all the connections, and the first
+// one's own: a pooled or multiplexed protocol's first connection carries
+// the session's TCP and TLS handshakes, which the rest reuse, and in the
+// percentiles of 150 it is only the maximum.
+type setupLatencies struct {
+	latencies
+	// None (null) when the first connection failed.
+	FirstMs *float64 `json:"first_ms"`
 }
 
 // runSetup opens connections one after another: the time from dialing to
@@ -600,10 +621,15 @@ func runSetup(d dialer, n int) any {
 		err := echoOnce(d, 64)
 		r.add(err)
 		if err == nil {
-			setups = append(setups, time.Since(t0))
+			took := time.Since(t0)
+			setups = append(setups, took)
+			if i == 0 {
+				ms := float64(took.Microseconds()) / 1000
+				r.Setup.FirstMs = &ms
+			}
 		}
 	}
-	r.Setup = summarize(setups)
+	r.Setup.latencies = summarize(setups)
 	return r
 }
 
@@ -1053,15 +1079,28 @@ type stallResult struct {
 	counts
 	Conns       int `json:"conns"`
 	Established int `json:"established"`
+	// Of those established, the ones the proxy had ended (closed or reset)
+	// by the time the hold ended or netgen was told to stop, before netgen
+	// closed any; and the TCP states they were in. A stalled stream's
+	// unread data stays ahead of a FIN, so the state (TCP_INFO), not a
+	// read, tells.
+	Ended  int            `json:"ended"`
+	States map[string]int `json:"states"`
 }
 
 // runStall opens `conns` downloads of `size` bytes each and reads none of
 // them for `hold`: clients that stopped reading, whose data fills every
 // buffer on the way. With `up`, uploads of `size` bytes each to a target
 // that reads none of them: the same through the server. "STALLING n" on
-// stderr once they are all asked.
+// stderr once they are all asked. SIGTERM or SIGINT ends the hold early,
+// and the result is still printed: the harness stops it when the workload
+// beside it is done.
 func runStall(d dialer, conns int, size int64, hold time.Duration, up bool) any {
-	r := &stallResult{Conns: conns}
+	// Before the first dial: a stop that comes once STALLING is out must
+	// find the handler in place.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
+	r := &stallResult{Conns: conns, States: map[string]int{}}
 	var mu sync.Mutex
 	open := make([]net.Conn, 0, conns)
 	var wg sync.WaitGroup
@@ -1101,7 +1140,22 @@ func runStall(d dialer, conns int, size int64, hold time.Duration, up bool) any 
 	wg.Wait()
 	r.Established = len(open)
 	fmt.Fprintf(os.Stderr, "STALLING %d\n", len(open))
-	time.Sleep(hold)
+	select {
+	case <-time.After(hold):
+	case <-stop:
+	}
+	// Each one's state before any is closed: none of netgen's own closes
+	// is counted as the proxy's.
+	for _, c := range open {
+		state, err := tcpState(c)
+		if err != nil {
+			state = "unknown"
+		}
+		r.States[state]++
+		if state != "ESTABLISHED" && state != "unknown" {
+			r.Ended++
+		}
+	}
 	for _, c := range open {
 		c.Close()
 	}

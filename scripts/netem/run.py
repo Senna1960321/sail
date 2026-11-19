@@ -8,6 +8,11 @@ Run as root on the Linux test host, from this directory:
         [--inbound socks|tun] \\
         [--only SUBSTR] [--quick]
 
+Sail/1 (--protocols sail1) has sail at both ends (--servers sail, no
+sing-box client, no sb in --matrix), built with the features inbound-sail
+and outbound-sail. --only idle_wakeups counts how often the client and a
+sail server wake while --idle-conns connections sit idle.
+
 Two network namespaces (netns.sh): nc5 (nc$NETEM_NS) holds the client under
 test and the traffic tool, ns5 (ns$NETEM_NS) the protocol server (sing-box,
 the reference) and the traffic tool's server. Every scenario shapes the link between them with
@@ -65,6 +70,12 @@ UUID = "9b2b4b81-6125-4a7c-9a83-847cb325758f"
 REALITY_PRIVATE = "4KN8smrVWzyjgya4o2m-HXYFpB8hejWIldadEUV2iXE"
 REALITY_PUBLIC = "Wc6yEq9ozyhP_WaLMbd4ykhtrLcY-K69aF2exVhUAxA"
 REALITY_SHORT_ID = "0123456789abcdef"
+# Sail/1's user token: 32 bytes, unpadded base64url. Only sail speaks
+# Sail/1, both ends, and only a binary built with the features
+# inbound-sail and outbound-sail (not in the default set).
+SAIL_TOKEN = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo"
+# The protocols sing-box cannot take either end of.
+SAIL_ONLY = {"sail1"}
 # REALITY borrows a real TLS server's handshake: one in the server's
 # namespace, as there is no internet in there. It is a sing-box TLS
 # inbound, not openssl s_server: s_server takes one connection at a time,
@@ -234,8 +245,19 @@ COEXIST_SKIP_S = 5
 # 105-120 with 128 MiB) and 32 MiB at rtt150 measured mostly the climb. At
 # 128 MiB the climb is a quarter to a third of the transfer.
 # How long --stalled clients' data is given to fill the buffers on its way
-# before the workload beside them starts.
+# before the workload beside them starts: --stall-hold's default.
 STALL_SETTLE = 3
+# How long a stopped stall netgen is given to read its connections' states
+# and print them before it is killed.
+STALL_REPORT_S = 30
+
+# idle_wakeups: how long the idle connections are left before the count
+# starts (their setup's timers and acks done), and the rate they open at.
+IDLE_SETTLE_S = 10
+# --idle-stalled: how long the stalled downloads are held before the idle
+# ones open: past sail's 60 s mux.stall_timeout and its checks (5 s).
+IDLE_STALL_HOLD_S = 75
+IDLE_RATE = 100
 
 BULK_BYTES = {"rate10m": 8 << 20, "rate2m": 2 << 20, "rtt150": 128 << 20,
               "rtt300": 128 << 20, "loss5": 8 << 20, "burst2": 16 << 20}
@@ -323,6 +345,9 @@ def server_config(proto, work):
     elif proto == "anytls":
         inbound = {"type": "anytls", "listen": "0.0.0.0", "listen_port": 8443,
                    "users": [{"name": "u", "password": PASSWORD}], "tls": tls}
+    elif proto == "sail1":
+        inbound = {"type": "sail", "listen": "0.0.0.0", "listen_port": 8443,
+                   "users": [{"token": SAIL_TOKEN}], "tls": tls}
     elif proto == "trojan":
         inbound = {"type": "trojan", "listen": "0.0.0.0", "listen_port": 8443,
                    "users": [{"password": PASSWORD}],
@@ -371,6 +396,10 @@ def client_config(proto, inbound="socks", server=SERVER_ADDR, auto_detect=False)
     elif proto == "anytls":
         out = {"type": "anytls", "server": server, "server_port": 8443,
                "password": PASSWORD, "tls": insecure}
+    elif proto == "sail1":
+        # The outbound sets its own ALPN.
+        out = {"type": "sail", "server": server, "server_port": 8443,
+               "token": SAIL_TOKEN, "tls": insecure}
     elif proto == "trojan":
         out = {"type": "trojan", "server": server, "server_port": 8443,
                "password": PASSWORD,
@@ -628,7 +657,13 @@ def sender_state(samples, side, kind="proxied"):
                        "bw": total("bbr_bw_mbps"), "rtt": middle("rtt_ms"),
                        "mrtt": middle("bbr_mrtt_ms"), "cwnd": middle("cwnd"),
                        "gains": sorted({x["bbr_pacing_gain"] for x in socks
-                                        if "bbr_pacing_gain" in x})})
+                                        if "bbr_pacing_gain" in x}),
+                       # Each socket on its own, busiest first: a multiplexed
+                       # session's one connection beside separate ones.
+                       "each": sorted(({"delivery": x.get("delivery_mbps"),
+                                        "cwnd": x.get("cwnd"), "rtt": x.get("rtt_ms")}
+                                       for x in socks),
+                                      key=lambda e: -(e["delivery"] or 0))})
     return series
 
 
@@ -726,6 +761,48 @@ def proc_ticks(proc):
         return None
 
 
+def ctxt_switches(proc):
+    """(pid, the context switches of all its threads so far: voluntary and
+    not, /proc/<pid>/task/*/status), or None. Each is a wakeup of a thread
+    that slept or was preempted; a thread that exits between two readings
+    takes its own count with it."""
+    pid = proc.pid() if proc else None
+    if not pid:
+        return None
+    total = 0
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return None
+    for tid in tids:
+        try:
+            for line in open(f"/proc/{pid}/task/{tid}/status"):
+                if line.startswith(("voluntary_ctxt_switches:", "nonvoluntary_ctxt_switches:")):
+                    total += int(line.split()[1])
+        except OSError:
+            pass
+    return pid, total
+
+
+def wakeups_per_s(before, after, seconds):
+    """Context switches a second between two ctxt_switches() of one
+    process, or None."""
+    if not before or not after or before[0] != after[0] or seconds <= 0:
+        return None
+    return round((after[1] - before[1]) / seconds, 2)
+
+
+def tcp_to_server():
+    """The established TCP connections the client's namespace holds to the
+    protocol server's ports: per stream for a protocol with a connection
+    each, per session for a multiplexed one."""
+    # The state column too (a state filter drops it): fields as Sampler's.
+    out = sh(in_ns(CLIENT_NS, "ss -tanH"), check=False).stdout
+    rows = [line.split() for line in out.splitlines()]
+    return sum(1 for f in rows if len(f) >= 5 and f[0] == "ESTAB"
+               and f[4].startswith(SERVER_ADDR + ":") and port(f[4]) in PROXY_PORTS)
+
+
 def peak(samples, key):
     vals = [s[key] for s in samples if key in s]
     return max(vals) if vals else None
@@ -807,31 +884,50 @@ class Run:
         """--stalled clients: downloads nobody reads, open through the
         client for as long as the workload beside them, and how many
         opened; beside a bulk_up, --stalled-up uploads to a target that
-        reads none of them."""
+        reads none of them. They are held --stall-hold seconds before the
+        workload starts: by default for their data to fill the buffers on
+        its way, longer (past sail's 60 s mux.stall_timeout) to see whether
+        the proxy resets streams that stalled that long."""
         up = self.workload_now == "bulk_up"
-        cmd = self.netgen_cmd("stallup" if up else "stall",
-                              f"-conns {self.args.stalled_up if up else self.args.stalled}",
-                              f"-bytes {1 << 30}", "-hold 3600s")
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL,
+        return self.stall_open("stallup" if up else "stall",
+                               self.args.stalled_up if up else self.args.stalled,
+                               self.args.stall_hold)
+
+    def stall_open(self, mode, conns, hold):
+        """`conns` netgen `mode` (stall, stallup) connections, held `hold`
+        seconds once open: the process, and how many opened."""
+        cmd = self.netgen_cmd(mode, f"-conns {conns}", f"-bytes {1 << 30}", "-hold 3600s")
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, start_new_session=True)
         opened = 0
         for line in p.stderr:
             if line.startswith("STALLING"):
                 opened = int(line.split()[1])
                 break
-        # Their data on its way into every buffer it can fill.
-        time.sleep(STALL_SETTLE)
+        time.sleep(hold)
         return p, opened
 
     @staticmethod
     def stall_stop(stall):
+        """Stops the stalled clients: SIGTERM, on which netgen reads each
+        connection's TCP state before it closes any, and prints them. The
+        number opened, and how many of them the proxy had closed or reset
+        by then (None when netgen said nothing)."""
         p, opened = stall
         try:
-            os.killpg(p.pid, signal.SIGKILL)
+            os.killpg(p.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        p.communicate()
-        return opened
+        try:
+            stdout, _ = p.communicate(timeout=STALL_REPORT_S)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            stdout, _ = p.communicate()
+        try:
+            res = json.loads(stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            res = {}
+        return opened, res.get("ended"), res.get("states")
 
     def start_server(self):
         log = os.path.join(self.dir, "server.log")
@@ -973,9 +1069,12 @@ class Run:
         cell = {}
         for round_ in range(self.args.rounds):
             for workload, flags in plan:
-                # Each transfer from a cold start, as a user's first one:
-                # echo and setup follow bulk_up on the same processes.
-                if workload.startswith("bulk"):
+                # Each transfer from a cold start, as a user's first one,
+                # and setup too, so that its first connection (first_ms)
+                # pays for the session a pooled or multiplexed protocol
+                # opens; echo follows bulk_up on the same processes.
+                # (Before 2026-11-19 setup followed echo, warm.)
+                if workload.startswith("bulk") or workload == "setup":
                     self.fresh()
                 self.workload_now = workload
                 stall = (self.stall_start()
@@ -1035,8 +1134,14 @@ class Run:
                         [before] + sampler.since(m) + [after],
                         "client" if workload == "bulk_up" else "server")
                 if stall:
-                    rec["stalled"] = self.stall_stop(stall)
-                    res["stalled"] = rec["stalled"]
+                    # Opened, and of them, closed or reset by the proxy
+                    # before the harness stopped them: across the hold and
+                    # the workload.
+                    opened, reset, states = self.stall_stop(stall)
+                    rec["stalled"] = res["stalled"] = opened
+                    rec["stalled_reset"] = res["stalled_reset"] = reset
+                    rec["stalled_states"] = states
+                    rec["stall_hold_s"] = self.args.stall_hold
                 rec["round"] = round_ + 1
                 self.check(scenario, workload, res)
                 print(f"  {self.name} {scenario} {workload}: {brief(res)}", flush=True)
@@ -1052,8 +1157,13 @@ class Run:
                                   ("client_cpu_sched_s_per_gib",
                                    lambda r: r.get("client_cpu_sched_s_per_gib")),
                                   ("host_softirq_s_per_gib", lambda r: r.get("host_softirq_s_per_gib")),
-                                  ("p50_ms", lambda r: (r.get("rtt") or {}).get("p50_ms")),
-                                  ("p99_ms", lambda r: (r.get("rtt") or {}).get("p99_ms"))):
+                                  # echo's round trips, setup's connections.
+                                  ("p50_ms", lambda r: (r.get("rtt") or r.get("setup")
+                                                        or {}).get("p50_ms")),
+                                  ("p99_ms", lambda r: (r.get("rtt") or r.get("setup")
+                                                        or {}).get("p99_ms")),
+                                  ("first_ms", lambda r: (r.get("setup") or {}).get("first_ms")),
+                                  ("stalled_reset", lambda r: r.get("stalled_reset"))):
                     vals = sorted(v for v in map(pick, results) if v is not None)
                     if vals:
                         spread[f"{workload}.{key}"] = {
@@ -1358,6 +1468,67 @@ class Run:
             self.check("concurrency", f"churn{rate}", res)
             print(f"  {self.name} churn {rate}/s: {brief(res)}", flush=True)
 
+    def idle_wakeups(self, sampler):
+        """A phone's battery cost of idle connections: --idle-conns through
+        the client, open and silent (netgen hold), and over --idle-seconds,
+        after IDLE_SETTLE_S, how often the client's threads and the
+        protocol server's woke (context switches a second); then the
+        client's RSS and how many TCP connections it holds to the server,
+        so that the cost per session and per stream can be told apart."""
+        self.fresh()
+        a = self.args
+        # --idle-stalled: downloads nobody reads beside the idle ones, held
+        # past sail's 60 s mux.stall_timeout before the count, so that what
+        # a stalled stream costs once it has been parked (Sail/1) or reset
+        # (the others) is what is counted.
+        stall = (self.stall_open("stall", a.idle_stalled, IDLE_STALL_HOLD_S)
+                 if a.idle_stalled else None)
+        hold = IDLE_SETTLE_S + a.idle_seconds + 10
+        cmd = self.netgen_cmd("hold", f"-conns {a.idle_conns}", f"-rate {IDLE_RATE}",
+                              f"-hold {hold}s")
+        idle_before = self.idle(sampler, settle=1)
+        m = sampler.mark()
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, start_new_session=True)
+        holding = None
+        for line in p.stderr:
+            if line.startswith("HOLDING"):
+                holding = int(line.split()[1])
+                break
+        time.sleep(IDLE_SETTLE_S)
+        c0, s0, t0 = (ctxt_switches(self.procs["client"]),
+                      ctxt_switches(self.procs.get("server")), time.time())
+        time.sleep(a.idle_seconds)
+        c1, s1, t1 = (ctxt_switches(self.procs["client"]),
+                      ctxt_switches(self.procs.get("server")), time.time())
+        at_end = sampler.one()
+        conns = tcp_to_server()
+        stalled = self.stall_stop(stall) if stall else None
+        try:
+            stdout, _ = p.communicate(timeout=hold + 120)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            stdout, _ = p.communicate()
+        try:
+            res = json.loads(stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            res = {"failed": a.idle_conns, "_error": "hold printed no result"}
+        res.update(idle_conns=a.idle_conns, holding=holding, idle_seconds=a.idle_seconds,
+                   client_wakeups_per_s=wakeups_per_s(c0, c1, t1 - t0),
+                   server_wakeups_per_s=wakeups_per_s(s0, s1, t1 - t0),
+                   client_rss_kb=at_end.get("rss_kb"), client_tcp_to_server=conns)
+        if stalled:
+            res.update(idle_stalled=stalled[0], stalled_reset=stalled[1],
+                       stalled_states=stalled[2])
+        self.record("idle_wakeups", "hold", res, sampler.since(m), idle_before,
+                    self.idle(sampler))
+        if holding != a.idle_conns or res.get("survived") != a.idle_conns:
+            self.fail(f"idle_wakeups: {holding} held, {res.get('survived')} survived "
+                      f"of {a.idle_conns}")
+        self.check("idle_wakeups", "hold", res)
+        print(f"  {self.name} idle_wakeups: {brief(res)} rss {res['client_rss_kb']} kB",
+              flush=True)
+
     def halfclose(self, sampler):
         self.fresh()
         for scenario, spec in (("baseline", None), ("loss2", "delay 10ms loss 2%")):
@@ -1410,6 +1581,10 @@ class Run:
             self.concurrency(sampler)
         if not self.args.only or any("halfclose" in o for o in self.args.only_list):
             self.halfclose(sampler)
+        # Opt-in: a minute and more of nothing, for a battery's measure.
+        if any("idle_wakeups" in o for o in self.args.only_list):
+            netns("clear")
+            self.idle_wakeups(sampler)
 
     def go(self):
         print(f"== {self.name}", flush=True)
@@ -1445,7 +1620,8 @@ class Run:
 
 def brief(res):
     keep = ("ok", "failed", "corrupt", "mbps", "client_cpu_s_per_gib", "server_cpu_s_per_gib",
-            "rtt", "setup", "established", "survived", "_error")
+            "rtt", "setup", "established", "survived", "stalled", "stalled_reset",
+            "client_wakeups_per_s", "server_wakeups_per_s", "client_tcp_to_server", "_error")
     out = {k: res[k] for k in keep if k in res}
     for side in ("client_first", "server_first"):
         if side in res:
@@ -1572,8 +1748,9 @@ def main():
     ap.add_argument("--servers", default="sing-box")
     ap.add_argument("--only", default="",
                     help="only these scenarios, comma-separated: each a part of a shaped "
-                         "scenario's name, or disconnect, rtt_step, concurrency, halfclose; "
-                         "route_switch alone, as a run of its own")
+                         "scenario's name, or disconnect, rtt_step, concurrency, halfclose, "
+                         "idle_wakeups (only so: not in the defaults); route_switch alone, "
+                         "as a run of its own")
     ap.add_argument("--shape", action="append", default=[], metavar="NAME=SPEC",
                     help="a shaped scenario of one's own, after the fixed ones: NAME, and "
                          "what `tc qdisc ... netem` takes, e.g. rtt100='delay 50ms 5ms "
@@ -1641,6 +1818,19 @@ def main():
                     help="beside each bulk_up, N more uploads through the client and the "
                          "server to a target that reads none of them, the server's side of "
                          "--stalled (sail#18)")
+    ap.add_argument("--stall-hold", type=float, default=STALL_SETTLE, metavar="S",
+                    help="how long the --stalled/--stalled-up streams stay stalled before "
+                         f"the workload beside them starts (default {STALL_SETTLE}); e.g. 90, "
+                         "past sail's 60 s mux.stall_timeout, to count the stalled streams "
+                         "the proxy resets (stalled_reset)")
+    ap.add_argument("--idle-conns", type=int, default=32,
+                    help="idle_wakeups: idle connections held through the client (default "
+                         "32, one Sail/1 session's STREAMS_PER_SESSION)")
+    ap.add_argument("--idle-seconds", type=float, default=60,
+                    help="idle_wakeups: how long the wakeups are counted (default 60)")
+    ap.add_argument("--idle-stalled", type=int, default=0,
+                    help="idle_wakeups: also this many downloads nobody reads, held 75 s "
+                         "(past mux.stall_timeout) before the count (default 0)")
     ap.add_argument("--streams", type=int, default=4,
                     help="parallel streams of the bulk workloads (default 4)")
     ap.add_argument("--bulk-bytes-quic", type=int, default=None,
@@ -1698,6 +1888,25 @@ def main():
         known = {"sb", "sail", *args.sail_bins}
         if len(sides) != 2 or not set(sides) <= known:
             ap.error(f"--matrix {pair!r}: client>server, each of {sorted(known)}")
+    sail_only = SAIL_ONLY & set(args.protocols.split(","))
+    if sail_only:
+        # Refused here, not found out a run later as a sing-box that will
+        # not start.
+        what = ", ".join(sorted(sail_only))
+        if args.matrix:
+            with_sb = [p for p in filter(None, args.matrix.split(",")) if "sb" in p.split(">")]
+            if with_sb:
+                ap.error(f"--protocols {what}: only sail speaks it, both ends; --matrix pairs "
+                         f"with a sing-box side: {','.join(with_sb)}")
+        else:
+            if "sing-box" in args.clients.split(","):
+                ap.error(f"--protocols {what}: only sail speaks it; drop sing-box from "
+                         f"--clients")
+            if "sing-box" in args.servers.split(","):
+                ap.error(f"--protocols {what}: only sail speaks it; --servers sail (the "
+                         f"default, sing-box, cannot serve it)")
+    if args.stall_hold < 0 or args.idle_conns <= 0 or args.idle_seconds <= 0:
+        ap.error("--stall-hold: 0 or more; --idle-conns, --idle-seconds: above 0")
     pinned = set()
     for opt, value in (("--cpus", args.cpus), ("--server-cpus", args.server_cpus),
                        ("--netgen-cpus", args.netgen_cpus), ("--peer-cpus", args.peer_cpus)):

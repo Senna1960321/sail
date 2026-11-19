@@ -17,6 +17,13 @@ side by side, at the 10k level, as design-notes' 3.6 design has it.
   and down, with server CPU per GiB). --soak runs a mixed load for hours
   and samples the server's RSS every minute.
 
+- --client sail makes the load's client processes sail (--sail-client,
+  default --sail) instead of sing-box; Sail/1 (--protocols sail1) needs it,
+  and sail servers, all built with the features inbound-sail and
+  outbound-sail. With one server, the summary gives its values and no ratio.
+- idle also counts the TCP connections the load holds to the server, for
+  KB per session beside KB per stream.
+
 Everything stays in the two namespaces, which are removed on exit; no
 global sysctl is touched. Results go to <work>/results/<time>/.
 
@@ -24,6 +31,7 @@ global sysctl is touched. Results go to <work>/results/<time>/.
   python3 run.py ... --protocols trojan --rounds 1 --conns 1000   # smoke
   python3 run.py ... --soak 24 --protocols trojan --servers sail
   python3 run.py ... --sail-base W/sail-old --servers sail,sail-base   # regression
+  python3 run.py ... --client sail --servers sail --protocols sail1,anytls,trojan
 """
 import argparse, json, math, os, signal, statistics, subprocess, sys, time
 
@@ -50,6 +58,11 @@ PORT, HS_PORT, TARGET_PORT, SOCKS_BASE = 4430, 8443, 9000, 2000
 UUID = "90ee4432-671e-4ec8-8512-15d5fd0f8eab"
 PSK, USER_PSK = "AAECAwQFBgcICQoLDA0ODw==", "EBESExQVFhcYGRobHB0eHw=="
 PROTOCOLS = ["ss2022", "trojan", "vless-reality", "hy2", "tuic", "anytls"]
+# Sail/1: only sail speaks it, both ends (a binary built with the features
+# inbound-sail and outbound-sail), so not in the defaults. Its user token is
+# 32 bytes, unpadded base64url.
+SAIL_ONLY = {"sail1"}
+SAIL_TOKEN = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo"
 TICK = os.sysconf("SC_CLK_TCK")
 
 
@@ -113,6 +126,14 @@ def softnet_dropped():
         return sum(int(line.split()[1], 16) for line in f)
 
 
+def tcp_conns_to_server(cores):
+    """The established TCP connections from the load's namespace to the
+    server's port."""
+    out = sh(f"taskset -c {cores} ip netns exec {NS_C} ss -tnH state established "
+             f"'( dport = :{PORT} )'", check=False).stdout
+    return sum(1 for line in out.splitlines() if line.strip())
+
+
 def sockstat(ns):
     out = sh(f"ip netns exec {ns} cat /proc/net/sockstat", check=False).stdout
     for line in out.splitlines():
@@ -155,6 +176,8 @@ def inbound(proto, work, keys):
                          "congestion_control": "bbr", "tls": {**server_tls(work), "alpn": ["h3"]}},
         "anytls": lambda: {**base, "type": "anytls", "users": [{"name": "u", "password": "p"}],
                            "tls": server_tls(work)},
+        "sail1": lambda: {**base, "type": "sail", "users": [{"token": SAIL_TOKEN}],
+                          "tls": server_tls(work)},
     }[proto]()
 
 
@@ -170,6 +193,8 @@ def outbound(proto, tag, bind, keys):
         "tuic": lambda: {**base, "type": "tuic", "uuid": UUID, "password": "p", "congestion_control": "bbr",
                          "tls": {**client_tls(), "alpn": ["h3"]}},
         "anytls": lambda: {**base, "type": "anytls", "password": "p", "tls": client_tls()},
+        # The outbound sets its own ALPN.
+        "sail1": lambda: {**base, "type": "sail", "token": SAIL_TOKEN, "tls": client_tls()},
     }[proto]()
 
 
@@ -235,7 +260,9 @@ class Run:
         self.clients = []
         for p in range(a.processes):
             ccfg = write(f"{self.out}/client-{proto}-{p}.json", client_config(proto, p, a.carriers, self.keys))
-            self.clients.append(spawn(NS_C, self.load_cores, f"{a.singbox} run -c {ccfg}",
+            ccmd = (f"{a.sail_client} --profile {a.client_profile} -c {ccfg}" if a.client == "sail"
+                    else f"{a.singbox} run -c {ccfg}")
+            self.clients.append(spawn(NS_C, self.load_cores, ccmd,
                                       f"{self.out}/log-client-{proto}-{p}.txt"))
         time.sleep(2)
         # Warm: what is set up once per carrier or lazily is, before the base.
@@ -276,11 +303,29 @@ class Run:
                 except FileNotFoundError:
                     return
 
+        # The TCP connections the load holds to the server, at most: one a
+        # stream for most protocols (AnyTLS too: its clients carry one
+        # stream a session at a time), one a session of up to 32 streams
+        # for Sail/1, none for QUIC. Only for idle,
+        # where they are held, and every 5 s on the load's cores: ss over
+        # tens of thousands of sockets is not free.
+        if shape == "idle":
+            peak["tcp_conns"] = 0
+
+        def sample_conns():
+            while not done.wait(5):
+                peak["tcp_conns"] = max(peak["tcp_conns"], tcp_conns_to_server(self.load_cores))
+
         th = threading.Thread(target=sample)
         th.start()
+        tc = threading.Thread(target=sample_conns) if shape == "idle" else None
+        if tc:
+            tc.start()
         result = run()
         done.set()
         th.join()
+        if tc:
+            tc.join()
         time.sleep(2)
         delta = {ns: {k: v - before[ns].get(k, 0) for k, v in tcp_counters(ns).items()} for ns in (NS_S, NS_C)}
         return {"tcp_server_ns": delta[NS_S], "tcp_load_ns": delta[NS_C],
@@ -288,7 +333,8 @@ class Run:
                 "seconds": round(time.time() - t0, 2), "rss_base_kb": base_rss, "rss_peak_kb": peak["rss"],
                 "rss_after_kb": rss_kb(pid), "cpu_s": round(cpu_s(pid) - base_cpu, 3),
                 "server_sockets_peak": peak["sockets"], "load": open("/proc/loadavg").read().split()[0],
-                "server_cores": self.server_cores}
+                "server_cores": self.server_cores, "client": self.args.client,
+                "client_tcp_conns_peak": peak.get("tcp_conns")}
 
     def stop(self):
         stop(*self.clients, self.server)
@@ -311,6 +357,12 @@ def shapes(r, server, proto, a):
         g = m["netgen"]
         n = g.get("established") or g.get("ok") or 0
         m["server_kb_per_conn"] = round((m["rss_peak_kb"] - m["rss_base_kb"]) / n, 2) if n and m["shape"] == "idle" else None
+        # Per TCP connection to the server: per session where streams share
+        # one (Sail/1), the same as per stream where they do not. The
+        # streams' own cost (and their connections to the target) is in it.
+        tcp = m.get("client_tcp_conns_peak")
+        m["server_kb_per_session"] = (round((m["rss_peak_kb"] - m["rss_base_kb"]) / tcp, 2)
+                                      if tcp and m["shape"] == "idle" else None)
         if m["shape"].startswith("bulk") and g.get("bytes"):
             m["cpu_s_per_gib"] = round(m["cpu_s"] / (g["bytes"] / (1 << 30)), 3)
     return out
@@ -319,7 +371,8 @@ def shapes(r, server, proto, a):
 def summarize(results, servers):
     """Medians per (shape, protocol, server), and the paired ratio of the
     first server to the second per round with a t-based 95% interval."""
-    keys = {"idle": ["server_kb_per_conn", ("netgen", "setup", "p99_ms"), ("netgen", "setup", "p999_ms")],
+    keys = {"idle": ["server_kb_per_conn", "server_kb_per_session", "client_tcp_conns_peak",
+                     ("netgen", "setup", "p99_ms"), ("netgen", "setup", "p999_ms")],
             "churn": [("netgen", "setup", "p99_ms"), "cpu_s"],
             "bulk-down": ["cpu_s_per_gib", ("netgen", "mbps")], "bulk-up": ["cpu_s_per_gib", ("netgen", "mbps")]}
 
@@ -400,6 +453,16 @@ def soak(r, a, out):
     print(json.dumps(res))
 
 
+def cpu_set(spec):
+    """The CPUs of a taskset list, as "0-1", "2,3,6" or "2-3,6": a hostq
+    lease's CPUs ($HOSTQ_CPUS) need not be contiguous."""
+    cpus = set()
+    for part in spec.split(","):
+        first, _, last = part.partition("-")
+        cpus.update(range(int(first), int(last or first) + 1))
+    return cpus
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)
@@ -424,21 +487,39 @@ def main():
     ap.add_argument("--name", default="p36", help="the namespaces are <name>c and <name>s")
     ap.add_argument("--net", type=int, default=98, help="the link is 10.<net>.0.0/24")
     ap.add_argument("--soak", type=float, default=0, help="hours of the mixed load instead of the rounds")
+    ap.add_argument("--client", choices=["sing-box", "sail"], default="sing-box",
+                    help="what the load's client processes are (default sing-box)")
+    ap.add_argument("--sail-client", help="the sail binary of --client sail (default: --sail)")
+    ap.add_argument("--client-profile", default="server",
+                    help="the runtime profile of --client sail (default server)")
     a = ap.parse_args()
     a.protocols, a.servers = a.protocols.split(","), a.servers.split(",")
+    a.sail_client = a.sail_client or a.sail
     if not set(a.servers) <= {"sail", "sail-base", "sing-box"}:
         sys.exit("--servers: of sail, sail-base, sing-box")
     if "sail-base" in a.servers and not a.sail_base:
         sys.exit("--servers sail-base needs --sail-base")
+    if not set(a.protocols) <= set(PROTOCOLS) | SAIL_ONLY:
+        sys.exit(f"--protocols: of {','.join(PROTOCOLS + sorted(SAIL_ONLY))}")
+    sail_only = SAIL_ONLY & set(a.protocols)
+    if sail_only and a.client != "sail":
+        sys.exit(f"--protocols {','.join(sorted(sail_only))}: only sail speaks it; --client sail")
+    if sail_only and "sing-box" in a.servers:
+        sys.exit(f"--protocols {','.join(sorted(sail_only))}: only sail serves it; --servers of "
+                 f"sail, sail-base")
     configure(a.name, a.net)
     ncpu = os.cpu_count()
-    first, _, last = a.server_cores.partition("-")
-    used = set(range(int(first), int(last or first) + 1))
+    used = cpu_set(a.server_cores)
     load_cores = a.load_cores or ",".join(str(c) for c in range(ncpu) if c not in used)
     if not load_cores:
         sys.exit("--server-cores leaves no core for the load")
     out = f"{a.work}/results/{time.strftime('%Y%m%dT%H%M%S')}"
     os.makedirs(out)
+    # The servers' certificate, made once, as netem's run.py makes its own.
+    if not os.path.exists(f"{a.work}/cert.pem"):
+        sh(f"openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes "
+           f"-subj /CN=localhost -addext subjectAltName=DNS:localhost -days 30 "
+           f"-keyout {a.work}/key.pem -out {a.work}/cert.pem")
     keys = sh(f"{a.singbox} generate reality-keypair").stdout.split()
     keys = (keys[1], keys[3])
     up()
@@ -472,6 +553,12 @@ def main():
         with open(f"{out}/summary.json", "w") as f:
             json.dump(summarize(results, a.servers), f, indent=1)
         print(f"results in {out}")
+        # A cell where nothing connected measured nothing: a server that did
+        # not start, or a client that cannot reach it. Not a result.
+        empty = [f"{m['proto']}/{m['shape']}/{m['server']}" for m in results
+                 if isinstance(m.get("netgen"), dict) and not m["netgen"].get("ok")]
+        if empty:
+            sys.exit(f"nothing connected in: {', '.join(empty)}")
     finally:
         stop(hs, *(target or []))
         down()
