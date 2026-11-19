@@ -521,11 +521,10 @@ pub struct UserLimits {
 
 impl UserLimits {
     /// `expire_at`, once `Config::validate` checked it.
-    pub fn expire_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+    pub fn expire_at(&self) -> Option<std::time::SystemTime> {
         self.expire_at
             .as_deref()
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-            .map(|at| at.with_timezone(&chrono::Utc))
+            .and_then(|at| crate::util::rfc3339::parse(at).ok())
     }
 
     pub(crate) fn check(&self, name: &str) -> Result<()> {
@@ -560,7 +559,7 @@ impl UserLimits {
             ));
         }
         if let Some(at) = &self.expire_at {
-            chrono::DateTime::parse_from_rfc3339(at).map_err(|e| {
+            crate::util::rfc3339::parse(at).map_err(|e| {
                 anyhow!(
                     "{}: {:?} is not an RFC 3339 time: {}",
                     field("expire_at"),

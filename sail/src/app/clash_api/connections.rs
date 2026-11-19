@@ -97,9 +97,8 @@ fn connection(c: &ConnectionInfo, told: &Told, inbounds: &HashMap<String, (Strin
             None => (matched, ""),
         },
     };
-    let start = chrono::DateTime::from_timestamp(i64::from(c.start), 0)
-        .unwrap_or_default()
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let start = crate::util::rfc3339::seconds_from_unix(i64::from(c.start))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".into());
     let mut value = json!({
         "id": c.id.to_string(),
         "metadata": {
@@ -151,9 +150,9 @@ fn time_of(millis: u64) -> String {
     match i64::try_from(millis)
         .ok()
         .filter(|m| *m > 0)
-        .and_then(chrono::DateTime::from_timestamp_millis)
+        .and_then(crate::util::rfc3339::millis_from_unix)
     {
-        Some(at) => at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        Some(at) => at,
         None => "0001-01-01T00:00:00Z".into(),
     }
 }

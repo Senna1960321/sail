@@ -258,7 +258,7 @@ portable-atomic = "1"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
-chrono = "0.4"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "std"] }
 
 # Router
 maxminddb = "0.27"

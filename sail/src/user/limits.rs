@@ -40,7 +40,7 @@ impl Limits {
             max_connections: limits.max_connections,
             max_tcp_connections: limits.max_tcp_connections,
             quota_bytes: limits.quota_bytes,
-            expire_at: limits.expire_at().map(SystemTime::from),
+            expire_at: limits.expire_at(),
             up_mbps: limits.up_mbps,
             down_mbps: limits.down_mbps,
             total_mbps: limits.total_mbps,
