@@ -96,7 +96,8 @@ fn build(ctx: &mut OutboundContext<'_>) -> Result<AnyOutboundHandler> {
         token: Secret(token),
         connector,
         padding: Arc::new(RwLock::new(Arc::new(PaddingScheme::default_scheme()))),
-        tuning: (&ctx.env.options).into(),
+        // Windows bound what a stream holds: one nobody reads is kept.
+        tuning: Tuning::from(&ctx.env.options).parking(),
         label: format!("outbound={}", tag),
         sessions: Mutex::new(Vec::new()),
         check: Mutex::new(None),

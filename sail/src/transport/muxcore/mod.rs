@@ -19,7 +19,12 @@
 //! - A stream whose inbox holds data that nothing has read for
 //!   `Tuning::stall_timeout` is reset, alone: its data dropped, the peer
 //!   told as the protocol tells it. A stream that is read, however slowly,
-//!   never is.
+//!   never is. Where `Tuning::park_stalled` (Sail/1), a windowed stream is
+//!   parked instead, kept as a paused TCP connection is, its window
+//!   charged to the process's transfer budget until it reads or ends; it
+//!   is reset as above only where the budget has no room for it. Parked
+//!   streams keep their session, so such a session also fails once its
+//!   ping goes unanswered for `Tuning::ping_timeout`.
 //! - Without windows, a session whose connection takes nothing written to
 //!   it for `Tuning::write_stall`, the reader having stopped for a full
 //!   inbox meanwhile, fails: when neither end reads, a TCP connection may
@@ -98,6 +103,15 @@ pub struct Tuning {
     /// A client's session with no streams for this long is closed (mux,
     /// amux): the profile's carrier idle timeout.
     pub idle_timeout: Duration,
+    /// With windows: a stream whose data nothing has read for
+    /// `stall_timeout` is parked rather than reset, its window charged to
+    /// the process's transfer budget, and reset only where the budget has
+    /// no room for it (Sail/1, `Tuning::parking`).
+    pub park_stalled: bool,
+    /// With windows: a session whose ping has gone unanswered this long
+    /// fails. Parked streams keep a session open for as long as they last,
+    /// so something else has to notice a peer that is gone.
+    pub ping_timeout: Option<Duration>,
 }
 
 impl Default for Tuning {
@@ -122,11 +136,31 @@ impl From<&crate::runtime::options::RuntimeOptions> for Tuning {
                 .unwrap_or(u32::MAX)
                 .max(1 << 20),
             idle_timeout: options.profile.carrier_idle_timeout(),
+            park_stalled: false,
+            ping_timeout: None,
         }
     }
 }
 
+/// How long a parking session's ping may go unanswered. A judgment value:
+/// well past the round trips of a loaded mobile link, short of the
+/// minutes a TCP connection to a vanished peer takes to fail.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Tuning {
+    /// This tuning, for a protocol whose windows bound what each stream
+    /// holds: streams nobody reads are kept, as a TCP connection whose
+    /// reader paused is, for as long as the transfer budget has room for
+    /// their windows, and a peer that stops answering pings ends the
+    /// session (`PING_TIMEOUT`).
+    pub fn parking(self) -> Self {
+        Tuning {
+            park_stalled: true,
+            ping_timeout: Some(PING_TIMEOUT),
+            ..self
+        }
+    }
+
     /// How often streams are checked for stalling.
     fn stall_check(&self) -> Duration {
         stall::check_interval(self.stall_timeout)

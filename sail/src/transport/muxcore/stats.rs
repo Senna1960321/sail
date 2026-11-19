@@ -1,6 +1,6 @@
 //! Counters of the sessions of every protocol on the core, for all
 //! instances of the process: how many are open, their streams, and the
-//! streams reset for stalling.
+//! streams reset or parked for stalling.
 
 use portable_atomic::AtomicU64;
 use std::collections::BTreeMap;
@@ -15,6 +15,7 @@ pub struct Counters {
     sessions: AtomicU64,
     streams: AtomicU64,
     stalls: AtomicU64,
+    parks: AtomicU64,
     refused: AtomicU64,
     sessions_created: AtomicU64,
     streams_opened: AtomicU64,
@@ -48,6 +49,10 @@ impl Counters {
         self.stalls.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(super) fn parked(&self) {
+        self.parks.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn refused(&self) {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
@@ -63,6 +68,7 @@ impl Counters {
             sessions: self.sessions.load(Ordering::Relaxed),
             streams: self.streams.load(Ordering::Relaxed),
             stalls: self.stalls.load(Ordering::Relaxed),
+            parks: self.parks.load(Ordering::Relaxed),
             refused: self.refused.load(Ordering::Relaxed),
             sessions_created: self.sessions_created.load(Ordering::Relaxed),
             streams_opened: self.streams_opened.load(Ordering::Relaxed),
@@ -81,6 +87,10 @@ pub struct Snapshot {
     pub streams: u64,
     /// Streams reset since start because nothing read their data.
     pub stalls: u64,
+    /// Streams parked since start where they would have been reset:
+    /// nothing read their data, and the transfer budget had room for
+    /// their windows (Sail/1).
+    pub parks: u64,
     /// Streams the peer opened and this end turned away, since start.
     pub refused: u64,
     /// Multiplex sessions started since process start, client and server,

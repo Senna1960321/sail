@@ -145,7 +145,8 @@ fn build(ctx: &InboundContext<'_>) -> Result<AnyInboundHandler> {
         padding: Arc::new(padding),
         handshake_timeout: ctx.env.options.inbound.handshake_timeout,
         fallback,
-        tuning: (&ctx.env.options).into(),
+        // Windows bound what a stream holds: one nobody reads is kept.
+        tuning: Tuning::from(&ctx.env.options).parking(),
     });
     let core: AnyInboundHandler = Arc::new(Handler::new(tag.to_owned(), Some(stream), None));
     layers::inbound(core, &blocks, ctx)

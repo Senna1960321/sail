@@ -36,6 +36,8 @@ pub(crate) mod codec;
 pub mod inbound;
 #[cfg(feature = "outbound-sail")]
 pub mod outbound;
+#[cfg(test)]
+mod parking_tests;
 
 /// The prelude's version.
 pub(crate) const VERSION: u8 = 1;

@@ -17,7 +17,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ use tracing::{debug, trace};
 
 use super::stats::{self, Counters};
 use super::{Closing, Codec, Event, Flow, Tuning, INITIAL_WINDOW};
+use crate::runtime::transfer_budget::{self, TransferBudget};
 
 /// Stream data queued for the connection: past this, streams wait to
 /// write.
@@ -91,6 +92,10 @@ struct Slot {
     reset: bool,
     /// Reset by this end, for nothing read what it received.
     stalled: bool,
+    /// Parked (`Tuning::park_stalled`): what it charged the transfer
+    /// budget, its window when nothing had read it for the stall timeout;
+    /// zero when not parked.
+    parked: u64,
     /// The peer failed to open the stream, and said why.
     refused: Option<String>,
     /// Opened by this end, and not yet acknowledged by the peer, nor reset
@@ -132,6 +137,7 @@ impl Slot {
             local_fin: false,
             reset: false,
             stalled: false,
+            parked: 0,
             refused: None,
             unacked: false,
             sent_past_fin: false,
@@ -218,6 +224,8 @@ struct State {
     /// With windows: the ping waiting for its answer, and when it went.
     ping: Option<(u32, Instant)>,
     pings: u32,
+    /// With windows: since when a ping has gone out with none answered.
+    unanswered: Option<Instant>,
     /// Where accepted streams go, on a server.
     accept: Option<mpsc::UnboundedSender<Stream>>,
 }
@@ -228,6 +236,8 @@ struct Shared {
     closing: Closing,
     server: bool,
     tuning: Tuning,
+    /// What parked streams are charged to: the process's, but in tests.
+    budget: OnceLock<&'static TransferBudget>,
     /// Who the session serves, as its logs say it.
     label: Arc<str>,
     counters: Arc<Counters>,
@@ -387,6 +397,8 @@ impl Shared {
                 }
             }
             Event::Pong(opaque) => {
+                // Any answer says the peer is there.
+                state.unanswered = None;
                 if let Some((sent, at)) = state.ping {
                     if sent == opaque {
                         let rtt = at.elapsed();
@@ -488,12 +500,30 @@ impl Shared {
         }
         let mut stalled = Vec::new();
         for (id, slot) in state.streams.iter_mut() {
-            if slot.inbox == 0 || slot.stalled {
+            if slot.inbox == 0 || slot.stalled || slot.parked > 0 {
                 continue;
             }
             let idle = now.saturating_duration_since(slot.progress);
             if idle < self.tuning.stall_timeout {
                 continue;
+            }
+            // Its window bounds what it can come to hold: parked, as long
+            // as the budget has room for that much.
+            if self.tuning.park_stalled && self.flow == Flow::Window {
+                let window = u64::from(slot.window);
+                if self.budget().try_grow(window) {
+                    slot.parked = window;
+                    self.counters.parked();
+                    debug!(
+                        "event=stream_parked protocol={} {} stream={} buffered={} idle={}s",
+                        self.codec.name(),
+                        self.label,
+                        id,
+                        slot.inbox,
+                        idle.as_secs()
+                    );
+                    continue;
+                }
             }
             super::stall::log(
                 self.codec.name(),
@@ -554,6 +584,35 @@ impl Shared {
         ))
     }
 
+    /// What parked streams are charged to.
+    fn budget(&self) -> &'static TransferBudget {
+        self.budget
+            .get()
+            .copied()
+            .unwrap_or_else(transfer_budget::global)
+    }
+
+    /// Gives back what a parked stream charged the budget: it read, or it
+    /// is gone.
+    fn unpark(&self, slot: &mut Slot) {
+        if slot.parked > 0 {
+            self.budget().release(slot.parked);
+            slot.parked = 0;
+        }
+    }
+
+    /// Says why the session ends if its ping has gone unanswered for
+    /// `Tuning::ping_timeout`.
+    fn check_ping(&self) -> Option<String> {
+        let timeout = self.tuning.ping_timeout?;
+        let state = self.lock();
+        let since = state.unanswered?;
+        if state.error.is_some() || since.elapsed() < timeout {
+            return None;
+        }
+        Some(format!("no answer to a ping for {}s", timeout.as_secs()))
+    }
+
     /// Measures the round trip, which windows grow with.
     fn ping(&self) {
         if self.flow != Flow::Window {
@@ -566,7 +625,9 @@ impl Shared {
         state.pings = state.pings.wrapping_add(1);
         let opaque = state.pings;
         if let Some(frame) = self.codec.ping(false, opaque) {
-            state.ping = Some((opaque, Instant::now()));
+            let now = Instant::now();
+            state.ping = Some((opaque, now));
+            state.unanswered.get_or_insert(now);
             state.control.push(frame);
             drop(state);
             self.writer.notify_one();
@@ -664,11 +725,13 @@ impl Session {
                 rtt_pinned: false,
                 ping: None,
                 pings: 0,
+                unanswered: None,
                 accept: accept_tx,
             }),
             codec,
             server,
             tuning,
+            budget: OnceLock::new(),
             label: label.into(),
             counters,
             writer: Notify::new(),
@@ -791,6 +854,13 @@ impl Session {
     #[allow(dead_code)] // Not every protocol on the core uses it.
     pub(crate) fn received(&self) -> u64 {
         self.shared.lock().received
+    }
+
+    /// Parks this session's streams against `budget` rather than the
+    /// process's.
+    #[cfg(all(test, any(feature = "inbound-sail", feature = "outbound-sail")))]
+    pub(crate) fn park_against(&self, budget: &'static TransferBudget) {
+        let _ = self.shared.budget.set(budget);
     }
 
     /// Whether the session has ended, or the peer takes no new streams.
@@ -997,6 +1067,9 @@ async fn tick_loop(shared: &Shared) -> String {
             return reason;
         }
         shared.check_stalls();
+        if let Some(reason) = shared.check_ping() {
+            return reason;
+        }
         if !shared.lock().streams.is_empty() {
             shared.ping();
         }
@@ -1141,6 +1214,7 @@ impl AsyncRead for Stream {
             let was_full = slot.inbox >= shared.tuning.inbox;
             slot.inbox -= n;
             slot.progress = now;
+            shared.unpark(slot);
             if shared.flow == Flow::Pause && was_full && slot.inbox < shared.tuning.inbox {
                 state.full -= 1;
                 shared.reader.notify_one();
@@ -1294,6 +1368,8 @@ impl Drop for Stream {
             return;
         };
         shared.counters.stream_closed();
+        let mut slot = slot;
+        shared.unpark(&mut slot);
         if slot.unacked {
             state.unacked -= 1;
             shared.answered.notify_waiters();

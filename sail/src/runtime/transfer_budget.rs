@@ -1,6 +1,8 @@
 //! What all of a process's growable transfer buffers may grow by,
 //! together: Hysteria2's and TUIC's windows and the send buffers of the
-//! TCP connections inbounds accept.
+//! TCP connections inbounds accept. Sail/1's streams that nothing reads
+//! are charged their windows here too while they are kept, parked rather
+//! than reset (`transport::muxcore`).
 //!
 //! quinn (sail's fork) grows a stream's receive window while it is read
 //! about as fast as data arrives, the connection's with it, and the send
@@ -153,7 +155,7 @@ impl TransferBudget {
 
 impl TransferBudget {
     /// A budget of `limit` bytes, of no memory's: a test's own.
-    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    #[cfg(test)]
     pub(crate) fn limited(limit: u64) -> Self {
         Self {
             limit: AtomicU64::new(limit),

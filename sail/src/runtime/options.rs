@@ -452,7 +452,9 @@ pub struct Memory {
     /// accepted TCP connections (`inbound.tcp_send_buffer_max`) together
     /// may grow by past their starting sizes, in KiB: one budget for the
     /// process, so that one transfer can take a large share and many share
-    /// it. A buffer the budget cannot grow stays as it is.
+    /// it. A buffer the budget cannot grow stays as it is. Sail/1's
+    /// streams that nothing reads are charged their windows here while
+    /// they are kept (`mux.stall_timeout`).
     pub transfer_budget: usize,
     /// The memory buffers leave free, in KiB: while less than this is free
     /// (the least of MemAvailable and the process's cgroups' limits less
@@ -521,7 +523,9 @@ pub struct Mux {
     /// A stream whose received data nothing has read for this long is
     /// reset, alone, so that it holds up neither its connection nor its
     /// memory. Hysteria2's and TUIC's streams take it too, and with
-    /// `quic.credit_on_receipt` give back what was lent them.
+    /// `quic.credit_on_receipt` give back what was lent them. Sail/1's
+    /// streams are kept instead, their windows charged to
+    /// `memory.transfer_budget`, and reset only where it has no room.
     #[serde(with = "duration")]
     pub stall_timeout: Duration,
 }
