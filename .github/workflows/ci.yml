@@ -453,6 +453,7 @@ jobs:
       # info, which only costs compile and link time and cache space here.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       SAIL_SCOPE_STRICT: "1"
+      L1_FEATURES: sail/auto-reload,sail/plugin,sail/muxcore,sail/inbound-sail,sail/outbound-sail
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -475,10 +476,14 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
+      # Every step builds sail with the one feature set, L1_FEATURES, so
+      # that sail is compiled twice in all: its test build and the library
+      # the Shadowsocks plugin and the doc tests link, both here, side by
+      # side. A step with a set of its own compiles sail again (4-6 min).
       # Sail/1 (sail#60) is experimental and off by default: its features
       # are turned on here, and in L2, for its tests to run.
       - name: libraries
-        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/plugin,sail/muxcore,sail/inbound-sail,sail/outbound-sail --lib
+        run: cargo test --locked -p sail -p sail-netstack -p shadowsocks --features "$L1_FEATURES" --lib
 
       # muxcore's yamux against hashicorp/yamux, the reference
       # (scripts/yamux-peer): ignored in a plain run, and failing here
@@ -493,17 +498,13 @@ jobs:
         run: |
           (cd scripts/yamux-peer && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/yamux-peer" .)
           YAMUX_PEER="$RUNNER_TEMP/yamux-peer" cargo test --locked -p sail -p sail-netstack \
-            --features sail/auto-reload,sail/plugin,sail/muxcore --lib yamux_interop -- --ignored
-
-      # The out-of-tree plugin interface's example: the Shadowsocks plugin.
-      - name: the Shadowsocks plugin
-        run: cargo test --locked -p shadowsocks --lib
+            --features "$L1_FEATURES" --lib yamux_interop -- --ignored
 
       - name: sail-netstack's models
         run: cargo test --locked -p sail-netstack --test '*'
 
       - name: doc tests
-        run: cargo test --locked -p sail -p sail-netstack --features sail/auto-reload,sail/muxcore --doc
+        run: cargo test --locked -p sail -p sail-netstack --features "$L1_FEATURES" --doc
 
       - name: BoringSSL linked
         run: scripts/prebuilt-boringssl.sh --check "$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"
