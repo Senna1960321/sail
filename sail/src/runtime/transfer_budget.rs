@@ -155,7 +155,15 @@ impl TransferBudget {
 
 impl TransferBudget {
     /// A budget of `limit` bytes, of no memory's: a test's own.
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            feature = "inbound-sail",
+            feature = "outbound-sail"
+        )
+    ))]
     pub(crate) fn limited(limit: u64) -> Self {
         Self {
             limit: AtomicU64::new(limit),
