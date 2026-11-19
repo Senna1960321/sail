@@ -1837,6 +1837,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
       pages: write
       id-token: write
     concurrency:
