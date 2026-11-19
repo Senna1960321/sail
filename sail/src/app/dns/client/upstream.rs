@@ -91,6 +91,8 @@ impl Driver {
         std::sync::Arc::new(Driver(handle))
     }
 
+    // DoH's pool asks; HTTP/3's connection lives as long as its queries.
+    #[cfg_attr(not(feature = "dns-doh"), allow(dead_code))]
     pub(super) fn is_finished(&self) -> bool {
         self.0.is_finished()
     }

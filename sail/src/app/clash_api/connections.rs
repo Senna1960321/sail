@@ -194,12 +194,16 @@ pub(super) async fn close(State(clash): State<Arc<Clash>>, Path(id): Path<String
 /// number of rules of the rule-sets a `RuleSet` names, -1 for another.
 pub(super) async fn rules(State(clash): State<Arc<Clash>>) -> Json<Value> {
     let router = clash.rm.router();
+    #[cfg(feature = "rule-set")]
     let sizes: HashMap<String, usize> = router
         .rule_sets()
         .list()
         .into_iter()
         .map(|set| (set.tag, set.size))
         .collect();
+    // No rule-sets without the feature: every rule's size is -1.
+    #[cfg(not(feature = "rule-set"))]
+    let sizes: HashMap<String, usize> = HashMap::new();
     let rules: Vec<Value> = router
         .rules_with_stats()
         .enumerate()

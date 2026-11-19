@@ -6,7 +6,6 @@ use tokio::sync::RwLock;
 
 pub mod manager;
 
-#[cfg(feature = "outbound-select")]
 #[cfg(feature = "plugin")]
 pub mod plugin;
 #[cfg(feature = "outbound-select")]

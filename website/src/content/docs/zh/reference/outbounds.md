@@ -399,7 +399,7 @@ Rust 定义：[`PassOptions`](https://github.com/peakpassvpn/sail/blob/master/sa
 
 ## `outbounds[plugin]`
 
-Rust 定义：[`PluginOutboundOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/src/app/outbound/plugin.rs) · 构建条件：`feature = "outbound-select"` 且 `feature = "plugin"` · **sail 扩展**
+Rust 定义：[`PluginOutboundOptions`](https://github.com/peakpassvpn/sail/blob/master/sail/src/app/outbound/plugin.rs) · 构建条件：`feature = "plugin"` · **sail 扩展**
 
 | 字段 | 类型 | 默认 | 状态 | 说明 |
 | --- | --- | --- | --- | --- |

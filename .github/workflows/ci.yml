@@ -410,6 +410,10 @@ jobs:
             config-surge,inbound-mixed,outbound-direct \
             outbound-provider,outbound-select,outbound-direct,inbound-socks \
             api,outbound-direct \
+            clash-api \
+            dns-h3 \
+            outbound-shadowsocks \
+            plugin \
             dns-h3,dns-doh,outbound-direct \
             outbound-fallback,outbound-direct \
             config-clash,outbound-fallback,outbound-direct \

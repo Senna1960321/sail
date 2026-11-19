@@ -273,6 +273,7 @@ fn anonymous_sessions_are_also_pinned_for_every_cipher() {
 
 /// Combined A-plan regression: immutable authenticated row snapshots
 /// survive reload, while a different same-name row cannot steal its peer.
+#[cfg(feature = "inbound-shadowsocks")]
 #[tokio::test]
 async fn authenticated_row_context_stays_with_the_cipher_peer_across_reload() {
     let pool = crate::control::context::ContextPool::new(2);
