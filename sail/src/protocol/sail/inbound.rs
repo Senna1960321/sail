@@ -41,9 +41,10 @@ use crate::protocol::fallback::{Fallback, FallbackServer, HEADER_TIMEOUT};
 use crate::session::{Session as ProxySession, StreamId};
 use crate::transport::layers::{self, Blocks, InboundBlocks, Listable};
 use crate::transport::muxcore::{self, Tuning};
+use crate::transport::uot;
 
 use super::codec::{self, Role, Sail};
-use super::{read_stream_header, Head, Status, NETWORK_TCP, PRELUDE_HEAD, VERSION};
+use super::{read_stream_header, Head, Status, NETWORK_TCP, NETWORK_UDP, PRELUDE_HEAD, VERSION};
 
 /// Streams handshaken and waiting for the listener to take them.
 const INCOMING_QUEUE: usize = 64;
@@ -280,8 +281,14 @@ async fn accept(
         }
     };
     let (network, destination) = header;
-    if network != NETWORK_TCP {
-        // UDP comes with sail#60's second phase.
+    // UDP is UoT version 2 to its magic address, served where every
+    // inbound's is (`app::inbound::magic`); the network says which, and
+    // the two must agree.
+    let udp = uot::version(&destination) == Some(2);
+    if (network == NETWORK_UDP) != udp
+        || (network == NETWORK_TCP && uot::version(&destination).is_some())
+    {
+        debug!("sail stream {}: network {} to {}", id, network, destination);
         stream.fail(Status::Unsupported);
         return;
     }

@@ -31,9 +31,10 @@ use crate::session::{Session, SocksAddr};
 use crate::transport::idle::{self, Idle};
 use crate::transport::layers::{Blocks, Connector};
 use crate::transport::muxcore::{self, Tuning};
+use crate::transport::uot;
 
 use super::codec::{self, Role, Sail};
-use super::{prelude, stream_header, Status, NETWORK_TCP};
+use super::{prelude, stream_header, Status, NETWORK_TCP, NETWORK_UDP};
 
 /// The streams one session carries at once; a stream past them opens a new
 /// session. Judgment, to be measured against AnyTLS in sail#60's third
@@ -100,9 +101,11 @@ fn build(ctx: &mut OutboundContext<'_>) -> Result<AnyOutboundHandler> {
         sessions: Mutex::new(Vec::new()),
         check: Mutex::new(None),
     });
+    let stream: AnyOutboundStreamHandler = Arc::new(StreamHandler { client });
     Ok(HandlerBuilder::default()
         .tag(tag.to_owned())
-        .stream_handler(Arc::new(StreamHandler { client }))
+        .stream_handler(stream.clone())
+        .datagram_handler(uot::datagram_handler(stream))
         .build())
 }
 
@@ -201,7 +204,19 @@ impl Client {
 
     /// A stream to `sess.destination`, its header written.
     pub(crate) async fn open(self: &Arc<Self>, sess: &Session) -> io::Result<ClientStream> {
-        let header = stream_header(NETWORK_TCP, &sess.destination)?;
+        // UDP comes as UoT version 2 to its magic address
+        // (`uot::datagram_handler`), which the network says.
+        let network = match uot::version(&sess.destination) {
+            Some(2) => NETWORK_UDP,
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "sail: UDP over TCP version 1",
+                ))
+            }
+            None => NETWORK_TCP,
+        };
+        let header = stream_header(network, &sess.destination)?;
         let reused = match sess.new_conn_once {
             true => None,
             false => self.kept(),

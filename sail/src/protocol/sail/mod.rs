@@ -11,7 +11,10 @@
 //!   the client holds; a server with another sends it a SCHEME frame.
 //! - A stream begins, client to server, with `network u8 (1 TCP, 2 UDP) |
 //!   atyp u8 (1 IPv4, 2 domain, 3 IPv6) | alen u8 (domain only) | addr |
-//!   port u16`, its data right after: the client does not wait.
+//!   port u16`, its data right after: the client does not wait. A UDP
+//!   stream is to `sp.v2.udp-over-tcp.arpa` and carries sing-box's UDP
+//!   over TCP, version 2 (`transport::uot`): its request, then packets,
+//!   each naming its address.
 //! - The server's first byte on a stream is its status: 0 connected, its
 //!   data after; else why not (`Status`), and the stream is reset.
 
@@ -55,7 +58,8 @@ pub(crate) enum Status {
     Connected = 0,
     /// The server's rules refused it.
     Refused = 1,
-    /// Not something the server does (UDP, for now).
+    /// Not something the server does: a network and destination that do
+    /// not agree.
     Unsupported = 2,
     /// The server's outbound failed to connect.
     UpstreamFailed = 3,
@@ -216,7 +220,8 @@ pub(crate) async fn read_stream_header<R: AsyncRead + Unpin>(
         }
     };
     let port = r.read_u16().await?;
-    if port == 0 {
+    // UoT's magic address has port 0, which no TCP destination has.
+    if port == 0 && network != NETWORK_UDP {
         return Err(invalid("port 0"));
     }
     Ok((
@@ -294,6 +299,13 @@ mod tests {
             let (n, a) = read_stream_header(&mut &bytes[..]).await.unwrap();
             assert_eq!((n, a), (network, addr));
         }
+        // UDP's magic address, with its port 0.
+        let magic = crate::transport::uot::magic_destination();
+        let bytes = stream_header(NETWORK_UDP, &magic).unwrap();
+        assert_eq!(
+            read_stream_header(&mut &bytes[..]).await.unwrap(),
+            (NETWORK_UDP, magic)
+        );
         for bad in [
             &[3u8, 1, 1, 1, 1, 1, 0, 80][..],
             &[1, 9, 1, 1, 1, 1, 0, 80],

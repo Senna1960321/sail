@@ -1,7 +1,7 @@
 //! Sail/1 between sail instances (sail#60): streams share one TLS
 //! connection, the server's padding scheme reaches the client, a user the
-//! rules refuse and a target that refuses fail fast, and a half-close
-//! carries through.
+//! rules refuse and a target that refuses fail fast, a half-close
+//! carries through, and UDP goes over the same session's streams.
 //!
 //! A counting TCP forwarder in front of the server shows the client's
 //! connections to it.
@@ -111,6 +111,31 @@ async fn echo_stream(
         timeout(Duration::from_secs(10), async { tokio::join!(write, read) }).await?;
     written?;
     anyhow::ensure!(back? == data, "stream {} echoed something else", seed);
+    Ok(())
+}
+
+/// Echoes a few packets through each of two UDP associations: UoT over
+/// Sail/1 streams, each packet naming its address.
+async fn echo_datagrams(socks_port: u16, echo: SocketAddr) -> anyhow::Result<()> {
+    let sess = session_to(echo);
+    for round in 0..2u8 {
+        let dgram = timeout(
+            Duration::from_secs(5),
+            common::new_socks_datagram("127.0.0.1", socks_port, &sess, None, None),
+        )
+        .await??;
+        let (mut r, mut s) = dgram.split();
+        for i in 0..3u8 {
+            let msg = vec![round * 16 + i; 100 + i as usize * 500];
+            s.send_to(&msg, &sess.destination).await?;
+            let mut buf = vec![0u8; 4096];
+            let (n, from) = timeout(Duration::from_secs(5), r.recv_from(&mut buf))
+                .await
+                .map_err(|_| anyhow::anyhow!("udp round {} packet {}: no echo", round, i))??;
+            anyhow::ensure!(buf[..n] == msg[..], "udp echo mismatch");
+            anyhow::ensure!(from == sess.destination, "udp echo from {}", from);
+        }
+    }
     Ok(())
 }
 
@@ -257,6 +282,18 @@ fn test_sail_to_sail() -> anyhow::Result<()> {
             }
             // The refused stream did not take the session down.
             echo_stream(socks, echo, 7, 5000).await?;
+
+            // UDP, over streams of the same session.
+            let (udp_echo, udp_server) = common::run_udp_echo_server("127.0.0.1:0").await?;
+            let udp_server = tokio::spawn(udp_server);
+            let udp = echo_datagrams(socks, udp_echo).await;
+            udp_server.abort();
+            udp?;
+            anyhow::ensure!(
+                connections.load(Ordering::SeqCst) == 1,
+                "UDP opened {} connections in all, not 1",
+                connections.load(Ordering::SeqCst)
+            );
             echo_server.abort();
             anyhow::Ok(())
         });
