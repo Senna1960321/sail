@@ -447,9 +447,7 @@ jobs:
     needs: receipts
     if: ${{ !cancelled() && needs.receipts.result != 'skipped' && needs.receipts.outputs.l1 != 'true' }}
     runs-on: ubuntu-latest
-    # The diagnostics suites below compile sail twice more; #56 splits
-    # them into their own job, each back to 20.
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
       # Line numbers in a failing test's backtrace, without the full debug
       # info, which only costs compile and link time and cache space here.
