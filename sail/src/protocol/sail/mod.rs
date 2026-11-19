@@ -32,6 +32,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::session::SocksAddr;
 
 pub(crate) mod codec;
+#[cfg(feature = "outbound-sail")]
+mod dials;
 #[cfg(feature = "inbound-sail")]
 pub mod inbound;
 #[cfg(feature = "outbound-sail")]

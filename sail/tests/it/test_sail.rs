@@ -57,6 +57,12 @@ fn certs(name: &str) -> anyhow::Result<Certs> {
 
 /// A TCP forwarder to `target`, and the count of its connections.
 async fn counting_forwarder(target: u16) -> anyhow::Result<(u16, Arc<AtomicUsize>)> {
+    slow_forwarder(target, Duration::ZERO).await
+}
+
+/// A counting forwarder that holds each connection `delay` before it
+/// forwards anything: a dial that takes that long.
+async fn slow_forwarder(target: u16, delay: Duration) -> anyhow::Result<(u16, Arc<AtomicUsize>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let count = Arc::new(AtomicUsize::new(0));
@@ -65,6 +71,7 @@ async fn counting_forwarder(target: u16) -> anyhow::Result<(u16, Arc<AtomicUsize
         while let Ok((mut inbound, _)) = listener.accept().await {
             counted.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
                 if let Ok(mut outbound) = TcpStream::connect(("127.0.0.1", target)).await {
                     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                 }
@@ -294,6 +301,54 @@ fn test_sail_to_sail() -> anyhow::Result<()> {
                 "UDP opened {} connections in all, not 1",
                 connections.load(Ordering::SeqCst)
             );
+            echo_server.abort();
+            anyhow::Ok(())
+        });
+        common::shutdown_instances(&rt, ids);
+        result
+    })
+}
+
+// A burst of streams on cold pools, each dial held 300 ms: 16 share one
+// session's dial, and 40 two, with STREAMS_PER_SESSION at 32. Each burst
+// through a client of its own.
+#[test]
+fn test_sail_cold_pool_shares_dials() -> anyhow::Result<()> {
+    let certs = certs("sail-cold")?;
+    common::retry_port_clash(|| {
+        let [server, sixteen, forty] = common::free_ports();
+        let rt = runtime()?;
+        let (to16, count16) = rt.block_on(slow_forwarder(server, Duration::from_millis(300)))?;
+        let (to40, count40) = rt.block_on(slow_forwarder(server, Duration::from_millis(300)))?;
+        let ids = common::run_sail_instances(
+            &rt,
+            vec![
+                sail_server(server, &certs),
+                socks_to_sail(sixteen, to16, ALICE, &certs),
+                socks_to_sail(forty, to40, ALICE, &certs),
+            ],
+        )?;
+        let result = rt.block_on(async {
+            let (echo, echo_server) = common::run_tcp_echo_server("127.0.0.1:0").await?;
+            let echo_server = tokio::spawn(echo_server);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            for (port, streams, count, want) in
+                [(sixteen, 16u8, &count16, 1), (forty, 40, &count40, 2)]
+            {
+                let burst: Vec<_> = (0..streams)
+                    .map(|i| tokio::spawn(echo_stream(port, echo, i, 20_000)))
+                    .collect();
+                for task in burst {
+                    task.await??;
+                }
+                anyhow::ensure!(
+                    count.load(Ordering::SeqCst) == want,
+                    "{} streams at once on a cold pool: {} connections, not {}",
+                    streams,
+                    count.load(Ordering::SeqCst),
+                    want
+                );
+            }
             echo_server.abort();
             anyhow::Ok(())
         });

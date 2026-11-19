@@ -9,7 +9,11 @@
 //!
 //! Sessions are kept and shared by streams, up to `STREAMS_PER_SESSION` at
 //! once each, and closed once they have had none for the profile's carrier
-//! idle timeout.
+//! idle timeout. Streams that find no session with room wait for one being
+//! dialled that has room for them, or dial one: as many sessions are
+//! dialled at once as the waiting streams need, a burst of streams on a
+//! cold pool sharing them rather than each dialling its own. A dial that
+//! fails fails every stream waiting for it; none dials again for itself.
 
 use std::io;
 use std::pin::Pin;
@@ -34,6 +38,7 @@ use crate::transport::muxcore::{self, Tuning};
 use crate::transport::uot;
 
 use super::codec::{self, Role, Sail};
+use super::dials::Dials;
 use super::{prelude, stream_header, Status, NETWORK_TCP, NETWORK_UDP};
 
 /// The streams one session carries at once; a stream past them opens a new
@@ -41,6 +46,12 @@ use super::{prelude, stream_header, Status, NETWORK_TCP, NETWORK_UDP};
 /// phase: windows keep one stream from holding the others back, and fewer
 /// sessions are fewer TLS handshakes.
 const STREAMS_PER_SESSION: usize = 32;
+
+/// How long a session's dial may take, connection, TLS and prelude
+/// together, before the streams waiting for it fail. Judgment: sing-box's
+/// TCP connect timeout is 5 s, and a TLS handshake over a slow mobile link
+/// takes several round trips more.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The shared blocks that make its connections.
 const CONNECTION_BLOCKS: Blocks = Blocks {
@@ -100,6 +111,7 @@ fn build(ctx: &mut OutboundContext<'_>) -> Result<AnyOutboundHandler> {
         tuning: Tuning::from(&ctx.env.options).parking(),
         label: format!("outbound={}", tag),
         sessions: Mutex::new(Vec::new()),
+        dials: Arc::new(Dials::new(STREAMS_PER_SESSION, DIAL_TIMEOUT)),
         check: Mutex::new(None),
     });
     let stream: AnyOutboundStreamHandler = Arc::new(StreamHandler { client });
@@ -127,6 +139,9 @@ pub(crate) struct Client {
     tuning: Tuning,
     label: String,
     sessions: Mutex<Vec<Pooled>>,
+    /// Sessions being dialled, which streams wait for: their lock is taken
+    /// before `sessions`' where both are.
+    dials: Arc<Dials<Arc<muxcore::Session>>>,
     /// The idle check, started with the first session.
     check: Mutex<Option<idle::Check>>,
 }
@@ -156,6 +171,20 @@ impl Client {
             .iter()
             .find(|p| p.session.is_reusable() && p.session.num_streams() < STREAMS_PER_SESSION)
             .map(|p| p.session.clone())
+    }
+
+    /// A session for one more stream: a kept one with room, or one being
+    /// dialled with room, or a new one dialled for it and the streams that
+    /// come while it is (`dials`).
+    async fn session(self: &Arc<Self>, sess: &Session) -> io::Result<Arc<muxcore::Session>> {
+        let client = self.clone();
+        let sess = sess.clone();
+        self.dials
+            .get(
+                || self.kept(),
+                move || async move { client.dial(&sess).await },
+            )
+            .await
     }
 
     /// A new session, kept for the streams after this one.
@@ -218,17 +247,14 @@ impl Client {
             None => NETWORK_TCP,
         };
         let header = stream_header(network, &sess.destination)?;
-        let reused = match sess.new_conn_once {
-            true => None,
-            false => self.kept(),
-        };
-        let mut stream = match reused {
-            Some(session) => match session.open().await {
+        let mut stream = if sess.new_conn_once {
+            self.dial(sess).await?.open().await?
+        } else {
+            match self.session(sess).await?.open().await {
                 Ok(stream) => stream,
-                // Gone since it was found: a new one.
-                Err(_) => self.dial(sess).await?.open().await?,
-            },
-            None => self.dial(sess).await?.open().await?,
+                // Gone since it was found or dialled: another.
+                Err(_) => self.session(sess).await?.open().await?,
+            }
         };
         stream.write_all(&header).await?;
         Ok(ClientStream {
