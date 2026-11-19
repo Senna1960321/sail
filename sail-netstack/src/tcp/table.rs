@@ -1027,8 +1027,10 @@ impl TcpTable {
                 recent_at_ms: now_ms,
             });
             let default_peer_mss = if key.source.is_ipv4() { 536 } else { 1_220 };
-            flow.max_send_segment_bytes = max_segment_payload_bytes.min(usize::from(
-                options.maximum_segment_size.unwrap_or(default_peer_mss),
+            flow.max_send_segment_bytes = max_segment_payload_bytes.min(peer_segment_bytes(
+                usize::from(options.maximum_segment_size.unwrap_or(default_peer_mss)),
+                flow.sack_permitted,
+                flow.timestamp.is_some(),
             ));
             if let Some(mtu) = link_mtu {
                 lower_flow_mtu(key, flow, mtu);
@@ -1874,8 +1876,10 @@ impl TcpTable {
     /// options the SYN asks for.
     fn passive_segment_bytes(&self, key: TcpFlowKey, options: &TcpOptions) -> usize {
         let default_peer_mss = if key.source.is_ipv4() { 536 } else { 1_220 };
-        let bytes = self.local_mss(key.source).min(usize::from(
-            options.maximum_segment_size.unwrap_or(default_peer_mss),
+        let bytes = self.local_mss(key.source).min(peer_segment_bytes(
+            usize::from(options.maximum_segment_size.unwrap_or(default_peer_mss)),
+            options.sack_permitted,
+            options.timestamps.is_some(),
         ));
         self.config.link_mtu.map_or(bytes, |mtu| {
             bytes.min(segment_ceiling(
@@ -3596,14 +3600,33 @@ fn link_mss(ipv4: bool, mtu: usize) -> usize {
 /// timestamps and three SACK blocks; with timestamps alone, their 10 bytes
 /// padded to 12 (RFC 7323 3).
 fn segment_ceiling(ipv4: bool, sack_permitted: bool, timestamps: bool, mtu: usize) -> usize {
-    let options = if sack_permitted {
+    link_mss(ipv4, mtu)
+        .saturating_sub(option_allowance(sack_permitted, timestamps))
+        .max(1)
+}
+
+/// The most payload a segment to a peer that announced `peer_mss` carries:
+/// its MSS counts no options (RFC 6691 2), so those our segments may carry
+/// come off it, as off the link's MSS in [`segment_ceiling`]. A peer
+/// announcing 1460 for a 1500-byte link takes 1448 with timestamps, 1420
+/// with SACK; 1460 would make packets of up to 1520 bytes.
+fn peer_segment_bytes(peer_mss: usize, sack_permitted: bool, timestamps: bool) -> usize {
+    peer_mss
+        .saturating_sub(option_allowance(sack_permitted, timestamps))
+        .max(1)
+}
+
+/// The option bytes a flow's segments may carry: with SACK the whole
+/// 40-byte option space, timestamps and up to three blocks; with
+/// timestamps alone their 10 bytes padded to 12.
+const fn option_allowance(sack_permitted: bool, timestamps: bool) -> usize {
+    if sack_permitted {
         TCP_MAX_OPTION_BYTES
     } else if timestamps {
         TCP_TIMESTAMP_OPTION_BYTES
     } else {
         0
-    };
-    link_mss(ipv4, mtu).saturating_sub(options).max(1)
+    }
 }
 
 fn lower_flow_mtu(key: TcpFlowKey, flow: &mut TcpFlow, mtu: usize) -> bool {

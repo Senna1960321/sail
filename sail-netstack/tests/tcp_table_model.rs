@@ -4644,3 +4644,102 @@ fn time_wait_keeps_unread_bytes_until_the_application_lets_go() {
     // Read in TIME-WAIT's compact entry, the stream has ended.
     assert!(table.read(token, usize::MAX).unwrap().bytes.is_empty());
 }
+
+/// A peer's MSS counts no options (RFC 6691 2): segments to a client that
+/// announced 1460 for its 1500-byte link stay within 1500 bytes with the
+/// options they carry, though the stack's own link (a TUN of 9000) allows
+/// more. Taking 1460 as the payload made packets of 1520.
+#[test]
+fn segments_to_a_peer_fit_its_mss_with_their_options() {
+    fn syn_options(sack: bool) -> Vec<u8> {
+        // MSS 1460, window scale 7, timestamps, SACK permitted or NOPs.
+        let mut options = vec![2, 4, 0x05, 0xb4, 1, 3, 3, 7, 8, 10];
+        options.extend_from_slice(&100_u32.to_be_bytes());
+        options.extend_from_slice(&0_u32.to_be_bytes());
+        options.extend_from_slice(if sack { &[4, 2] } else { &[1, 1] });
+        options
+    }
+    for (offset, sack, payload) in [(70, false, 1_448), (71, true, 1_420)] {
+        let ledger = ResourceLedger::new(BudgetProfile::Mobile.budget()).unwrap();
+        let mut table = TcpTable::new(
+            ledger,
+            NetworkGeneration::new(1),
+            TcpTableConfig {
+                max_segment_payload_bytes: 8_960,
+                ..TcpTableConfig::default()
+            },
+        );
+        let (source, destination) = endpoints(offset);
+        let syn = packet_with_options(
+            source,
+            destination,
+            100,
+            0,
+            TcpFlags::SYN,
+            &syn_options(sack),
+        );
+        let syn_ack = table.ingest(&syn).unwrap();
+        let syn_ack = only_segment(&syn_ack.outgoing);
+        let (echo, _) = syn_ack.options.timestamps.unwrap();
+        let mut ack_options = vec![1, 1, 8, 10];
+        ack_options.extend_from_slice(&101_u32.to_be_bytes());
+        ack_options.extend_from_slice(&echo.to_be_bytes());
+        let ack = packet_with_options(
+            source,
+            destination,
+            101,
+            syn_ack.meta.sequence.wrapping_add(1).get(),
+            TcpFlags::ACK,
+            &ack_options,
+        );
+        let accepted = table.ingest(&ack).unwrap();
+        let connection = match accepted.events.as_slice() {
+            [TcpEvent::Accepted(connection)] => *connection,
+            events => panic!("unexpected events: {events:?}"),
+        };
+        assert_eq!(connection.max_segment_payload_bytes, payload, "sack {sack}");
+        table.accept(connection.token).unwrap();
+        assert_eq!(table.write_limit(connection.token).unwrap(), payload);
+        assert!(matches!(
+            table.write(connection.token, &vec![0; payload + 1]),
+            Err(TcpTableError::PayloadTooLarge)
+        ));
+        let sent = table.write(connection.token, &vec![0; payload]).unwrap();
+        assert_eq!(sent.outgoing.len(), 1);
+        assert!(
+            sent.outgoing[0].len() <= 1_500,
+            "sack {sack}: {}",
+            sent.outgoing[0].len()
+        );
+    }
+}
+
+/// The same on an active open: the server's SYN-ACK announces 1460 and
+/// timestamps, and segments to it carry 1448.
+#[test]
+fn segments_to_a_server_fit_its_mss_with_their_options() {
+    let (mut table, _) = active_table(TcpTableConfig {
+        max_segment_payload_bytes: 8_960,
+        ..TcpTableConfig::default()
+    });
+    let (_, output) = table.connect(ACTIVE_LOCAL, ACTIVE_REMOTE).unwrap();
+    let syn = only_segment(&output.outgoing);
+    let (echo, _) = syn.options.timestamps.unwrap();
+    let mut options = vec![2, 4, 0x05, 0xb4, 1, 1, 8, 10];
+    options.extend_from_slice(&7_u32.to_be_bytes());
+    options.extend_from_slice(&echo.to_be_bytes());
+    let syn_ack = packet_with_options(
+        ACTIVE_REMOTE,
+        syn.source,
+        9_000,
+        syn.meta.sequence.get().wrapping_add(1),
+        TcpFlags::SYN.union(TcpFlags::ACK),
+        &options,
+    );
+    let connected = table.ingest(&syn_ack).unwrap();
+    let connection = match connected.events.as_slice() {
+        [TcpEvent::Connected(connection)] => *connection,
+        events => panic!("unexpected events: {events:?}"),
+    };
+    assert_eq!(connection.max_segment_payload_bytes, 1_448);
+}
