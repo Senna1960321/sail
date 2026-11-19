@@ -42,10 +42,12 @@ use super::dials::Dials;
 use super::{prelude, stream_header, Status, NETWORK_TCP, NETWORK_UDP};
 
 /// The streams one session carries at once; a stream past them opens a new
-/// session. Judgment, to be measured against AnyTLS in sail#60's third
-/// phase: windows keep one stream from holding the others back, and fewer
-/// sessions are fewer TLS handshakes.
-const STREAMS_PER_SESSION: usize = 32;
+/// session. Measured in sail#60's third phase across 1, 8, 32 and 128: 8
+/// keeps 86 to 90% of 32's memory, descriptor and idle-wakeup savings while
+/// opening four times as many TCP connections on heavy bursts under an
+/// unprivileged client's socket buffer cap (1.7x download and 3.4x upload
+/// over 32 streams at 150 ms RTT).
+const STREAMS_PER_SESSION: usize = 8;
 
 /// How long a session's dial may take, connection, TLS and prelude
 /// together, before the streams waiting for it fail. Judgment: sing-box's

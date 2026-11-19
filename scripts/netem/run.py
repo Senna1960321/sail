@@ -1825,7 +1825,7 @@ def main():
                          "the proxy resets (stalled_reset)")
     ap.add_argument("--idle-conns", type=int, default=32,
                     help="idle_wakeups: idle connections held through the client (default "
-                         "32, one Sail/1 session's STREAMS_PER_SESSION)")
+                         "32, four Sail/1 sessions at STREAMS_PER_SESSION = 8)")
     ap.add_argument("--idle-seconds", type=float, default=60,
                     help="idle_wakeups: how long the wakeups are counted (default 60)")
     ap.add_argument("--idle-stalled", type=int, default=0,

@@ -305,7 +305,7 @@ class Run:
 
         # The TCP connections the load holds to the server, at most: one a
         # stream for most protocols (AnyTLS too: its clients carry one
-        # stream a session at a time), one a session of up to 32 streams
+        # stream a session at a time), one a session of up to 8 streams
         # for Sail/1, none for QUIC. Only for idle,
         # where they are held, and every 5 s on the load's cores: ss over
         # tens of thousands of sockets is not free.

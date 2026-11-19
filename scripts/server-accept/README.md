@@ -30,7 +30,7 @@ python3 run.py ... --client sail --servers sail --protocols sail1,anytls,trojan
 
 - `--servers`：取 `sail`、`sail-base`（`--sail-base` 指定的另一个 sail）、`sing-box`；默认 `sail,sing-box`。
 - `--protocols`：取 `ss2022,trojan,vless-reality,hy2,tuic,anytls`（默认全部），以及 `sail1`（sail 自己的协议 Sail/1，不在默认里）。`sail1` 只有 sail 会说：要 `--client sail`，`--servers` 只能是 `sail`、`sail-base`，否则在开始前就报错退出；客户端与服务端的 sail 都要用 `--features inbound-sail,outbound-sail` 编译（默认 feature 里没有）。
-- `--client`：负载里的客户端进程，`sing-box`（默认）或 `sail`。`--client sail` 用 `--sail-client` 给的 sail（默认就是 `--sail`），以 `--client-profile` 档位运行（默认 `server`），配置与 sing-box 客户端相同（每个进程 `--carriers` 个 SOCKS 入站，各对应一个绑定源地址的出站）。sail 的 AnyTLS 客户端一个会话同时只承载一条流；Sail/1 一个会话最多承载 32 条（`STREAMS_PER_SESSION`），所以 idle 时到服务端的 TCP 连接数远少于流数。
+- `--client`：负载里的客户端进程，`sing-box`（默认）或 `sail`。`--client sail` 用 `--sail-client` 给的 sail（默认就是 `--sail`），以 `--client-profile` 档位运行（默认 `server`），配置与 sing-box 客户端相同（每个进程 `--carriers` 个 SOCKS 入站，各对应一个绑定源地址的出站）。sail 的 AnyTLS 客户端一个会话同时只承载一条流；Sail/1 一个会话最多承载 8 条（`STREAMS_PER_SESSION`），所以 idle 时到服务端的 TCP 连接数远少于流数。
 - `--shapes`：取 `idle,churn,bulk`。
   - `idle`：netgen `hold`，以 `--rate` 每秒建立 `--conns` 条连接，并保持 `--hold` 秒。期间每 5 秒在负载命名空间里用 `ss` 数一次到服务端端口的已建立 TCP 连接（绑在 `--load-cores` 上），取最大值记为 `client_tcp_conns_peak`。
   - `churn`：netgen `churn`，经一个代理以 `--churn-rate` 每秒开关，持续 `--churn-seconds` 秒。经一个代理意味着 QUIC 协议的全部流都在一条 QUIC 连接上。

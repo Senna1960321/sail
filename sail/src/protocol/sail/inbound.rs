@@ -13,6 +13,11 @@
 //!
 //! Tokens are looked up by their SHA-256. What a lookup's timing could tell
 //! is about the hash of what was sent, not about any user's token.
+//!
+//! Because a Sail/1 client shares one TCP connection across up to eight
+//! concurrent streams, run a Sail/1 server with BBR
+//! (`--set relay.tcp_congestion=bbr` or `net.ipv4.tcp_congestion_control = bbr`
+//! on Linux) so packet loss does not collapse a shared CUBIC window (sail#60).
 
 use std::collections::HashMap;
 use std::io;
@@ -67,8 +72,12 @@ pub(crate) fn register(registry: &mut InboundRegistry) {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SailInboundOptions {
-    /// Who may connect, by token. Sail/1 is experimental (sail#60): its
-    /// wire format is not yet stable, and it is built only with the
+    /// Who may connect, by token. Because one TCP connection carries up to
+    /// eight concurrent streams, run a Sail/1 server with BBR
+    /// (`--set relay.tcp_congestion=bbr` or
+    /// `net.ipv4.tcp_congestion_control = bbr` on Linux) so packet loss does
+    /// not collapse a shared CUBIC window. Sail/1 is experimental (sail#60):
+    /// its wire format is not yet stable, and it is built only with the
     /// `inbound-sail` feature, which no default build turns on.
     users: Vec<SailUser>,
     /// The padding scheme, as lines, AnyTLS's syntax. Unset, the default.

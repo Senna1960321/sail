@@ -9847,7 +9847,7 @@
      "items": {
       "$ref": "#/$defs/inbounds%5Bsail%5D.users%5B%5D"
      },
-     "description": "Who may connect, by token. Sail/1 is experimental (sail#60): its wire format is not yet stable, and it is built only with the `inbound-sail` feature, which no default build turns on."
+     "description": "Who may connect, by token. Because one TCP connection carries up to eight concurrent streams, run a Sail/1 server with BBR (`--set relay.tcp_congestion=bbr` or `net.ipv4.tcp_congestion_control = bbr` on Linux) so packet loss does not collapse a shared CUBIC window. Sail/1 is experimental (sail#60): its wire format is not yet stable, and it is built only with the `inbound-sail` feature, which no default build turns on."
     },
     "padding_scheme": {
      "anyOf": [

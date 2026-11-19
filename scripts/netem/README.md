@@ -50,11 +50,11 @@ python3 run.py --work WORK --sail WORK/sail --netgen WORK/netgen \
 
 ## 空闲唤醒（idle_wakeups）
 
-`--only idle_wakeups` 估计手机上空闲连接的耗电：在不整形的链路上、新启动的进程上，经客户端打开 `--idle-conns` 条（默认 32，即一个 Sail/1 会话最多承载的流数 `STREAMS_PER_SESSION`）没有流量的连接（netgen `hold`，每秒建 100 条，每条先做一次带校验的回显），静置 10 秒，然后在 `--idle-seconds` 秒（默认 60）里读客户端进程所有线程的 `/proc/<pid>/task/*/status` 中 `voluntary_ctxt_switches` 与 `nonvoluntary_ctxt_switches` 之和的增量，协议服务端进程也一样。结果（`result` 里）：
+`--only idle_wakeups` 估计手机上空闲连接的耗电：在不整形的链路上、新启动的进程上，经客户端打开 `--idle-conns` 条（默认 32）没有流量的连接（netgen `hold`，每秒建 100 条，每条先做一次带校验的回显），静置 10 秒，然后在 `--idle-seconds` 秒（默认 60）里读客户端进程所有线程的 `/proc/<pid>/task/*/status` 中 `voluntary_ctxt_switches` 与 `nonvoluntary_ctxt_switches` 之和的增量，协议服务端进程也一样。结果（`result` 里）：
 
 - `client_wakeups_per_s`、`server_wakeups_per_s`：每秒上下文切换次数，即线程每秒被唤醒或被抢占的次数；这期间退出的线程会把它的计数一起带走。没有协议服务端进程时 `server_wakeups_per_s` 为 null。
 - `client_rss_kb`：计数结束时客户端的 RSS。
-- `client_tcp_to_server`：计数结束时客户端命名空间里到服务端代理端口（8443/8388）的已建立 TCP 连接数。每条流一条连接的协议（trojan；sail 的 AnyTLS 客户端一个会话同时只承载一条流）等于 `--idle-conns`，Sail/1 一个会话最多 32 条流，QUIC 类为 0。由此能分开看每会话和每条流的代价。
+- `client_tcp_to_server`：计数结束时客户端命名空间里到服务端代理端口（8443/8388）的已建立 TCP 连接数。每条流一条连接的协议（trojan；sail 的 AnyTLS 客户端一个会话同时只承载一条流）等于 `--idle-conns`，Sail/1 一个会话最多 8 条流（`STREAMS_PER_SESSION`），QUIC 类为 0。由此能分开看每会话和每条流的代价。
 - `holding`、`survived`：保持住的连接数与静置后仍能回显的连接数；两者不等于 `--idle-conns` 时判失败。
 - `--idle-stalled N`：在空闲连接之外再开 N 条没人读的下载（netgen `stall`），先保持 75 秒（超过 sail 的 60 秒 `mux.stall_timeout` 及其检查间隔）再开空闲连接、开始计数，测的是停读的流被停放（Sail/1）或被重置（其他协议）之后的唤醒代价。结果另记 `idle_stalled`（打开的条数）、`stalled_reset` 和 `stalled_states`，含义与停读客户端的相同。
 

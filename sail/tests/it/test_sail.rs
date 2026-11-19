@@ -243,11 +243,13 @@ fn test_sail_to_sail() -> anyhow::Result<()> {
             tokio::time::sleep(Duration::from_millis(200)).await;
 
             // Sequential streams, then concurrent ones: one connection for
-            // all of them, streams sharing it.
+            // all of them, streams sharing it (6 concurrent stays below
+            // STREAMS_PER_SESSION = 8 while the last sequential SOCKS stream
+            // finishes closing).
             for i in 0..5u8 {
                 echo_stream(socks, echo, i, 1000 + 40_000 * i as usize).await?;
             }
-            let concurrent: Vec<_> = (0..8u8)
+            let concurrent: Vec<_> = (0..6u8)
                 .map(|i| tokio::spawn(echo_stream(socks, echo, 100 + i, 300_000)))
                 .collect();
             for task in concurrent {
@@ -255,7 +257,7 @@ fn test_sail_to_sail() -> anyhow::Result<()> {
             }
             anyhow::ensure!(
                 connections.load(Ordering::SeqCst) == 1,
-                "{} connections for 13 streams, not 1",
+                "{} connections for 11 streams, not 1",
                 connections.load(Ordering::SeqCst)
             );
 
@@ -309,31 +311,30 @@ fn test_sail_to_sail() -> anyhow::Result<()> {
     })
 }
 
-// A burst of streams on cold pools, each dial held 300 ms: 16 share one
-// session's dial, and 40 two, with STREAMS_PER_SESSION at 32. Each burst
+// A burst of streams on cold pools, each dial held 300 ms: 6 share one
+// session's dial, and 20 three, with STREAMS_PER_SESSION at 8. Each burst
 // through a client of its own.
 #[test]
 fn test_sail_cold_pool_shares_dials() -> anyhow::Result<()> {
     let certs = certs("sail-cold")?;
     common::retry_port_clash(|| {
-        let [server, sixteen, forty] = common::free_ports();
+        let [server, six, twenty] = common::free_ports();
         let rt = runtime()?;
-        let (to16, count16) = rt.block_on(slow_forwarder(server, Duration::from_millis(300)))?;
-        let (to40, count40) = rt.block_on(slow_forwarder(server, Duration::from_millis(300)))?;
+        let (to6, count6) = rt.block_on(slow_forwarder(server, Duration::from_millis(300)))?;
+        let (to20, count20) = rt.block_on(slow_forwarder(server, Duration::from_millis(300)))?;
         let ids = common::run_sail_instances(
             &rt,
             vec![
                 sail_server(server, &certs),
-                socks_to_sail(sixteen, to16, ALICE, &certs),
-                socks_to_sail(forty, to40, ALICE, &certs),
+                socks_to_sail(six, to6, ALICE, &certs),
+                socks_to_sail(twenty, to20, ALICE, &certs),
             ],
         )?;
         let result = rt.block_on(async {
             let (echo, echo_server) = common::run_tcp_echo_server("127.0.0.1:0").await?;
             let echo_server = tokio::spawn(echo_server);
             tokio::time::sleep(Duration::from_millis(200)).await;
-            for (port, streams, count, want) in
-                [(sixteen, 16u8, &count16, 1), (forty, 40, &count40, 2)]
+            for (port, streams, count, want) in [(six, 6u8, &count6, 1), (twenty, 20, &count20, 3)]
             {
                 let burst: Vec<_> = (0..streams)
                     .map(|i| tokio::spawn(echo_stream(port, echo, i, 20_000)))
