@@ -15,7 +15,7 @@ fuzzing = []
 
 [dev-dependencies]
 futures = "0.3"
-smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
 
 [lints.rust]
 unsafe_code = "forbid"
