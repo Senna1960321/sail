@@ -70,6 +70,40 @@ pub(super) fn kept_timed_out() -> bool {
         .is_ok()
 }
 
+/// The reuse deadline of a pipelined connection (DoT or HTTP/2).
+/// Siblings inherit their batch's origin while the connection has answered
+/// recently. After a whole reuse wait without an answer, even a continuously
+/// busy fresh batch must probe again so a silent connection is retired.
+#[cfg(feature = "tls")]
+struct ReuseState {
+    probing: bool,
+    heard: Instant,
+}
+
+#[cfg(feature = "tls")]
+impl Default for ReuseState {
+    fn default() -> Self {
+        Self {
+            probing: false,
+            heard: Instant::now(),
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+impl ReuseState {
+    fn take(&mut self, kept: bool, first: bool, wait: Option<Duration>) -> bool {
+        if first {
+            self.probing = kept;
+        }
+        kept && (self.probing || wait.is_some_and(|wait| self.heard.elapsed() >= wait))
+    }
+
+    fn answered(&mut self) {
+        self.heard = Instant::now();
+    }
+}
+
 /// Idle connections kept per server: as many as queries that ran at once,
 /// up to this.
 const MAX_IDLE: usize = 4;
@@ -778,7 +812,8 @@ impl super::DnsClient {
 
     /// How long a query may take on a connection kept from before, which
     /// may have died without a word: the rest of the query's time is left
-    /// for a new connection.
+    /// for a new connection. A healthy but slower-than-half-timeout answer
+    /// can therefore retire a kept connection and require another handshake.
     #[cfg(feature = "tls")]
     fn reused_connection_timeout(&self) -> Duration {
         self.timeout / 2

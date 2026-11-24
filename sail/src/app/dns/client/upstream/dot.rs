@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermi
 use tokio::time::timeout;
 use tracing::debug;
 
-use super::{kept_timed_out, kept_wait, Upstream, IDLE_TIMEOUT};
+use super::{kept_timed_out, kept_wait, ReuseState, Upstream, IDLE_TIMEOUT};
 use crate::adapter::AnyStream;
 use crate::app::dns::DnsClient;
 
@@ -75,14 +75,7 @@ struct Pending {
 
 struct Shared {
     pending: HashMap<u16, Pending>,
-    // All queries in a batch share its origin: a fresh pipeline must not
-    // become an idle-connection probe merely because a sibling joined it.
-    probing: bool,
-    // When the connection was opened or last answered. Once a busy
-    // pipeline has been quiet for a whole reuse wait, joiners are probes
-    // whatever the batch's origin: a connection that died silently under
-    // steady load, which never drains, is still timed out and retired.
-    heard: Instant,
+    reuse: ReuseState,
     // IDs are never reused on a connection. A late reply to a cancelled
     // query therefore cannot be mistaken for a new query with that ID.
     next_id: u32,
@@ -123,8 +116,7 @@ impl Connection {
     fn new(stream: AnyStream, permit: OwnedSemaphorePermit, write_timeout: Duration) -> Arc<Self> {
         let shared = Arc::new(Mutex::new(Shared {
             pending: HashMap::new(),
-            probing: false,
-            heard: Instant::now(),
+            reuse: ReuseState::default(),
             next_id: 0,
             closed: false,
             used: Instant::now(),
@@ -153,7 +145,7 @@ impl Connection {
                     let pending = {
                         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
                         state.used = Instant::now();
-                        state.heard = state.used;
+                        state.reuse.answered();
                         state.pending.remove(&id)
                     };
                     if let Some(pending) = pending {
@@ -211,11 +203,8 @@ impl Connection {
         {
             return None;
         }
-        if state.pending.is_empty() {
-            state.probing = kept;
-        }
-        let probing =
-            kept && (state.probing || wait.is_some_and(|wait| state.heard.elapsed() >= wait));
+        let first = state.pending.is_empty();
+        let probing = state.reuse.take(kept, first, wait);
         let id = state.next_id as u16;
         state.next_id += 1;
         let (send, response) = oneshot::channel();
@@ -395,7 +384,7 @@ impl DnsClient {
         // A sequential fresh attempt has its full outer budget. Another
         // waiter may already have opened its replacement; share that one.
         // Every query joining a fresh pipeline keeps its normal deadline
-        // while it opened or answered within the wait; see `Shared::heard`.
+        // while it opened or answered within the wait; see `ReuseState`.
         if !probing || wait.is_none() {
             return query.exchange().await;
         }
