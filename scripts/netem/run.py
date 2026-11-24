@@ -130,14 +130,22 @@ def fmt_cpus(cpus):
 
 def in_ns_netgen(ns, cmd):
     cpus = NETGEN_CPUS.get(ns) or CPUS.get(ns)
-    pin = f"taskset -c {cpus} " if cpus else ""
-    return f"ip netns exec {ns} {pin}{cmd}"
+    return in_ns_command(ns, cmd, cpus)
 
 
 def in_ns(ns, cmd):
-    cpus = CPUS.get(ns)
-    pin = f"taskset -c {cpus} " if cpus else ""
-    return f"ip netns exec {ns} {pin}{cmd}"
+    return in_ns_command(ns, cmd, CPUS.get(ns))
+
+
+def in_ns_command(ns, cmd, cpus):
+    # ip remounts /sys in a private mount namespace, hiding cgroup2.
+    # Restore its view before exec; a failed mount must stop the launch.
+    launch = shlex.join([
+        "ip", "netns", "exec", ns, "sh", "-c",
+        'mount -t cgroup2 none /sys/fs/cgroup && exec "$@"', "sh",
+    ])
+    pin = shlex.join(["taskset", "-c", cpus]) + " " if cpus else ""
+    return f"{launch} {pin}{cmd}"
 
 
 def netns(*args):
