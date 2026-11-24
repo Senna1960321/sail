@@ -20,6 +20,9 @@ use sail::net::DialDefaults;
 #[cfg(all(feature = "dns-doh", feature = "inbound-tls"))]
 mod doh_retry;
 
+#[cfg(all(feature = "dns-doh", feature = "inbound-tls"))]
+mod h3_retry;
+
 /// The answer every server here gives for an A query.
 const ANSWER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 7);
 
