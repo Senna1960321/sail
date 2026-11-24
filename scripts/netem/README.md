@@ -13,6 +13,8 @@ netgen 客户端 --SOCKS--> 被测客户端 ==veth, netem==> sing-box 服务端 
 
 ## 运行
 
+测试机使用 cgroup v2。`run.py` 在 `ip netns exec` 的私有挂载命名空间里重新挂载 cgroup2，再执行被测程序或 netgen，让进程及其祖先的 `memory.max` / `memory.current` 保持可见；挂载失败则不启动命令。进程仍属于原 cgroup，网络 sysfs 和命名空间 DNS/hosts 设置仍由 `ip netns exec` 提供，宿主挂载不变。不支持 cgroup v1。
+
 测试机上需要 root，以及 `tc`、`ss`、`ethtool`、sing-box（作服务端和对照客户端）。
 
 ```sh
