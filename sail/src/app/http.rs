@@ -557,6 +557,7 @@ pub(crate) fn cache_entry(
         writers.insert(tag_dir, Arc::downgrade(&shared));
         shared
     };
+    drop(writers);
     // Legacy tag-named entries cannot prove which source produced them.
     let legacy = dir.join(file_name(tag));
     let mut old_paths = vec![
@@ -565,6 +566,7 @@ pub(crate) fn cache_entry(
         legacy.with_extension("partial"),
         dir.join(format!("{}.meta.json", file_name(tag))),
         dir.join(format!("{}.partial", file_name(tag))),
+        dir.join(format!("{}.meta.partial", file_name(tag))),
     ];
     for extension in ["srs", "json", "mrs", "yaml", "txt", "list"] {
         old_paths.push(legacy.with_file_name(format!("{}.{}", file_name(tag), extension)));
