@@ -70,6 +70,18 @@ pub(super) fn kept_timed_out() -> bool {
         .is_ok()
 }
 
+/// Whether a transport already ended this attempt with a stale-connection
+/// timeout. Callers must preserve that signal for the outer sequential retry.
+pub(super) fn attempt_timed_out() -> bool {
+    ATTEMPT
+        .try_with(|attempt| {
+            attempt
+                .kept_timed_out
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .unwrap_or(false)
+}
+
 /// The reuse deadline of a pipelined connection (DoT or HTTP/2).
 /// Siblings inherit their batch's origin while the connection has answered
 /// recently. After a whole reuse wait without an answer, even a continuously
