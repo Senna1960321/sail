@@ -958,6 +958,8 @@ impl RuntimeManager {
                 .fetch_missing(&dispatcher)
                 .await
                 .map_err(Error::Config)?;
+            #[cfg(feature = "outbound-provider")]
+            providers.fetch_for_reload(&dispatcher).await;
         }
         let dns_client = self
             .dns_client

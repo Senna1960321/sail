@@ -375,6 +375,15 @@ asked of the new server, and the old server is asked nothing more. Also
 which close once their connections end. A TUN staying
 up across such a reload needs root and is not among sail's tests.
 
+Remote outbound provider caches share the rule-set cache layout: one hashed
+directory per tag, with the effective URL, format and headers identifying
+the entry. A successful save removes the tag's other entries; retired
+sources cannot overwrite or remove the new source's copy. A changed source
+cannot reuse old nodes, ETags, update times or subscription usage. At reload,
+new sources without a cached copy are fetched before the new groups are
+published. A failed download leaves the provider empty until an update
+succeeds. Legacy tag-named files are deleted.
+
 ## A snapshot, then what follows
 
 To read a state and then follow it without a gap, **subscribe first, then

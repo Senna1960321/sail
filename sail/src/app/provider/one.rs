@@ -18,7 +18,6 @@ use crate::adapter::registry::{self, OutboundBuildState};
 use crate::adapter::AnyOutboundHandler;
 use crate::app::dispatcher::Dispatcher;
 use crate::app::http::{self, HttpClients};
-use crate::app::http::{file_name, write_atomically};
 use crate::app::SyncDnsClient;
 use crate::config::clash::subscription::{self, Selection};
 use crate::config::model::{Endpoint, Outbound, OutboundProvider, OutboundProviderKind};
@@ -58,7 +57,7 @@ enum Source {
         interval: Duration,
         /// Where the downloaded copy is kept; none when there is nowhere
         /// to.
-        cache: Option<PathBuf>,
+        cache: Option<http::CacheEntry>,
     },
     Local {
         path: String,
@@ -132,23 +131,31 @@ impl Provider {
         starter: Arc<Starter>,
     ) -> Result<Self> {
         let source = match config.kind {
-            OutboundProviderKind::Remote => Source::Remote {
-                url: env
+            OutboundProviderKind::Remote => {
+                let url = env
                     .host
                     .download_url(config.url.as_deref().unwrap_or_default())
-                    .map_err(|e| anyhow!("url: {}", e))?,
-                client: clients.client(
+                    .map_err(|e| anyhow!("url: {}", e))?;
+                let client = clients.client(
                     config.http_client.as_ref(),
                     config.download_detour.as_deref(),
-                )?,
-                interval: config.update_interval.unwrap_or(DEFAULT_INTERVAL),
-                // Kept across restarts only where the host keeps things.
-                cache: env
-                    .host
-                    .cache_dir
-                    .as_ref()
-                    .map(|dir| dir.join("provider").join(file_name(&config.tag))),
-            },
+                )?;
+                let cache = env.host.cache_dir.as_ref().map(|dir| {
+                    http::cache_entry(
+                        &dir.join("provider"),
+                        &config.tag,
+                        &url,
+                        "yaml",
+                        &client.headers,
+                    )
+                });
+                Source::Remote {
+                    url,
+                    client,
+                    interval: config.update_interval.unwrap_or(DEFAULT_INTERVAL),
+                    cache,
+                }
+            }
             OutboundProviderKind::Local => Source::Local {
                 path: env.data_path(config.path.as_deref().unwrap_or_default()),
                 interval: config.update_interval,
@@ -179,8 +186,21 @@ impl Provider {
         for warning in warnings {
             warn!("outbound provider [{}]: {}", provider.tag, warning);
         }
-        // Configured as it was: it goes on as it is.
-        if let Some(previous) = previous {
+        // Configured as it was, and still from the same effective URL:
+        // a host's Sub-Store rewrite may change without changing config.
+        if let Some(previous) =
+            previous.filter(|previous| match (&previous.source, &provider.source) {
+                (
+                    Source::Remote {
+                        url: before,
+                        client: previous_client,
+                        ..
+                    },
+                    Source::Remote { url, client, .. },
+                ) => before == url && previous_client.headers == client.headers,
+                _ => true,
+            })
+        {
             provider.members = previous.members.clone();
             *provider.state.get_mut().unwrap_or_else(|e| e.into_inner()) = previous.state().clone();
             return Ok(provider);
@@ -409,7 +429,7 @@ impl Provider {
                     data.len()
                 );
                 if let Some(cache) = cache {
-                    if let Err(e) = write_atomically(cache, &data) {
+                    if let Err(e) = cache.save(&data) {
                         warn!("outbound provider [{}]: not cached: {}", self.tag, e);
                     }
                 }
@@ -418,11 +438,19 @@ impl Provider {
         };
         if let Some(cache) = cache {
             let meta = serde_json::to_vec(&self.state().meta)?;
-            if let Err(e) = write_atomically(&meta_path(cache), &meta) {
+            if let Err(e) = cache.save_meta(&meta) {
                 warn!("outbound provider [{}]: not cached: {}", self.tag, e);
             }
         }
         Ok(changed)
+    }
+
+    /// Fetch only the document: reload builds members against the new
+    /// outbound manager afterwards, so new detours need not exist in the old one.
+    pub(super) async fn download_for_reload(&self, dispatcher: &Dispatcher) -> Result<()> {
+        let result = self.download(dispatcher).await;
+        self.state().failed = result.as_ref().err().map(crate::control::Failure::now);
+        result.map(|_| ())
     }
 
     /// Reads its file again; whether what it holds changed.
@@ -650,6 +678,7 @@ fn hash(body: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::http::write_atomically;
 
     #[cfg(feature = "outbound-direct")]
     fn dns_client() -> SyncDnsClient {
@@ -713,6 +742,154 @@ mod tests {
             Default::default(),
         )
         .unwrap()
+    }
+
+    fn cache_path(provider: &Provider) -> &http::CacheEntry {
+        match &provider.source {
+            Source::Remote {
+                cache: Some(path), ..
+            } => path,
+            _ => panic!("remote provider with a cache"),
+        }
+    }
+
+    fn cache_env(name: &str) -> RuntimeEnv {
+        RuntimeEnv {
+            host: crate::runtime::Host {
+                cache_dir: Some(std::env::temp_dir().join(format!(
+                    "sail-provider-{}-{}-{:?}",
+                    name,
+                    std::process::id(),
+                    std::thread::current().id()
+                ))),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn write_cache(provider: &Provider, name: &str) {
+        let body = format!(
+            "proxies:\n  - {{name: {}, type: socks5, server: a.example, port: 1080}}\n",
+            name
+        );
+        cache_path(provider).save(body.as_bytes()).unwrap();
+        let meta = Meta {
+            etag: Some(format!("\"{}\"", name)),
+            updated: Some(SystemTime::now()),
+            userinfo: Some("upload=1; download=2; total=100".into()),
+        };
+        cache_path(provider)
+            .save_meta(&serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_source_caches_are_isolated() {
+        let env = cache_env("sources");
+        let old_config = config(serde_json::json!({
+            "type": "remote", "tag": "s", "url": "https://example.com/old?token=old-secret"
+        }));
+        let mut new_config = old_config.clone();
+        new_config.url = Some("https://example.com/new?token=new-secret".into());
+        let old = load(&old_config, &env, None);
+        write_cache(&old, "old");
+        let old = load(&old_config, &env, None);
+        assert!(old.is_loaded());
+        let new = load(&new_config, &env, None);
+        assert!(!new.is_loaded(), "loaded nodes from the previous source");
+        assert!(new.state().meta.etag.is_none());
+        assert!(new.state().meta.userinfo.is_none());
+        assert!(new.state().meta.updated.is_none());
+        assert_eq!(new.due_in(SystemTime::now()), Some(Duration::ZERO));
+        assert_ne!(cache_path(&old), cache_path(&new));
+        assert!(!cache_path(&new).to_string_lossy().contains("secret"));
+
+        // A replaced source can finish a download late. Neither its body
+        // nor its metadata may overwrite the new source's cache.
+        write_cache(&new, "new");
+        write_cache(&old, "late-old");
+        assert!(!cache_path(&old).exists());
+        assert!(!meta_path(cache_path(&old)).exists());
+        assert_eq!(
+            std::fs::read_dir(cache_path(&new).parent().unwrap())
+                .unwrap()
+                .count(),
+            2
+        );
+        let cached = load(&new_config, &env, None);
+        assert_eq!(cached.state().proxies[0].0, "new");
+        assert_eq!(cached.state().meta.etag.as_deref(), Some("\"new\""));
+        let reused = load(&new_config, &env, Some(&cached));
+        assert!(Arc::ptr_eq(&cached.members(), &reused.members()));
+        std::fs::remove_dir_all(env.host.cache_dir.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn provider_legacy_cache_without_source_is_deleted() {
+        let env = cache_env("legacy");
+        let path = env.host.cache_dir.as_ref().unwrap().join("provider/s");
+        write_atomically(
+            &path,
+            b"proxies:\n  - {name: old, type: socks5, server: a.example, port: 1080}\n",
+        )
+        .unwrap();
+        let meta = Meta {
+            etag: Some("\"old\"".into()),
+            updated: Some(SystemTime::now()),
+            userinfo: Some("upload=1; download=2; total=100".into()),
+        };
+        write_atomically(&meta_path(&path), &serde_json::to_vec(&meta).unwrap()).unwrap();
+        let config = config(serde_json::json!({
+            "type": "remote", "tag": "s", "url": "https://example.com/new"
+        }));
+        let provider = load(&config, &env, None);
+        assert!(!provider.is_loaded());
+        assert!(!path.exists());
+        assert!(!meta_path(&path).exists());
+        assert!(provider.state().meta.etag.is_none());
+        assert!(provider.state().meta.userinfo.is_none());
+        assert_eq!(provider.due_in(SystemTime::now()), Some(Duration::ZERO));
+        std::fs::remove_dir_all(env.host.cache_dir.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn provider_tags_keep_body_metadata_and_temporary_paths_apart() {
+        let env = cache_env("tags");
+        let mut paths = std::collections::HashSet::new();
+        for tag in [
+            "a".repeat(200),
+            "b".repeat(300),
+            "界".repeat(200),
+            "a/b".into(),
+            "a_b".into(),
+            "p".into(),
+            "p.meta.json".into(),
+            "p.one".into(),
+            "p.two".into(),
+        ] {
+            let config = config(serde_json::json!({
+                "type": "remote", "tag": tag, "url": "https://example.com/sub"
+            }));
+            let provider = load(&config, &env, None);
+            let cache = cache_path(&provider);
+            for path in [
+                cache.to_path_buf(),
+                meta_path(cache),
+                cache.with_extension("partial"),
+                meta_path(cache).with_extension("partial"),
+            ] {
+                assert!(
+                    paths.insert(path),
+                    "tag or metadata/temporary path collision"
+                );
+            }
+            write_cache(&provider, "cached");
+            let cached = load(&config, &env, None);
+            assert!(cached.is_loaded());
+            assert_eq!(cached.state().meta.etag.as_deref(), Some("\"cached\""));
+        }
+        std::fs::remove_dir_all(env.host.cache_dir.unwrap()).unwrap();
     }
 
     #[cfg(feature = "outbound-direct")]
@@ -790,7 +967,7 @@ mod tests {
         assert!(!provider.is_loaded());
         assert!(provider.due_in(SystemTime::now()).unwrap().is_zero());
 
-        let cache = dir.join("provider").join("sub_1");
+        let cache = cache_path(&provider).to_path_buf();
         write_atomically(
             &cache,
             b"proxies:\n  - { name: HK, type: socks5, server: a.example, port: 1080 }\n  \
@@ -885,6 +1062,65 @@ mod tests {
         next.build(&HashMap::new(), &dns, &env).unwrap();
         assert_eq!(names(&next), ["d"]);
         assert!(Arc::ptr_eq(&handler(&first, "d"), &handler(&next, "d")));
+    }
+
+    #[cfg(all(feature = "outbound-anytls", feature = "outbound-direct"))]
+    #[tokio::test]
+    async fn a_provider_with_a_changed_effective_url_retires_old_members() {
+        use super::super::Providers;
+
+        let mut env = cache_env("host-source");
+        env.host.sub_store = Some(crate::runtime::SubStore("https://old.example".into()));
+        let config = config(serde_json::json!({
+            "type": "remote", "tag": "p", "url": "https://sub.store/sub"
+        }));
+        let configs = [config];
+        let clients = HttpClients::default();
+        let dial = Arc::new(DialDefaults::default());
+        let first = Providers::load(&configs, &clients, dial.clone(), &env, None).unwrap();
+        {
+            let mut state = first.providers[0].state();
+            state.loaded = true;
+            state.proxies = Arc::new(vec![(
+                "any".into(),
+                serde_json::json!({
+                    "type": "anytls", "tag": "any", "server": "127.0.0.1", "server_port": 1,
+                    "password": "p", "tls": { "enabled": true, "server_name": "localhost" }
+                }),
+            )]);
+        }
+        first.build(&HashMap::new(), &dns_client(), &env).unwrap();
+        let held = handler(&first.providers[0], "any");
+        let tasks = first.providers[0].state().built[0].tasks.clone();
+        assert!(!tasks.is_empty());
+        let same = Providers::load(&configs, &clients, dial.clone(), &env, Some(&first)).unwrap();
+        assert!(Arc::ptr_eq(
+            &first.providers[0].members(),
+            &same.providers[0].members()
+        ));
+        drop(same);
+
+        // The configuration is unchanged, but the host now sends its
+        // Sub-Store requests to a different backend.
+        env.host.sub_store = Some(crate::runtime::SubStore("https://new.example".into()));
+        let next = Providers::load(&configs, &clients, dial, &env, Some(&first)).unwrap();
+        assert!(!next.providers[0].is_loaded());
+        assert_ne!(
+            cache_path(&first.providers[0]),
+            cache_path(&next.providers[0])
+        );
+        drop(first);
+        next.retired.check();
+        assert!(
+            !tasks[0].is_aborted(),
+            "a live connection still holds the old member"
+        );
+        drop(held);
+        next.retired.check();
+        assert!(
+            tasks[0].is_aborted(),
+            "the replaced source's cleanup task was not retired"
+        );
     }
 
     #[cfg(feature = "outbound-direct")]

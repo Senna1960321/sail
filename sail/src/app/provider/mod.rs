@@ -172,7 +172,10 @@ impl Providers {
         if let Some(previous) = previous {
             // What is gone is retired, and what was retired stays so.
             for gone in &previous.providers {
-                if !configs.contains(gone.config()) {
+                if !providers
+                    .iter()
+                    .any(|kept| Arc::ptr_eq(&kept.members(), &gone.members()))
+                {
                     gone.retire_all(&retired);
                 }
             }
@@ -236,6 +239,22 @@ impl Providers {
             }
         });
         futures::future::join_all(downloads).await;
+    }
+
+    /// A reload fetches new sources before constructing its outbound manager.
+    /// It cannot build their members against the previous manager's detours.
+    pub(crate) async fn fetch_for_reload(&self, dispatcher: &Dispatcher) {
+        let missing = self.providers.iter().filter(|p| !p.is_loaded());
+        futures::future::join_all(missing.map(|provider| async move {
+            if let Err(e) = provider.download_for_reload(dispatcher).await {
+                tracing::warn!(
+                    "outbound provider [{}]: download failed: {:#}",
+                    provider.tag,
+                    e
+                );
+            }
+        }))
+        .await;
     }
 
     /// Downloads the remote providers, and reads the local ones with an
