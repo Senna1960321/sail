@@ -465,6 +465,151 @@ pub(crate) fn write_atomically(path: &std::path::Path, data: &[u8]) -> Result<()
     Ok(())
 }
 
+/// A source-specific cache slot. Writers of a replaced source cannot remove
+/// the replacement's files while reclaiming old entries in the tag directory.
+#[derive(Clone, Debug)]
+pub(crate) struct CacheEntry {
+    path: std::path::PathBuf,
+    owner: Arc<()>,
+    writers: Arc<std::sync::Mutex<CacheWriter>>,
+}
+
+#[derive(Debug)]
+struct CacheWriter {
+    path: std::path::PathBuf,
+    owner: std::sync::Weak<()>,
+}
+
+impl std::ops::Deref for CacheEntry {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for CacheEntry {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl PartialEq for CacheEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+type CacheWriters =
+    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<CacheWriter>>>;
+fn cache_writers() -> &'static std::sync::Mutex<CacheWriters> {
+    static WRITERS: std::sync::OnceLock<std::sync::Mutex<CacheWriters>> =
+        std::sync::OnceLock::new();
+    WRITERS.get_or_init(std::sync::Mutex::default)
+}
+
+impl Drop for CacheEntry {
+    fn drop(&mut self) {
+        let mut writers = cache_writers().lock().unwrap_or_else(|e| e.into_inner());
+        if Arc::strong_count(&self.writers) == 1 {
+            writers.remove(self.path.parent().expect("tag directory"));
+        }
+    }
+}
+
+/// One directory per full tag, one body and metadata pair per source. The
+/// format and headers are part of the source; tokens never appear in paths.
+pub(crate) fn cache_entry(
+    dir: &std::path::Path,
+    tag: &str,
+    source: &str,
+    ext: &str,
+    headers: &[(String, String)],
+) -> CacheEntry {
+    use sha2::{Digest, Sha256};
+    use std::sync::{Mutex, Weak};
+    let tag_dir = dir.join(format!("{:x}", Sha256::digest(tag.as_bytes())));
+    let identity = serde_json::to_vec(&(source, ext, headers)).expect("strings serialize");
+    let path = tag_dir.join(format!("{:x}.{}", Sha256::digest(identity), ext));
+    let owner = Arc::new(());
+    let mut writers = cache_writers().lock().unwrap_or_else(|e| e.into_inner());
+    writers.retain(|_, entry| entry.strong_count() != 0);
+    let current = CacheWriter {
+        path: path.clone(),
+        owner: Arc::downgrade(&owner),
+    };
+    let shared = if let Some(shared) = writers.get(&tag_dir).and_then(Weak::upgrade) {
+        *shared.lock().unwrap_or_else(|e| e.into_inner()) = current;
+        shared
+    } else {
+        let shared = Arc::new(Mutex::new(current));
+        writers.insert(tag_dir, Arc::downgrade(&shared));
+        shared
+    };
+    // Legacy tag-named entries cannot prove which source produced them.
+    let legacy = dir.join(file_name(tag));
+    let mut old_paths = vec![
+        legacy.clone(),
+        legacy.with_extension("meta.json"),
+        legacy.with_extension("partial"),
+        dir.join(format!("{}.meta.json", file_name(tag))),
+        dir.join(format!("{}.partial", file_name(tag))),
+    ];
+    for extension in ["srs", "json", "mrs", "yaml", "txt", "list"] {
+        old_paths.push(legacy.with_file_name(format!("{}.{}", file_name(tag), extension)));
+    }
+    for old in old_paths {
+        // A very long old tag may never have been a valid filesystem name.
+        if let Err(error) = std::fs::remove_file(&old) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!("legacy download cache not removed: {}", error);
+            }
+        }
+    }
+    CacheEntry {
+        path,
+        owner,
+        writers: shared,
+    }
+}
+
+impl CacheEntry {
+    pub(crate) fn save(&self, data: &[u8]) -> Result<()> {
+        self.write(&self.path, data, true)
+    }
+
+    pub(crate) fn save_meta(&self, data: &[u8]) -> Result<()> {
+        self.write(&self.meta_path(), data, false)
+    }
+
+    pub(crate) fn meta_path(&self) -> std::path::PathBuf {
+        let mut path = self.path.as_os_str().to_os_string();
+        path.push(".meta.json");
+        path.into()
+    }
+
+    fn write(&self, path: &std::path::Path, data: &[u8], cleanup: bool) -> Result<()> {
+        let mut current = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+        if current.path != self.path && current.owner.upgrade().is_some() {
+            return Ok(());
+        }
+        // Dropping an unsuccessful reload restores the previous live writer.
+        current.path = self.path.clone();
+        current.owner = Arc::downgrade(&self.owner);
+        write_atomically(path, data)?;
+        if cleanup {
+            let meta = self.meta_path();
+            for entry in std::fs::read_dir(self.path.parent().expect("tag directory"))? {
+                let entry = entry?;
+                if entry.path() != self.path && entry.path() != meta && entry.file_type()?.is_file()
+                {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A tag as a file name: what could leave the directory, or trouble a
 /// file system, becomes `_`.
 pub(crate) fn file_name(tag: &str) -> String {
@@ -568,5 +713,71 @@ mod tests {
             .to_string();
         assert_eq!(err, "redirect from https to http refused");
         assert!(!ok("https://a.example/x", "file:///etc/passwd"));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn successful_cache_rotation_cleans_only_its_tag_and_rejects_late_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "sail-cache-rotation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let old = cache_entry(&dir, "tag", "https://old.example", "json", &[]);
+        old.save(b"old").unwrap();
+        old.save_meta(b"old etag").unwrap();
+        let sibling = cache_entry(&dir, "another", "https://old.example", "json", &[]);
+        sibling.save(b"sibling").unwrap();
+        let replacement = cache_entry(&dir, "tag", "https://new.example", "json", &[]);
+        assert!(
+            old.exists(),
+            "loading alone must not delete the last successful copy"
+        );
+        replacement.save(b"new").unwrap();
+        replacement.save_meta(b"new etag").unwrap();
+        old.save(b"late old").unwrap();
+        old.save_meta(b"late old etag").unwrap();
+        assert!(!old.exists());
+        assert!(!old.meta_path().exists());
+        assert_eq!(std::fs::read(&replacement).unwrap(), b"new");
+        assert_eq!(std::fs::read(replacement.meta_path()).unwrap(), b"new etag");
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling");
+        assert_eq!(
+            std::fs::read_dir(replacement.parent().unwrap())
+                .unwrap()
+                .count(),
+            2
+        );
+        drop(replacement);
+        // A rejected/abandoned reload drops its lease; the running instance
+        // can write again instead of permanently losing its disk cache.
+        old.save(b"running source").unwrap();
+        assert_eq!(std::fs::read(&old).unwrap(), b"running source");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn changed_headers_do_not_share_a_cache() {
+        let dir = std::env::temp_dir().join("sail-cache-header-identity");
+        let a = cache_entry(
+            &dir,
+            "tag",
+            "https://example.com",
+            "yaml",
+            &[("Authorization".into(), "first".into())],
+        );
+        let b = cache_entry(
+            &dir,
+            "tag",
+            "https://example.com",
+            "yaml",
+            &[("Authorization".into(), "second".into())],
+        );
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), b.parent());
     }
 }

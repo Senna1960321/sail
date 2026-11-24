@@ -273,8 +273,17 @@ A full reload:
 | group selections, pins | kept, for groups of the same tag |
 | delays measured | kept |
 | DNS client | rebuilt from the new `dns`. **Its cache starts empty** |
-| routing, rule-sets | rebuilt; rule-sets the configuration still names, and already downloaded, are not downloaded again |
+| routing, rule-sets | rebuilt; unchanged remote rule-sets keep their rules and refresh schedule. A changed source URL uses only its own cache or its explicit `initial_path`; without either, it is downloaded before the reload completes |
 | traffic counters | kept. Counters of inbounds and outbounds that are gone are dropped once nothing counts to them |
+
+Remote rule-set caches use one hashed directory per full tag and one
+source-specific body and metadata pair within it. The effective URL (after
+Sub-Store rewriting), format and request headers identify the source.
+After a successful body save, other entries for that tag are removed.
+A replaced source cannot overwrite or remove the current source's cache,
+and other tags are unaffected. Legacy tag-named files are deleted because
+they do not identify a source; the first start downloads again or uses an
+explicit `initial_path`.
 
 **The inbounds.** `reload` returns a `ReloadReport`: each inbound of the
 configuration, in its order, then those it no longer has, with what

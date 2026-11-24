@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use super::{RuleSet, SharedRuleSet};
 use crate::app::dispatcher::Dispatcher;
-use crate::app::http::{self, file_name, write_atomically};
+use crate::app::http;
 use crate::config::rule_set::{self as config, RuleSetFormat};
 use crate::runtime::RuntimeEnv;
 
@@ -31,7 +31,7 @@ pub(crate) struct Remote {
     interval: Duration,
     client: http::Client,
     /// Where the downloaded copy is kept; none when there is nowhere to.
-    cache: Option<PathBuf>,
+    cache: Option<http::CacheEntry>,
     /// Whose data files its rules name.
     env: RuntimeEnv,
     pub set: SharedRuleSet,
@@ -75,20 +75,19 @@ impl Remote {
             RuleSetFormat::ClashText => "txt",
             RuleSetFormat::SurgeText => "list",
         };
-        // Kept across restarts only where the host keeps things.
+        let url = env
+            .host
+            .download_url(&config::RuleSet::for_tag(
+                config.url.as_deref().unwrap_or_default(),
+                tag,
+            ))
+            .map_err(|e| anyhow!("url: {}", e))?;
         let cache = env.host.cache_dir.as_ref().map(|dir| {
-            dir.join("rule-set")
-                .join(format!("{}.{}", file_name(tag), extension))
+            http::cache_entry(&dir.join("rule-set"), tag, &url, extension, &client.headers)
         });
         let mut remote = Remote {
             tag: tag.to_string(),
-            url: env
-                .host
-                .download_url(&config::RuleSet::for_tag(
-                    config.url.as_deref().unwrap_or_default(),
-                    tag,
-                ))
-                .map_err(|e| anyhow!("url: {}", e))?,
+            url,
             format,
             behavior: config.behavior,
             size_limit: config.size_limit,
@@ -101,7 +100,10 @@ impl Remote {
         };
         if let Some(before) = before {
             let state = before.state();
-            if state.loaded {
+            if state.loaded
+                && before.url == remote.url
+                && before.client.headers == remote.client.headers
+            {
                 remote.set = before.set.clone();
                 *remote.state.get_mut().unwrap_or_else(|e| e.into_inner()) = State {
                     loaded: true,
@@ -255,7 +257,7 @@ impl Remote {
         let Some(path) = &self.cache else {
             return Ok(());
         };
-        write_atomically(path, data)
+        path.save(data)
     }
 
     fn save_meta(&self) -> Result<()> {
@@ -263,17 +265,22 @@ impl Remote {
             return Ok(());
         };
         let meta = serde_json::to_vec(&*self.state())?;
-        write_atomically(&meta_path(path), &meta)
+        path.save_meta(&meta)
     }
 }
 
 fn meta_path(cache: &std::path::Path) -> PathBuf {
-    cache.with_extension("meta.json")
+    // Retain the format too: two formats of a source have separate
+    // bodies, and must not share their ETags or update timestamps.
+    let mut path = cache.as_os_str().to_os_string();
+    path.push(".meta.json");
+    path.into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::http::file_name;
 
     #[test]
     fn a_cached_copy_is_used_until_due() {
@@ -340,5 +347,184 @@ mod tests {
         assert_eq!(file_name("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(file_name(".."), "_");
         assert_eq!(file_name("a/b\\c:d"), "a_b_c_d");
+    }
+
+    #[test]
+    fn changed_sources_do_not_load_or_overwrite_each_others_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "sail-rule-set-source-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let env = RuntimeEnv {
+            host: crate::runtime::Host {
+                cache_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = |url: &str| {
+            serde_json::from_value(serde_json::json!({
+                "type": "remote", "tag": "s", "format": "source", "url": url
+            }))
+            .unwrap()
+        };
+        let old_config = config("https://example.com/old.json?token=old-secret");
+        let new_config = config("https://example.com/new.json?token=new-secret");
+        let old = Remote::load(&old_config, "s", Default::default(), &env, None).unwrap();
+        let data = br#"{ "version": 3, "rules": [{ "domain": "old.example" }] }"#;
+        old.save(data).unwrap();
+        old.state().updated = Some(SystemTime::now());
+        old.state().etag = Some("\"old\"".into());
+        old.save_meta().unwrap();
+        let old = Remote::load(&old_config, "s", Default::default(), &env, None).unwrap();
+        assert!(old.is_loaded());
+
+        for before in [None, Some(&old)] {
+            let new = Remote::load(&new_config, "s", Default::default(), &env, before).unwrap();
+            assert!(!new.is_loaded(), "rules from the previous URL were reused");
+            assert!(new.state().etag.is_none());
+            assert!(new.updated().is_none());
+            assert!(new.due_in(SystemTime::now()).is_zero());
+            assert_ne!(new.cache, old.cache);
+            assert!(!new
+                .cache
+                .as_ref()
+                .unwrap()
+                .to_string_lossy()
+                .contains("secret"));
+
+            // An old download may finish after a reload. Its writes must
+            // not replace the new source's body or metadata.
+            let new_data = br#"{ "version": 3, "rules": [{ "domain": "new.example" }] }"#;
+            new.save(new_data).unwrap();
+            new.state().etag = Some("\"new\"".into());
+            new.save_meta().unwrap();
+            old.save(data).unwrap();
+            old.save_meta().unwrap();
+            assert_eq!(
+                std::fs::read(new.cache.as_ref().unwrap()).unwrap(),
+                new_data
+            );
+            let cached = Remote::load(&new_config, "s", Default::default(), &env, None).unwrap();
+            assert!(cached.is_loaded());
+            assert_eq!(cached.state().etag.as_deref(), Some("\"new\""));
+            std::fs::remove_file(new.cache.as_ref().unwrap()).unwrap();
+            std::fs::remove_file(meta_path(new.cache.as_ref().unwrap())).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_legacy_cache_without_a_source_is_not_trusted() {
+        let dir = std::env::temp_dir().join(format!(
+            "sail-rule-set-legacy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(dir.join("rule-set")).unwrap();
+        std::fs::write(
+            dir.join("rule-set/s.json"),
+            br#"{ "version": 3, "rules": [{ "domain": "old.example" }] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("rule-set/s.meta.json"),
+            serde_json::to_vec(&State {
+                etag: Some("\"old\"".into()),
+                updated: Some(SystemTime::now()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let env = RuntimeEnv {
+            host: crate::runtime::Host {
+                cache_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = serde_json::from_value(serde_json::json!({
+            "type": "remote", "tag": "s", "format": "source",
+            "url": "https://example.com/new.json"
+        }))
+        .unwrap();
+        let remote = Remote::load(&config, "s", Default::default(), &env, None).unwrap();
+        assert!(!remote.is_loaded());
+        assert!(!dir.join("rule-set/s.json").exists());
+        assert!(!dir.join("rule-set/s.meta.json").exists());
+        assert!(remote.state().etag.is_none());
+        assert!(remote.due_in(SystemTime::now()).is_zero());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_identity_uses_the_effective_url_and_keeps_formats_apart() {
+        let mut env = RuntimeEnv::default();
+        env.host.cache_dir = Some(PathBuf::from("cache"));
+        env.host.sub_store = Some(crate::runtime::SubStore("https://old.example".into()));
+        let config: config::RuleSet = serde_json::from_value(serde_json::json!({
+            "type": "remote", "tag": "s", "format": "source",
+            "url": "https://sub.store/s"
+        }))
+        .unwrap();
+        let old = Remote::load(&config, "s", Default::default(), &env, None).unwrap();
+        old.state().loaded = true;
+        env.host.sub_store = Some(crate::runtime::SubStore("https://new.example".into()));
+        let new = Remote::load(&config, "s", Default::default(), &env, Some(&old)).unwrap();
+        assert!(!new.is_loaded());
+        assert_ne!(old.cache, new.cache);
+
+        let mut binary_config = config.clone();
+        binary_config.format = Some(RuleSetFormat::Binary);
+        let binary = Remote::load(&binary_config, "s", Default::default(), &env, None).unwrap();
+        assert_ne!(new.cache, binary.cache);
+        assert_ne!(
+            new.cache.as_ref().unwrap().with_extension("partial"),
+            binary.cache.as_ref().unwrap().with_extension("partial")
+        );
+        assert_ne!(
+            meta_path(new.cache.as_ref().unwrap()),
+            meta_path(binary.cache.as_ref().unwrap())
+        );
+    }
+
+    #[test]
+    fn long_and_sanitized_alike_tags_have_separate_writable_caches() {
+        let dir = std::env::temp_dir().join(format!(
+            "sail-rule-set-tags-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let env = RuntimeEnv {
+            host: crate::runtime::Host {
+                cache_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = serde_json::from_value(serde_json::json!({
+            "type": "remote", "tag": "unused", "format": "source",
+            "url": "https://example.com/rules.json"
+        }))
+        .unwrap();
+        let mut paths = Vec::new();
+        for tag in ["a".repeat(200), "界".repeat(70), "a/b".into(), "a_b".into()] {
+            let remote = Remote::load(&config, &tag, Default::default(), &env, None).unwrap();
+            let path = remote.cache.as_ref().unwrap();
+            assert_eq!(path.file_name().unwrap().len(), 69);
+            assert!(!paths.contains(path), "distinct tags shared a cache");
+            paths.push(path.clone());
+            remote
+                .save(br#"{ "version": 3, "rules": [{ "domain": "a.example" }] }"#)
+                .unwrap();
+            remote.state().etag = Some("\"v1\"".into());
+            remote.save_meta().unwrap();
+            let cached = Remote::load(&config, &tag, Default::default(), &env, None).unwrap();
+            assert!(cached.is_loaded());
+            assert_eq!(cached.state().etag.as_deref(), Some("\"v1\""));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
