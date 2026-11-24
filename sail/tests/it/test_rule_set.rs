@@ -1,6 +1,127 @@
 #[allow(unused_imports)] // Unused where features leave out every test.
 use crate::common;
 
+// A changed URL must fetch its own rules even while the previous URL's
+// cache is fresh. Exercise both the restart and live-reload paths, with
+// real conditional HTTP requests through the instance.
+#[cfg(all(feature = "outbound-direct", feature = "rule-set"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_rule_set_urls_are_fetched_on_restart_and_reload() -> anyhow::Result<()> {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use sail::embed::{Config, Instance, Options, Threads};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut head = Vec::new();
+            let mut byte = [0];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                head.push(byte[0]);
+                assert!(head.len() < 8192);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let path = head.split_whitespace().nth(1).unwrap().to_string();
+            let etag = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("If-None-Match")
+                    .then(|| value.trim().to_string())
+            });
+            observed.lock().unwrap().push((path.clone(), etag.clone()));
+            let version = format!("\"{}\"", path);
+            let response = if etag.as_deref() == Some(version.as_str()) {
+                "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n".to_string()
+            } else {
+                let rules = if path == "/old.json" {
+                    serde_json::json!([{ "domain": "old.example" }])
+                } else {
+                    serde_json::json!([{ "domain": "new.example" }, { "domain": "other.example" }])
+                };
+                let body = serde_json::json!({ "version": 3, "rules": rules }).to_string();
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: {}\r\n\r\n{}",
+                    version,
+                    body.len(),
+                    body
+                )
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let config = |path: &str| {
+        Config::Json(
+            serde_json::json!({
+                "outbounds": [{ "type": "direct", "tag": "direct" }],
+                "route": { "rule_set": [{
+                    "type": "remote", "tag": "s", "format": "source",
+                    "url": format!("http://{}{}", addr, path), "update_interval": "24h"
+                }] }
+            })
+            .to_string(),
+        )
+    };
+
+    for reload in [false, true] {
+        let dir = common::TempDir::new("rule-set-url")?;
+        let options = || Options::new().threads(Threads::One).cache_dir(dir.path());
+        let instance = Instance::new(options())?;
+        requests.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(5), instance.start(config("/old.json"))).await??;
+        assert_eq!(instance.rule_sets().await?[0].rules, 1);
+        let instance = if reload {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                instance.reload(Some(config("/new.json"))),
+            )
+            .await??;
+            instance
+        } else {
+            instance.stop().await?;
+            let instance = Instance::new(options())?;
+            tokio::time::timeout(Duration::from_secs(5), instance.start(config("/new.json")))
+                .await??;
+            instance
+        };
+        let rules = instance.rule_sets().await?;
+        assert_eq!(
+            rules[0].rules, 2,
+            "reload={reload}: still using the old URL's rules"
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                ("/old.json".to_string(), None),
+                ("/new.json".to_string(), None),
+            ]
+        );
+        instance.stop().await?;
+
+        // The new source remains cached through another restart. A
+        // manual update sends that source's ETag and accepts its 304.
+        let cached = Instance::new(options())?;
+        tokio::time::timeout(Duration::from_secs(5), cached.start(config("/new.json"))).await??;
+        assert_eq!(cached.rule_sets().await?[0].rules, 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        tokio::time::timeout(Duration::from_secs(5), cached.update_rule_set("s")).await??;
+        assert_eq!(
+            requests.lock().unwrap().last().unwrap(),
+            &("/new.json".to_string(), Some("\"/new.json\"".to_string()))
+        );
+        assert_eq!(cached.rule_sets().await?[0].rules, 2);
+        cached.stop().await?;
+    }
+    server.abort();
+    Ok(())
+}
+
 // app(socks) -> (socks)sail(route by rule-set) -> echo
 //
 // A rule-set holding the echo server's address makes the rule reject the
