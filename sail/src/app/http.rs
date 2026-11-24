@@ -471,7 +471,7 @@ pub(crate) fn write_atomically(path: &std::path::Path, data: &[u8]) -> Result<()
 pub(crate) struct CacheEntry {
     path: std::path::PathBuf,
     owner: Arc<()>,
-    writers: Arc<std::sync::Mutex<CacheWriter>>,
+    writers: Arc<std::sync::Mutex<Vec<CacheWriter>>>,
 }
 
 #[derive(Debug)]
@@ -499,8 +499,10 @@ impl PartialEq for CacheEntry {
     }
 }
 
-type CacheWriters =
-    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<CacheWriter>>>;
+type CacheWriters = std::collections::HashMap<
+    std::path::PathBuf,
+    std::sync::Weak<std::sync::Mutex<Vec<CacheWriter>>>,
+>;
 fn cache_writers() -> &'static std::sync::Mutex<CacheWriters> {
     static WRITERS: std::sync::OnceLock<std::sync::Mutex<CacheWriters>> =
         std::sync::OnceLock::new();
@@ -512,6 +514,12 @@ impl Drop for CacheEntry {
         let mut writers = cache_writers().lock().unwrap_or_else(|e| e.into_inner());
         if Arc::strong_count(&self.writers) == 1 {
             writers.remove(self.path.parent().expect("tag directory"));
+        } else if Arc::strong_count(&self.owner) == 1 {
+            let owner = Arc::downgrade(&self.owner);
+            self.writers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|entry| !entry.owner.ptr_eq(&owner) && entry.owner.strong_count() != 0);
         }
     }
 }
@@ -538,10 +546,14 @@ pub(crate) fn cache_entry(
         owner: Arc::downgrade(&owner),
     };
     let shared = if let Some(shared) = writers.get(&tag_dir).and_then(Weak::upgrade) {
-        *shared.lock().unwrap_or_else(|e| e.into_inner()) = current;
+        {
+            let mut entries = shared.lock().unwrap_or_else(|e| e.into_inner());
+            entries.retain(|entry| entry.owner.strong_count() != 0);
+            entries.push(current);
+        }
         shared
     } else {
-        let shared = Arc::new(Mutex::new(current));
+        let shared = Arc::new(Mutex::new(vec![current]));
         writers.insert(tag_dir, Arc::downgrade(&shared));
         shared
     };
@@ -588,13 +600,14 @@ impl CacheEntry {
     }
 
     fn write(&self, path: &std::path::Path, data: &[u8], cleanup: bool) -> Result<()> {
-        let mut current = self.writers.lock().unwrap_or_else(|e| e.into_inner());
-        if current.path != self.path && current.owner.upgrade().is_some() {
+        let mut writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+        writers.retain(|entry| entry.owner.strong_count() != 0);
+        if writers
+            .last()
+            .is_some_and(|current| current.path != self.path)
+        {
             return Ok(());
         }
-        // Dropping an unsuccessful reload restores the previous live writer.
-        current.path = self.path.clone();
-        current.owner = Arc::downgrade(&self.owner);
         write_atomically(path, data)?;
         if cleanup {
             let meta = self.meta_path();
@@ -751,6 +764,13 @@ mod cache_tests {
                 .unwrap()
                 .count(),
             2
+        );
+        let abandoned = cache_entry(&dir, "tag", "https://abandoned.example", "json", &[]);
+        drop(abandoned);
+        old.save(b"still retired").unwrap();
+        assert!(
+            !old.exists(),
+            "abandoning a later reload must restore the newest live owner"
         );
         drop(replacement);
         // A rejected/abandoned reload drops its lease; the running instance
