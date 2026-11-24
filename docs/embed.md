@@ -380,9 +380,10 @@ directory per tag, with the effective URL, format and headers identifying
 the entry. A successful save removes the tag's other entries; retired
 sources cannot overwrite or remove the new source's copy. A changed source
 cannot reuse old nodes, ETags, update times or subscription usage. At reload,
-new sources without a cached copy are fetched before the new groups are
-published. A failed download leaves the provider empty until an update
-succeeds. Legacy tag-named files are deleted.
+new sources without a cached copy are fetched before reload returns, using
+the new outbound manager (including newly added download detours). A failed
+download leaves the provider empty until an update succeeds. Legacy tag-named
+files are deleted.
 
 ## A snapshot, then what follows
 

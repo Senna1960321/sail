@@ -445,14 +445,6 @@ impl Provider {
         Ok(changed)
     }
 
-    /// Fetch only the document: reload builds members against the new
-    /// outbound manager afterwards, so new detours need not exist in the old one.
-    pub(super) async fn download_for_reload(&self, dispatcher: &Dispatcher) -> Result<()> {
-        let result = self.download(dispatcher).await;
-        self.state().failed = result.as_ref().err().map(crate::control::Failure::now);
-        result.map(|_| ())
-    }
-
     /// Reads its file again; whether what it holds changed.
     fn read_again(&self, path: &str) -> Result<bool> {
         let body = std::fs::read(path).map_err(|e| anyhow!("{}: {}", path, e))?;

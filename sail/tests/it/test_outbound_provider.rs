@@ -91,6 +91,7 @@ async fn changed_provider_urls_are_fetched_on_restart_and_reload() -> anyhow::Re
                     "type": "direct", "tag": "new-detour"
                 }));
             config["outbound_providers"][0]["detour"] = "new-detour".into();
+            config["outbound_providers"][0]["download_detour"] = "new-detour".into();
         }
         Config::Json(config.to_string())
     };
@@ -118,7 +119,7 @@ async fn changed_provider_urls_are_fetched_on_restart_and_reload() -> anyhow::Re
             instance
         };
         // New source members are ready when reload returns, without waiting
-        // for the periodic updater or exposing an empty group in between.
+        // for the next periodic updater tick.
         let members = instance
             .outbound("pick")
             .await?

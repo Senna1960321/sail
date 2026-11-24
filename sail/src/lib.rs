@@ -958,8 +958,6 @@ impl RuntimeManager {
                 .fetch_missing(&dispatcher)
                 .await
                 .map_err(Error::Config)?;
-            #[cfg(feature = "outbound-provider")]
-            providers.fetch_for_reload(&dispatcher).await;
         }
         let dns_client = self
             .dns_client
@@ -1086,6 +1084,17 @@ impl RuntimeManager {
         *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(running);
         self.reloads
             .fetch_add(1, portable_atomic::Ordering::Relaxed);
+        // The replacement manager now resolves both member detours and
+        // download detours added by this reload. All reload state is committed
+        // and updaters are running, so cancellation of this wait is safe.
+        #[cfg(feature = "outbound-provider")]
+        if let Some(dispatcher) = self.dispatcher.upgrade() {
+            self.outbound_manager
+                .load()
+                .providers()
+                .fetch_missing(&dispatcher)
+                .await;
+        }
         for note in &notes {
             warn!("{}", note);
         }
